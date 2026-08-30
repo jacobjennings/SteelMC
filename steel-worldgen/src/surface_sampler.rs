@@ -1448,7 +1448,10 @@ fn canonical_block_state_key(state: BlockStateId) -> String {
 mod tests {
     use std::time::Instant;
 
-    use super::{SurfaceChunkCache, SurfaceDimension, SurfaceSampler, SurfaceTile};
+    use super::{
+        BlockStateId, DimensionNoises, OverworldNoises, SurfaceChunkCache, SurfaceColumn,
+        SurfaceDimension, SurfaceSampler, SurfaceTile,
+    };
 
     fn assert_tiles_equal(actual: &SurfaceTile, expected: &SurfaceTile) {
         assert_eq!(actual.samples_per_side, expected.samples_per_side);
