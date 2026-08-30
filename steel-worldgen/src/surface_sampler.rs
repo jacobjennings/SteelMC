@@ -85,9 +85,12 @@ pub struct SurfaceVegetationBlock {
 
 /// Maximum number of reusable terrain chunks retained by the browser sampler.
 ///
-/// Each entry retains pre- and post-Carvers copies: 2 * 192 KiB * 96 entries
-/// is about 36 MiB per worker, or 576 MiB across the viewer's maximum 16 workers.
-pub const DEFAULT_SURFACE_CHUNK_CACHE_CAPACITY: usize = 96;
+/// Each entry retains pre- and post-Carvers copies. A capacity sweep over the
+/// viewer's 4×4 tile traversal found that 160 is the smallest measured capacity
+/// that avoids regenerating chunks (400 misses versus 640 at capacity 96);
+/// 256 and 400 improved median time by only another 2.5% and 2.2%, respectively.
+/// The retained block and heightmap payload is about 60 MiB per worker.
+pub const DEFAULT_SURFACE_CHUNK_CACHE_CAPACITY: usize = 160;
 
 /// Diagnostic counters for a surface chunk cache.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1332,6 +1335,43 @@ mod tests {
             "isolated cached={isolated_cached:.3} ms uncached={isolated_uncached:.3} ms ratio={:.3}x regression={:.2}%",
             isolated_uncached / isolated_cached,
             (isolated_cached / isolated_uncached - 1.0) * 100.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "measurement harness; run with --ignored --nocapture"]
+    fn measure_isolated_surface_chunk_cache() {
+        const REPETITIONS: usize = 9;
+        let mut cached_times = Vec::new();
+        let mut uncached_times = Vec::new();
+        for repetition in 0..REPETITIONS {
+            let mut measure_cached = || {
+                let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+                let mut cache = SurfaceChunkCache::default();
+                let start = Instant::now();
+                let _ = sampler.tile_with_cache(&mut cache, 0, 0, 64, 1);
+                cached_times.push(start.elapsed().as_secs_f64() * 1_000.0);
+            };
+            let mut measure_uncached = || {
+                let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+                let start = Instant::now();
+                let _ = sampler.tile(0, 0, 64, 1);
+                uncached_times.push(start.elapsed().as_secs_f64() * 1_000.0);
+            };
+            if repetition.is_multiple_of(2) {
+                measure_cached();
+                measure_uncached();
+            } else {
+                measure_uncached();
+                measure_cached();
+            }
+        }
+        let cached = median_ms(cached_times);
+        let uncached = median_ms(uncached_times);
+        println!(
+            "isolated_order_balanced cached={cached:.3} ms uncached={uncached:.3} ms ratio={:.3}x regression={:.2}%",
+            uncached / cached,
+            (cached / uncached - 1.0) * 100.0,
         );
     }
 
