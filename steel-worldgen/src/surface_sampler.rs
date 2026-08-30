@@ -89,6 +89,19 @@ pub struct SurfaceVegetationBlock {
 /// is about 36 MiB per worker, or 576 MiB across the viewer's maximum 16 workers.
 pub const DEFAULT_SURFACE_CHUNK_CACHE_CAPACITY: usize = 96;
 
+/// Diagnostic counters for a surface chunk cache.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SurfaceChunkCacheStats {
+    /// Requests served by an already-retained chunk.
+    pub hits: u64,
+    /// Requests which generated a chunk.
+    pub misses: u64,
+    /// Retained chunks removed to honor the capacity.
+    pub evictions: u64,
+    /// Largest number of chunks retained simultaneously.
+    pub peak_retained_chunks: usize,
+}
+
 struct CachedSurfaceChunk {
     pre_carver: InMemorySurfaceChunk,
     post_carver: InMemorySurfaceChunk,
@@ -100,6 +113,7 @@ pub struct SurfaceChunkCache {
     capacity: usize,
     clock: u64,
     chunks: HashMap<(i32, i32), CachedSurfaceChunk>,
+    stats: SurfaceChunkCacheStats,
 }
 
 impl Default for SurfaceChunkCache {
@@ -116,7 +130,23 @@ impl SurfaceChunkCache {
             capacity,
             clock: 0,
             chunks: HashMap::new(),
+            stats: SurfaceChunkCacheStats::default(),
         }
+    }
+
+    /// Returns diagnostic counters accumulated since construction.
+    #[must_use]
+    pub fn stats(&self) -> SurfaceChunkCacheStats {
+        self.stats
+    }
+
+    /// Returns bytes used by retained block-state and heightmap payloads.
+    #[must_use]
+    pub fn retained_payload_bytes(&self) -> usize {
+        self.chunks
+            .values()
+            .map(|entry| entry.pre_carver.payload_bytes() + entry.post_carver.payload_bytes())
+            .sum()
     }
 
     fn touch(&mut self, key: (i32, i32)) -> Option<&CachedSurfaceChunk> {
@@ -138,9 +168,11 @@ impl SurfaceChunkCache {
                 .map(|(&key, _)| key);
             if let Some(oldest) = oldest {
                 self.chunks.remove(&oldest);
+                self.stats.evictions += 1;
             }
         }
         self.chunks.insert(key, entry);
+        self.stats.peak_retained_chunks = self.stats.peak_retained_chunks.max(self.chunks.len());
     }
 }
 
@@ -510,8 +542,10 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
     fn ensure_cached_chunk(&self, cache: &mut SurfaceChunkCache, chunk_x: i32, chunk_z: i32) {
         let key = (chunk_x, chunk_z);
         if cache.chunks.contains_key(&key) {
+            cache.stats.hits += 1;
             return;
         }
+        cache.stats.misses += 1;
         let pre_carver = self.sample_surface_chunk_data(chunk_x, chunk_z);
         let mut post_carver = pre_carver.clone();
         self.apply_carvers_to_chunk(&mut post_carver);
@@ -766,6 +800,11 @@ struct InMemorySurfaceChunk {
 }
 
 impl InMemorySurfaceChunk {
+    fn payload_bytes(&self) -> usize {
+        self.blocks.capacity() * std::mem::size_of::<BlockStateId>()
+            + std::mem::size_of_val(&self.world_surface)
+    }
+
     fn new(chunk_min_x: i32, chunk_min_z: i32, min_y: i32, height: i32) -> Self {
         let air = vanilla_blocks::AIR.default_state();
         Self {
