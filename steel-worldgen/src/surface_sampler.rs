@@ -107,7 +107,7 @@ pub struct SurfaceChunkCacheStats {
 
 struct CachedSurfaceChunk {
     pre_carver_surface: Box<[SurfaceColumn; 256]>,
-    post_carver: Option<InMemorySurfaceChunk>,
+    post_carver: Option<PalettizedSurfaceChunk>,
     last_used: u64,
 }
 
@@ -160,7 +160,7 @@ impl SurfaceChunkCache {
                     + entry
                         .post_carver
                         .as_ref()
-                        .map_or(0, InMemorySurfaceChunk::payload_bytes)
+                        .map_or(0, PalettizedSurfaceChunk::payload_bytes)
             })
             .sum()
     }
@@ -558,7 +558,7 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
                 let Some(chunk) = cached_chunk.post_carver.as_ref() else {
                     panic!("vegetation halo chunk must have been carved");
                 };
-                let chunk = chunk.clone();
+                let chunk = chunk.to_in_memory();
                 chunks.insert((chunk_x, chunk_z), chunk);
             }
         }
@@ -625,7 +625,7 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
                 let mut post_carver = self.sample_surface_chunk_data(chunk_x, chunk_z);
                 self.apply_carvers_to_chunk(&mut post_carver);
                 if let Some(entry) = cache.chunks.get_mut(&key) {
-                    entry.post_carver = Some(post_carver);
+                    entry.post_carver = Some(PalettizedSurfaceChunk::from(post_carver));
                 }
             }
             return;
@@ -643,7 +643,7 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         let post_carver = include_carvers.then(|| {
             let mut chunk = pre_carver_chunk;
             self.apply_carvers_to_chunk(&mut chunk);
-            chunk
+            PalettizedSurfaceChunk::from(chunk)
         });
         cache.clock = cache.clock.wrapping_add(1);
         cache.insert(
@@ -880,6 +880,140 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
     }
 }
 
+/// Lossless section-palettized format used only while a post-Carvers chunk is retained.
+///
+/// Generation and feature placement continue to use [`InMemorySurfaceChunk`], avoiding
+/// palette maintenance on their random-access writes.
+struct PalettizedSurfaceChunk {
+    chunk_min_x: i32,
+    chunk_min_z: i32,
+    min_y: i32,
+    height: usize,
+    sections: Box<[PalettizedSurfaceSection]>,
+    world_surface: Box<[i32; 256]>,
+}
+
+struct PalettizedSurfaceSection {
+    palette: Box<[BlockStateId]>,
+    packed_indices: Box<[u64]>,
+    bits_per_index: u8,
+}
+
+impl PalettizedSurfaceSection {
+    const VOLUME: usize = 16 * 16 * 16;
+
+    fn from_chunk(chunk: &InMemorySurfaceChunk, section_y: usize) -> Self {
+        let mut palette = Vec::new();
+        let mut palette_lookup = HashMap::new();
+        let mut indices = Vec::with_capacity(Self::VOLUME);
+        for relative_y in section_y * 16..section_y * 16 + 16 {
+            for local_z in 0..16 {
+                for local_x in 0..16 {
+                    let state = chunk.blocks[chunk.block_index(local_x, relative_y, local_z)];
+                    let index = if let Some(&index) = palette_lookup.get(&state) {
+                        index
+                    } else {
+                        let index = palette.len() as u16;
+                        palette.push(state);
+                        palette_lookup.insert(state, index);
+                        index
+                    };
+                    indices.push(index);
+                }
+            }
+        }
+
+        let bits_per_index = if palette.len() == 1 {
+            0
+        } else {
+            usize::BITS - (palette.len() - 1).leading_zeros()
+        } as u8;
+        let packed_indices = if bits_per_index == 0 {
+            Vec::new()
+        } else {
+            let values_per_word = 64 / usize::from(bits_per_index);
+            let mut packed = vec![0; Self::VOLUME.div_ceil(values_per_word)];
+            for (position, index) in indices.into_iter().enumerate() {
+                let word = position / values_per_word;
+                let offset = position % values_per_word * usize::from(bits_per_index);
+                packed[word] |= u64::from(index) << offset;
+            }
+            packed
+        };
+        Self {
+            palette: palette.into_boxed_slice(),
+            packed_indices: packed_indices.into_boxed_slice(),
+            bits_per_index,
+        }
+    }
+
+    fn state_at(&self, position: usize) -> BlockStateId {
+        if self.bits_per_index == 0 {
+            return self.palette[0];
+        }
+        let bits = usize::from(self.bits_per_index);
+        let values_per_word = 64 / bits;
+        let mask = (1_u64 << bits) - 1;
+        let index = (self.packed_indices[position / values_per_word]
+            >> (position % values_per_word * bits))
+            & mask;
+        self.palette[index as usize]
+    }
+
+    fn payload_bytes(&self) -> usize {
+        self.palette.len() * std::mem::size_of::<BlockStateId>()
+            + self.packed_indices.len() * std::mem::size_of::<u64>()
+    }
+}
+
+impl From<InMemorySurfaceChunk> for PalettizedSurfaceChunk {
+    fn from(chunk: InMemorySurfaceChunk) -> Self {
+        assert!(chunk.height.is_multiple_of(16));
+        let sections = (0..chunk.height / 16)
+            .map(|section_y| PalettizedSurfaceSection::from_chunk(&chunk, section_y))
+            .collect();
+        Self {
+            chunk_min_x: chunk.chunk_min_x,
+            chunk_min_z: chunk.chunk_min_z,
+            min_y: chunk.min_y,
+            height: chunk.height,
+            sections,
+            world_surface: Box::new(chunk.world_surface),
+        }
+    }
+}
+
+impl PalettizedSurfaceChunk {
+    fn payload_bytes(&self) -> usize {
+        self.sections
+            .iter()
+            .map(PalettizedSurfaceSection::payload_bytes)
+            .sum::<usize>()
+            + std::mem::size_of_val(self.world_surface.as_ref())
+    }
+
+    fn to_in_memory(&self) -> InMemorySurfaceChunk {
+        let mut chunk = InMemorySurfaceChunk::new(
+            self.chunk_min_x,
+            self.chunk_min_z,
+            self.min_y,
+            self.height as i32,
+        );
+        for (section_y, section) in self.sections.iter().enumerate() {
+            for position in 0..PalettizedSurfaceSection::VOLUME {
+                let local_y = position / 256;
+                let local_z = position / 16 % 16;
+                let local_x = position % 16;
+                let relative_y = section_y * 16 + local_y;
+                let index = chunk.block_index(local_x, relative_y, local_z);
+                chunk.blocks[index] = section.state_at(position);
+            }
+        }
+        chunk.world_surface = *self.world_surface;
+        chunk
+    }
+}
+
 /// Minimal mutable chunk representation used by the browser-safe Surface host.
 ///
 /// It intentionally contains only pre-Features block data and the world-surface
@@ -896,11 +1030,6 @@ struct InMemorySurfaceChunk {
 }
 
 impl InMemorySurfaceChunk {
-    fn payload_bytes(&self) -> usize {
-        self.blocks.capacity() * std::mem::size_of::<BlockStateId>()
-            + std::mem::size_of_val(&self.world_surface)
-    }
-
     fn new(chunk_min_x: i32, chunk_min_z: i32, min_y: i32, height: i32) -> Self {
         let air = vanilla_blocks::AIR.default_state();
         Self {
@@ -1319,7 +1448,10 @@ fn canonical_block_state_key(state: BlockStateId) -> String {
 mod tests {
     use std::time::Instant;
 
-    use super::{SurfaceChunkCache, SurfaceDimension, SurfaceSampler, SurfaceTile};
+    use super::{
+        BlockStateId, DimensionNoises, OverworldNoises, SurfaceChunkCache, SurfaceColumn,
+        SurfaceDimension, SurfaceSampler, SurfaceTile,
+    };
 
     fn assert_tiles_equal(actual: &SurfaceTile, expected: &SurfaceTile) {
         assert_eq!(actual.samples_per_side, expected.samples_per_side);
@@ -1394,7 +1526,9 @@ mod tests {
         let mut isolated_cached = Vec::new();
         let mut isolated_uncached = Vec::new();
 
-        println!("capacity ratio hit_rate peak_chunks retained_payload_bytes evictions");
+        println!(
+            "capacity ratio hit_rate misses evictions retained_payload_bytes retained_8_workers retained_16_workers"
+        );
         for capacity in CAPACITIES {
             let mut grid_cached = Vec::new();
             let mut grid_uncached = Vec::new();
@@ -1428,14 +1562,29 @@ mod tests {
             let stats = final_stats.expect("capacity sweep must execute");
             let requests = stats.hits + stats.misses;
             println!(
-                "{capacity} {:.3}x {:.2}% {} {} {} (cached={cached:.3} ms uncached={uncached:.3} ms hits={} misses={})",
+                "{capacity} {:.3}x {:.2}% {} {} {} {} {} (cached={cached:.3} ms uncached={uncached:.3} ms hits={} peak_chunks={})",
                 uncached / cached,
                 stats.hits as f64 * 100.0 / requests as f64,
-                stats.peak_retained_chunks,
-                retained_payload_bytes,
-                stats.evictions,
-                stats.hits,
                 stats.misses,
+                stats.evictions,
+                retained_payload_bytes,
+                retained_payload_bytes * 8,
+                retained_payload_bytes * 16,
+                stats.hits,
+                stats.peak_retained_chunks,
+            );
+            let flat_entry_bytes = 16
+                * 16
+                * <OverworldNoises as DimensionNoises>::Settings::HEIGHT as usize
+                * std::mem::size_of::<BlockStateId>()
+                + std::mem::size_of::<[i32; 256]>()
+                + std::mem::size_of::<[SurfaceColumn; 256]>();
+            println!(
+                "entry_bytes capacity={capacity} before={flat_entry_bytes} after_average={} entries={} before_8_workers={} before_16_workers={}",
+                retained_payload_bytes / stats.peak_retained_chunks,
+                stats.peak_retained_chunks,
+                flat_entry_bytes * capacity * 8,
+                flat_entry_bytes * capacity * 16,
             );
         }
 
