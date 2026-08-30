@@ -88,8 +88,8 @@ pub struct SurfaceVegetationBlock {
 /// Each entry retains pre- and post-Carvers copies. A capacity sweep over the
 /// viewer's 4×4 tile traversal found that 160 is the smallest measured capacity
 /// that avoids regenerating chunks (400 misses versus 640 at capacity 96);
-/// 256 and 400 improved median time by only another 2.5% and 2.2%, respectively.
-/// The retained block and heightmap payload is about 60 MiB per worker.
+/// 256 and 400 were slightly slower in the same sweep. The compact pre-carver
+/// summary keeps retained block, heightmap, and summary payload near 30 MiB.
 pub const DEFAULT_SURFACE_CHUNK_CACHE_CAPACITY: usize = 160;
 
 /// Diagnostic counters for a surface chunk cache.
