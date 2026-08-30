@@ -85,14 +85,37 @@ pub struct SurfaceVegetationBlock {
 
 /// Maximum number of reusable terrain chunks retained by the browser sampler.
 ///
-/// Each entry retains pre- and post-Carvers copies: 2 * 192 KiB * 96 entries
-/// is about 36 MiB per worker, or 576 MiB across the viewer's maximum 16 workers.
-pub const DEFAULT_SURFACE_CHUNK_CACHE_CAPACITY: usize = 96;
+/// Each entry retains pre- and post-Carvers copies. A capacity sweep over the
+/// viewer's 4×4 tile traversal found that 160 is the smallest measured capacity
+/// that avoids regenerating chunks (400 misses versus 640 at capacity 96);
+/// 256 and 400 were slightly slower in the same sweep. The compact pre-carver
+/// summary keeps retained block, heightmap, and summary payload near 30 MiB.
+pub const DEFAULT_SURFACE_CHUNK_CACHE_CAPACITY: usize = 160;
+
+/// Diagnostic counters for a surface chunk cache.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SurfaceChunkCacheStats {
+    /// Requests served by an already-retained chunk.
+    pub hits: u64,
+    /// Requests which generated a chunk.
+    pub misses: u64,
+    /// Retained chunks removed to honor the capacity.
+    pub evictions: u64,
+    /// Largest number of chunks retained simultaneously.
+    pub peak_retained_chunks: usize,
+}
 
 struct CachedSurfaceChunk {
-    pre_carver: InMemorySurfaceChunk,
+    pre_carver_surface: Box<[SurfaceColumn; 256]>,
     post_carver: InMemorySurfaceChunk,
     last_used: u64,
+}
+
+#[derive(Clone, Copy)]
+struct SurfaceColumn {
+    height: i16,
+    state: BlockStateId,
+    exists: bool,
 }
 
 /// Bounded least-recently-used cache for reusable surface-generation chunks.
@@ -100,6 +123,7 @@ pub struct SurfaceChunkCache {
     capacity: usize,
     clock: u64,
     chunks: HashMap<(i32, i32), CachedSurfaceChunk>,
+    stats: SurfaceChunkCacheStats,
 }
 
 impl Default for SurfaceChunkCache {
@@ -116,7 +140,26 @@ impl SurfaceChunkCache {
             capacity,
             clock: 0,
             chunks: HashMap::new(),
+            stats: SurfaceChunkCacheStats::default(),
         }
+    }
+
+    /// Returns diagnostic counters accumulated since construction.
+    #[must_use]
+    pub fn stats(&self) -> SurfaceChunkCacheStats {
+        self.stats
+    }
+
+    /// Returns bytes used by retained block-state and heightmap payloads.
+    #[must_use]
+    pub fn retained_payload_bytes(&self) -> usize {
+        self.chunks
+            .values()
+            .map(|entry| {
+                std::mem::size_of_val(entry.pre_carver_surface.as_ref())
+                    + entry.post_carver.payload_bytes()
+            })
+            .sum()
     }
 
     fn touch(&mut self, key: (i32, i32)) -> Option<&CachedSurfaceChunk> {
@@ -138,9 +181,11 @@ impl SurfaceChunkCache {
                 .map(|(&key, _)| key);
             if let Some(oldest) = oldest {
                 self.chunks.remove(&oldest);
+                self.stats.evictions += 1;
             }
         }
         self.chunks.insert(key, entry);
+        self.stats.peak_retained_chunks = self.stats.peak_retained_chunks.max(self.chunks.len());
     }
 }
 
@@ -389,7 +434,11 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
                     .touch((chunk_x, chunk_z))
                     .expect("surface chunk must have been cached");
                 let index = (z.rem_euclid(16) * 16 + x.rem_euclid(16)) as usize;
-                let (height, state, exists) = chunk.pre_carver.top_surface(index);
+                let SurfaceColumn {
+                    height,
+                    state,
+                    exists,
+                } = chunk.pre_carver_surface[index];
                 heights.push(height);
                 present.push(u8::from(exists));
                 surface_blocks.push(canonical_block_key(state));
@@ -510,16 +559,25 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
     fn ensure_cached_chunk(&self, cache: &mut SurfaceChunkCache, chunk_x: i32, chunk_z: i32) {
         let key = (chunk_x, chunk_z);
         if cache.chunks.contains_key(&key) {
+            cache.stats.hits += 1;
             return;
         }
-        let pre_carver = self.sample_surface_chunk_data(chunk_x, chunk_z);
-        let mut post_carver = pre_carver.clone();
+        cache.stats.misses += 1;
+        let mut post_carver = self.sample_surface_chunk_data(chunk_x, chunk_z);
+        let pre_carver_surface = Box::new(std::array::from_fn(|index| {
+            let (height, state, exists) = post_carver.top_surface(index);
+            SurfaceColumn {
+                height,
+                state,
+                exists,
+            }
+        }));
         self.apply_carvers_to_chunk(&mut post_carver);
         cache.clock = cache.clock.wrapping_add(1);
         cache.insert(
             key,
             CachedSurfaceChunk {
-                pre_carver,
+                pre_carver_surface,
                 post_carver,
                 last_used: cache.clock,
             },
@@ -766,6 +824,11 @@ struct InMemorySurfaceChunk {
 }
 
 impl InMemorySurfaceChunk {
+    fn payload_bytes(&self) -> usize {
+        self.blocks.capacity() * std::mem::size_of::<BlockStateId>()
+            + std::mem::size_of_val(&self.world_surface)
+    }
+
     fn new(chunk_min_x: i32, chunk_min_z: i32, min_y: i32, height: i32) -> Self {
         let air = vanilla_blocks::AIR.default_state();
         Self {
@@ -1214,6 +1277,12 @@ mod tests {
             let uncached = sampler.tile(x, z, size, 1);
             assert_tiles_equal(&cached, &uncached);
         }
+
+        // Exercise summarized pre-carver columns across constant eviction.
+        let mut tiny_cache = SurfaceChunkCache::new(1);
+        let cached = sampler.tile_with_cache(&mut tiny_cache, 0, 0, 16, 1);
+        let uncached = sampler.tile(0, 0, 16, 1);
+        assert_tiles_equal(&cached, &uncached);
     }
 
     fn median_ms(mut values: Vec<f64>) -> f64 {
@@ -1225,31 +1294,56 @@ mod tests {
     #[ignore = "measurement harness; run with --ignored --nocapture"]
     fn measure_surface_chunk_cache() {
         const REPETITIONS: usize = 3;
-        let mut grid_cached = Vec::new();
-        let mut grid_uncached = Vec::new();
+        const CAPACITIES: [usize; 4] = [96, 160, 256, 400];
         let mut isolated_cached = Vec::new();
         let mut isolated_uncached = Vec::new();
 
+        println!("capacity ratio hit_rate peak_chunks retained_payload_bytes evictions");
+        for capacity in CAPACITIES {
+            let mut grid_cached = Vec::new();
+            let mut grid_uncached = Vec::new();
+            let mut final_stats = None;
+            let mut retained_payload_bytes = 0;
+            for _ in 0..REPETITIONS {
+                let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+                let mut cache = SurfaceChunkCache::new(capacity);
+                let start = Instant::now();
+                for tile_z in 0..4 {
+                    for tile_x in 0..4 {
+                        let _ =
+                            sampler.tile_with_cache(&mut cache, tile_x * 64, tile_z * 64, 64, 1);
+                    }
+                }
+                grid_cached.push(start.elapsed().as_secs_f64() * 1_000.0);
+                final_stats = Some(cache.stats());
+                retained_payload_bytes = cache.retained_payload_bytes();
+
+                let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+                let start = Instant::now();
+                for tile_z in 0..4 {
+                    for tile_x in 0..4 {
+                        let _ = sampler.tile(tile_x * 64, tile_z * 64, 64, 1);
+                    }
+                }
+                grid_uncached.push(start.elapsed().as_secs_f64() * 1_000.0);
+            }
+            let cached = median_ms(grid_cached);
+            let uncached = median_ms(grid_uncached);
+            let stats = final_stats.expect("capacity sweep must execute");
+            let requests = stats.hits + stats.misses;
+            println!(
+                "{capacity} {:.3}x {:.2}% {} {} {} (cached={cached:.3} ms uncached={uncached:.3} ms hits={} misses={})",
+                uncached / cached,
+                stats.hits as f64 * 100.0 / requests as f64,
+                stats.peak_retained_chunks,
+                retained_payload_bytes,
+                stats.evictions,
+                stats.hits,
+                stats.misses,
+            );
+        }
+
         for _ in 0..REPETITIONS {
-            let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
-            let mut cache = SurfaceChunkCache::default();
-            let start = Instant::now();
-            for tile_z in 0..4 {
-                for tile_x in 0..4 {
-                    let _ = sampler.tile_with_cache(&mut cache, tile_x * 64, tile_z * 64, 64, 1);
-                }
-            }
-            grid_cached.push(start.elapsed().as_secs_f64() * 1_000.0);
-
-            let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
-            let start = Instant::now();
-            for tile_z in 0..4 {
-                for tile_x in 0..4 {
-                    let _ = sampler.tile(tile_x * 64, tile_z * 64, 64, 1);
-                }
-            }
-            grid_uncached.push(start.elapsed().as_secs_f64() * 1_000.0);
-
             let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
             let mut cache = SurfaceChunkCache::default();
             let start = Instant::now();
@@ -1262,19 +1356,49 @@ mod tests {
             isolated_uncached.push(start.elapsed().as_secs_f64() * 1_000.0);
         }
 
-        let grid_cached = median_ms(grid_cached);
-        let grid_uncached = median_ms(grid_uncached);
         let isolated_cached = median_ms(isolated_cached);
         let isolated_uncached = median_ms(isolated_uncached);
         println!(
-            "grid cached={grid_cached:.3} ms uncached={grid_uncached:.3} ms ratio={:.3}x; useful_chunk cached={:.3} ms uncached={:.3} ms",
-            grid_uncached / grid_cached,
-            grid_cached / 256.0,
-            grid_uncached / 256.0,
-        );
-        println!(
-            "isolated cached={isolated_cached:.3} ms uncached={isolated_uncached:.3} ms ratio={:.3}x",
+            "isolated cached={isolated_cached:.3} ms uncached={isolated_uncached:.3} ms ratio={:.3}x regression={:.2}%",
             isolated_uncached / isolated_cached,
+            (isolated_cached / isolated_uncached - 1.0) * 100.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "measurement harness; run with --ignored --nocapture"]
+    fn measure_isolated_surface_chunk_cache() {
+        const REPETITIONS: usize = 9;
+        let mut cached_times = Vec::new();
+        let mut uncached_times = Vec::new();
+        for repetition in 0..REPETITIONS {
+            let mut measure_cached = || {
+                let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+                let mut cache = SurfaceChunkCache::default();
+                let start = Instant::now();
+                let _ = sampler.tile_with_cache(&mut cache, 0, 0, 64, 1);
+                cached_times.push(start.elapsed().as_secs_f64() * 1_000.0);
+            };
+            let mut measure_uncached = || {
+                let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+                let start = Instant::now();
+                let _ = sampler.tile(0, 0, 64, 1);
+                uncached_times.push(start.elapsed().as_secs_f64() * 1_000.0);
+            };
+            if repetition.is_multiple_of(2) {
+                measure_cached();
+                measure_uncached();
+            } else {
+                measure_uncached();
+                measure_cached();
+            }
+        }
+        let cached = median_ms(cached_times);
+        let uncached = median_ms(uncached_times);
+        println!(
+            "isolated_order_balanced cached={cached:.3} ms uncached={uncached:.3} ms ratio={:.3}x regression={:.2}%",
+            uncached / cached,
+            (cached / uncached - 1.0) * 100.0,
         );
     }
 
