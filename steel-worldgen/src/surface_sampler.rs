@@ -1306,6 +1306,30 @@ mod tests {
         assert_eq!(actual.min_y, expected.min_y);
     }
 
+    fn assert_coarse_tile_matches_full(coarse: &SurfaceTile, full: &SurfaceTile) {
+        assert_eq!(coarse.samples_per_side, full.samples_per_side);
+        assert_eq!(coarse.heights, full.heights);
+        assert_eq!(coarse.colors, full.colors);
+        assert_eq!(coarse.biomes, full.biomes);
+        assert_eq!(coarse.biome_indices, full.biome_indices);
+        assert_eq!(coarse.present, full.present);
+        assert_eq!(coarse.surface_blocks, full.surface_blocks);
+        assert!(coarse.vegetation_blocks.is_empty());
+        assert_eq!(coarse.min_y, full.min_y);
+    }
+
+    #[test]
+    fn coarse_tiles_match_full_tiles_except_vegetation() {
+        let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+        for (x, z, size) in [(0, 0, 64), (7, 11, 64), (-71, -93, 64), (256, 256, 256)] {
+            let mut full_cache = SurfaceChunkCache::default();
+            let full = sampler.tile_with_cache(&mut full_cache, x, z, size, 1);
+            let mut coarse_cache = SurfaceChunkCache::default();
+            let coarse = sampler.coarse_tile_with_cache(&mut coarse_cache, x, z, size, 1);
+            assert_coarse_tile_matches_full(&coarse, &full);
+        }
+    }
+
     #[test]
     fn cached_tiles_are_identical_to_uncached_tiles() {
         let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
@@ -1407,6 +1431,60 @@ mod tests {
             "isolated cached={isolated_cached:.3} ms uncached={isolated_uncached:.3} ms ratio={:.3}x regression={:.2}%",
             isolated_uncached / isolated_cached,
             (isolated_cached / isolated_uncached - 1.0) * 100.0,
+        );
+    }
+
+    #[test]
+    #[ignore = "measurement harness; run with --ignored --nocapture"]
+    fn measure_coarse_surface_tiles() {
+        const REPETITIONS: usize = 3;
+        let mut full_times = Vec::with_capacity(REPETITIONS);
+        let mut coarse_times = Vec::with_capacity(REPETITIONS);
+
+        for repetition in 0..REPETITIONS {
+            let mut measure_full = || {
+                let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+                let mut cache = SurfaceChunkCache::default();
+                let start = Instant::now();
+                for tile_z in 0..4 {
+                    for tile_x in 0..4 {
+                        let _ =
+                            sampler.tile_with_cache(&mut cache, tile_x * 64, tile_z * 64, 64, 1);
+                    }
+                }
+                full_times.push(start.elapsed().as_secs_f64() * 1_000.0);
+            };
+            let mut measure_coarse = || {
+                let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+                let mut cache = SurfaceChunkCache::default();
+                let start = Instant::now();
+                for tile_z in 0..4 {
+                    for tile_x in 0..4 {
+                        let _ = sampler.coarse_tile_with_cache(
+                            &mut cache,
+                            tile_x * 64,
+                            tile_z * 64,
+                            64,
+                            1,
+                        );
+                    }
+                }
+                coarse_times.push(start.elapsed().as_secs_f64() * 1_000.0);
+            };
+            if repetition.is_multiple_of(2) {
+                measure_full();
+                measure_coarse();
+            } else {
+                measure_coarse();
+                measure_full();
+            }
+        }
+
+        let full_ms = median_ms(full_times);
+        let coarse_ms = median_ms(coarse_times);
+        println!(
+            "contiguous_4x4_64 full={full_ms:.3} ms coarse={coarse_ms:.3} ms ratio={:.3}x",
+            full_ms / coarse_ms,
         );
     }
 
