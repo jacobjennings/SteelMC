@@ -107,7 +107,7 @@ pub struct SurfaceChunkCacheStats {
 
 struct CachedSurfaceChunk {
     pre_carver_surface: Box<[SurfaceColumn; 256]>,
-    post_carver: InMemorySurfaceChunk,
+    post_carver: Option<InMemorySurfaceChunk>,
     last_used: u64,
 }
 
@@ -157,7 +157,10 @@ impl SurfaceChunkCache {
             .values()
             .map(|entry| {
                 std::mem::size_of_val(entry.pre_carver_surface.as_ref())
-                    + entry.post_carver.payload_bytes()
+                    + entry
+                        .post_carver
+                        .as_ref()
+                        .map_or(0, InMemorySurfaceChunk::payload_bytes)
             })
             .sum()
     }
@@ -470,7 +473,7 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
                 let z = origin_z.saturating_add((sample_z * resolution) as i32);
                 let chunk_x = x.div_euclid(16);
                 let chunk_z = z.div_euclid(16);
-                self.ensure_cached_chunk(cache, chunk_x, chunk_z);
+                self.ensure_cached_chunk(cache, chunk_x, chunk_z, include_vegetation);
                 let chunk = cache
                     .touch((chunk_x, chunk_z))
                     .expect("surface chunk must have been cached");
@@ -548,12 +551,14 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         let mut chunks = HashMap::new();
         for chunk_z in source_min_chunk_z - 1..=source_max_chunk_z + 1 {
             for chunk_x in source_min_chunk_x - 1..=source_max_chunk_x + 1 {
-                self.ensure_cached_chunk(cache, chunk_x, chunk_z);
-                let chunk = cache
+                self.ensure_cached_chunk(cache, chunk_x, chunk_z, true);
+                let cached_chunk = cache
                     .touch((chunk_x, chunk_z))
-                    .expect("vegetation halo chunk must have been cached")
-                    .post_carver
-                    .clone();
+                    .expect("vegetation halo chunk must have been cached");
+                let Some(chunk) = cached_chunk.post_carver.as_ref() else {
+                    panic!("vegetation halo chunk must have been carved");
+                };
+                let chunk = chunk.clone();
                 chunks.insert((chunk_x, chunk_z), chunk);
             }
         }
@@ -601,23 +606,45 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         final_blocks
     }
 
-    fn ensure_cached_chunk(&self, cache: &mut SurfaceChunkCache, chunk_x: i32, chunk_z: i32) {
+    fn ensure_cached_chunk(
+        &self,
+        cache: &mut SurfaceChunkCache,
+        chunk_x: i32,
+        chunk_z: i32,
+        include_carvers: bool,
+    ) {
         let key = (chunk_x, chunk_z);
         if cache.chunks.contains_key(&key) {
             cache.stats.hits += 1;
+            if include_carvers
+                && cache
+                    .chunks
+                    .get(&key)
+                    .is_some_and(|entry| entry.post_carver.is_none())
+            {
+                let mut post_carver = self.sample_surface_chunk_data(chunk_x, chunk_z);
+                self.apply_carvers_to_chunk(&mut post_carver);
+                if let Some(entry) = cache.chunks.get_mut(&key) {
+                    entry.post_carver = Some(post_carver);
+                }
+            }
             return;
         }
         cache.stats.misses += 1;
-        let mut post_carver = self.sample_surface_chunk_data(chunk_x, chunk_z);
+        let pre_carver_chunk = self.sample_surface_chunk_data(chunk_x, chunk_z);
         let pre_carver_surface = Box::new(std::array::from_fn(|index| {
-            let (height, state, exists) = post_carver.top_surface(index);
+            let (height, state, exists) = pre_carver_chunk.top_surface(index);
             SurfaceColumn {
                 height,
                 state,
                 exists,
             }
         }));
-        self.apply_carvers_to_chunk(&mut post_carver);
+        let post_carver = include_carvers.then(|| {
+            let mut chunk = pre_carver_chunk;
+            self.apply_carvers_to_chunk(&mut chunk);
+            chunk
+        });
         cache.clock = cache.clock.wrapping_add(1);
         cache.insert(
             key,
