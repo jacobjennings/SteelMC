@@ -1523,7 +1523,9 @@ mod tests {
         let mut isolated_cached = Vec::new();
         let mut isolated_uncached = Vec::new();
 
-        println!("capacity ratio hit_rate peak_chunks retained_payload_bytes evictions");
+        println!(
+            "capacity ratio hit_rate misses evictions retained_payload_bytes retained_8_workers retained_16_workers"
+        );
         for capacity in CAPACITIES {
             let mut grid_cached = Vec::new();
             let mut grid_uncached = Vec::new();
@@ -1557,14 +1559,29 @@ mod tests {
             let stats = final_stats.expect("capacity sweep must execute");
             let requests = stats.hits + stats.misses;
             println!(
-                "{capacity} {:.3}x {:.2}% {} {} {} (cached={cached:.3} ms uncached={uncached:.3} ms hits={} misses={})",
+                "{capacity} {:.3}x {:.2}% {} {} {} {} {} (cached={cached:.3} ms uncached={uncached:.3} ms hits={} peak_chunks={})",
                 uncached / cached,
                 stats.hits as f64 * 100.0 / requests as f64,
-                stats.peak_retained_chunks,
-                retained_payload_bytes,
-                stats.evictions,
-                stats.hits,
                 stats.misses,
+                stats.evictions,
+                retained_payload_bytes,
+                retained_payload_bytes * 8,
+                retained_payload_bytes * 16,
+                stats.hits,
+                stats.peak_retained_chunks,
+            );
+            let flat_entry_bytes = 16
+                * 16
+                * <OverworldNoises as DimensionNoises>::Settings::HEIGHT as usize
+                * std::mem::size_of::<BlockStateId>()
+                + std::mem::size_of::<[i32; 256]>()
+                + std::mem::size_of::<[SurfaceColumn; 256]>();
+            println!(
+                "entry_bytes capacity={capacity} before={flat_entry_bytes} after_average={} entries={} before_8_workers={} before_16_workers={}",
+                retained_payload_bytes / stats.peak_retained_chunks,
+                stats.peak_retained_chunks,
+                flat_entry_bytes * capacity * 8,
+                flat_entry_bytes * capacity * 16,
             );
         }
 
