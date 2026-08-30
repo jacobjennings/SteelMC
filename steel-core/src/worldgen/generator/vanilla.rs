@@ -1,14 +1,13 @@
+use std::marker::PhantomData;
 use std::path::Path;
-use std::{cell::Cell, marker::PhantomData};
 
 use glam::{DVec3, IVec3};
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
-use steel_math::lerp2;
 use steel_registry::biome::BiomeRef;
 use steel_registry::blocks::block_state_ext::BlockStateExt;
 use steel_registry::carver::ConfiguredCarverKind;
-use steel_registry::{REGISTRY, RegistryEntry, RegistryExt, vanilla_biomes};
+use steel_registry::{REGISTRY, RegistryEntry, RegistryExt};
 use steel_utils::random::{
     Random, RandomSource, RandomSplitter, legacy_random::LegacyRandom, xoroshiro::Xoroshiro,
 };
@@ -19,14 +18,12 @@ use steel_worldgen::density_functions::{
 };
 use steel_worldgen::noise_parameters::get_noise_parameters;
 use steel_worldgen::surface::{
-    SurfaceBiomeProvider, SurfaceConditionNoiseCache, SurfaceRuleContext,
+    PreliminarySurfaceCorners, SurfaceBiomeAccess, SurfaceExtensions, SurfaceStage, SurfaceSystem,
 };
 
 use crate::chunk::Chunk;
 use crate::chunk::heightmap::{Heightmap, HeightmapType};
-use crate::worldgen::carver::{
-    CarveRun, CarverBlockIds, CarvingContext, PreliminarySurfaceCorners, SourceChunk, cave,
-};
+use crate::worldgen::carver::{CarveRun, CarverBlockIds, CarvingContext, SourceChunk, cave};
 use crate::worldgen::feature::FeatureDecorationRunner;
 use crate::worldgen::generator::{
     CarversPhase, ChunkGenerator, GenerationChunk, NoisePhase, SurfacePhase,
@@ -34,7 +31,6 @@ use crate::worldgen::generator::{
 };
 use crate::worldgen::region::WorldGenRegion;
 use crate::worldgen::structure::{StructureGenerator, create_structures};
-use crate::worldgen::surface::SurfaceSystem;
 use steel_worldgen::biomes::BiomeSourceKind;
 use steel_worldgen::biomes::obfuscate_biome_seed;
 use steel_worldgen::noise::Beardifier;
@@ -133,7 +129,7 @@ pub struct VanillaGenerator<N: DimensionNoises> {
     /// Surface system for biome-specific block replacement.
     surface_system: SurfaceSystem,
     /// Which vanilla surface extension biomes this source can produce.
-    surface_extension_biomes: SurfaceExtensionBiomes,
+    surface_extension_biomes: SurfaceExtensions,
     /// Block state ID for the default block, cached at construction time.
     default_block_id: BlockStateId,
     /// Obfuscated seed for `BiomeManager` biome zoom fuzzing.
@@ -147,23 +143,59 @@ pub struct VanillaGenerator<N: DimensionNoises> {
     _phantom: PhantomData<N>,
 }
 
-#[derive(Clone, Copy)]
-struct SurfaceExtensionBiomes {
-    eroded_badlands: bool,
-    frozen_ocean: bool,
+/// Native palette-backed implementation of the portable Surface biome host.
+///
+/// Current-chunk values are read from the snapshot taken before Surface, while
+/// one-quart spillover uses the scheduler's published neighbor palette. This
+/// retains the native stage's no-lock inner column scan and its exact
+/// BiomeManager input values.
+struct NativeSurfaceBiomeAccess<'a> {
+    biome_data: &'a [u16],
+    section_count: usize,
+    min_y: i32,
+    chunk_quart_x: i32,
+    chunk_quart_z: i32,
+    neighbor_biomes: &'a dyn Fn(IVec3) -> u16,
 }
 
-impl SurfaceExtensionBiomes {
-    fn from_possible(possible_biomes: &FxHashSet<Identifier>) -> Self {
-        Self {
-            eroded_badlands: possible_biomes.contains(&vanilla_biomes::ERODED_BADLANDS.key),
-            frozen_ocean: possible_biomes.contains(&vanilla_biomes::FROZEN_OCEAN.key)
-                || possible_biomes.contains(&vanilla_biomes::DEEP_FROZEN_OCEAN.key),
+impl NativeSurfaceBiomeAccess<'_> {
+    fn new<'a>(
+        biome_data: &'a [u16],
+        section_count: usize,
+        min_y: i32,
+        chunk_quart_x: i32,
+        chunk_quart_z: i32,
+        neighbor_biomes: &'a dyn Fn(IVec3) -> u16,
+    ) -> NativeSurfaceBiomeAccess<'a> {
+        NativeSurfaceBiomeAccess {
+            biome_data,
+            section_count,
+            min_y,
+            chunk_quart_x,
+            chunk_quart_z,
+            neighbor_biomes,
         }
     }
+}
 
-    const fn needs_surface_biome(self) -> bool {
-        self.eroded_badlands || self.frozen_ocean
+impl SurfaceBiomeAccess for NativeSurfaceBiomeAccess<'_> {
+    fn biome_id_at_quart(&mut self, quart_x: i32, quart_y: i32, quart_z: i32) -> u16 {
+        let in_chunk = quart_x >= self.chunk_quart_x
+            && quart_x < self.chunk_quart_x + 4
+            && quart_z >= self.chunk_quart_z
+            && quart_z < self.chunk_quart_z + 4;
+        if !in_chunk {
+            return (self.neighbor_biomes)(IVec3::new(quart_x, quart_y, quart_z));
+        }
+
+        let min_quart_y = self.min_y >> 2;
+        let total_quarts_y = self.section_count * 4;
+        let local_quart_x = (quart_x - self.chunk_quart_x) as usize;
+        let local_quart_z = (quart_z - self.chunk_quart_z) as usize;
+        let quart_y_in_chunk = (quart_y - min_quart_y).clamp(0, total_quarts_y as i32 - 1) as usize;
+        let section_index = quart_y_in_chunk / 4;
+        let local_quart_y = quart_y_in_chunk % 4;
+        self.biome_data[section_index * 64 + local_quart_y * 16 + local_quart_z * 4 + local_quart_x]
     }
 }
 
@@ -210,7 +242,7 @@ impl<N: DimensionNoises> VanillaGenerator<N> {
         // pool so its parallel construction does not initialize Rayon's global pool.
         let possible_biome_refs = thread_pool.install(|| biome_source.possible_biome_refs());
         let possible_biomes = biome_source.possible_biomes();
-        let surface_extension_biomes = SurfaceExtensionBiomes::from_possible(&possible_biomes);
+        let surface_extension_biomes = SurfaceExtensions::from_possible_biomes(&possible_biomes);
         let structure_generator =
             StructureGenerator::vanilla(seed as i64, world_path, &biome_source, thread_pool);
         let uniform_carver_biome = Self::uniform_carver_biome(&possible_biomes);
@@ -502,267 +534,34 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
         }
     }
 
-    #[expect(clippy::too_many_lines, reason = "splitting would hurt readability")]
     fn build_surface(
         &self,
         chunk: GenerationChunk<'_, SurfacePhase>,
         neighbor_biomes: &dyn Fn(IVec3) -> u16,
     ) {
-        let min_y = N::Settings::MIN_Y;
         let pos = chunk.pos();
         let chunk_min_x = pos.0.x * 16;
         let chunk_min_z = pos.0.y * 16;
-        let default_block_id = self.default_block_id;
-        let surface_rule_block_states = N::surface_rule_block_states();
-        let surface_rule_uses_biome = N::surface_rule_uses_biome();
-        let surface_rule_uses_preliminary_surface = N::surface_rule_uses_preliminary_surface();
-        let surface_rule_uses_surface_secondary = N::surface_rule_uses_surface_secondary();
-        let surface_rule_uses_steep = N::surface_rule_uses_steep();
-        let lazy_surface_rule_biome =
-            surface_rule_uses_biome && surface_rule_uses_preliminary_surface;
-        let surface_needs_min_surface_level =
-            surface_rule_uses_preliminary_surface || self.surface_extension_biomes.frozen_ocean;
-        let surface_needs_biomes =
-            surface_rule_uses_biome || self.surface_extension_biomes.needs_surface_biome();
-        let chunk_quart_x = pos.0.x * 4;
-        let chunk_quart_z = pos.0.y * 4;
-
-        chunk.prime_world_surface_heightmap();
-
-        // Pre-compute preliminary surface corners only for rules/extensions that read them.
-        let preliminary_surface_corners = surface_needs_min_surface_level
+        let stage = SurfaceStage::<N>::new(
+            &self.surface_system,
+            self.default_block_id,
+            self.biome_zoom_seed,
+            self.surface_extension_biomes,
+        );
+        let preliminary_surface_corners = stage
+            .needs_preliminary_surface()
             .then(|| self.preliminary_surface_corners(chunk, chunk_min_x, chunk_min_z));
-
-        let eroded_badlands_id = (*vanilla_biomes::ERODED_BADLANDS).id() as u16;
-        let frozen_ocean_id = (*vanilla_biomes::FROZEN_OCEAN).id() as u16;
-        let deep_frozen_ocean_id = (*vanilla_biomes::DEEP_FROZEN_OCEAN).id() as u16;
-
-        // Pre-extract biome palette values only if surface rules/extensions need them.
-        let biome_data = surface_needs_biomes.then(|| chunk.read_all_biomes());
-        let section_count = chunk.section_count();
-
-        let mut pending_writes: Vec<(usize, BlockStateId)> = Vec::new();
-        let mut column_buf: Vec<BlockStateId> = Vec::new();
-        let condition_noise_values = N::surface_noise_ids()
-            .iter()
-            .map(|_| Cell::new(0.0))
-            .collect::<Vec<_>>();
-        let condition_noise_initialized = N::surface_noise_ids()
-            .iter()
-            .map(|_| Cell::new(false))
-            .collect::<Vec<_>>();
-        let condition_noise_cache =
-            SurfaceConditionNoiseCache::new(&condition_noise_values, &condition_noise_initialized);
-
-        for local_x in 0..16usize {
-            for local_z in 0..16usize {
-                let block_x = chunk_min_x + local_x as i32;
-                let block_z = chunk_min_z + local_z as i32;
-
-                // Start scanning from one above the highest non-air block
-                let mut start_height = chunk.world_surface_height_at(local_x, local_z);
-
-                // Column-local Voronoi cache for fuzzed biome lookups.
-                let mut biome_col = biome_data.as_deref().map(|biome_data| {
-                    FuzzedBiomeColumn::new(
-                        biome_data,
-                        section_count,
-                        self.biome_zoom_seed,
-                        block_x,
-                        block_z,
-                        min_y,
-                        chunk_quart_x,
-                        chunk_quart_z,
-                        neighbor_biomes,
-                    )
-                });
-
-                // Eroded badlands extension: add terracotta pillars above surface
-                let surface_biome_id = if self.surface_extension_biomes.needs_surface_biome() {
-                    biome_col
-                        .as_mut()
-                        .map(|biome_col| biome_col.get(start_height))
-                } else {
-                    None
-                };
-                if self.surface_extension_biomes.eroded_badlands
-                    && surface_biome_id == Some(eroded_badlands_id)
-                {
-                    start_height = self.surface_system.eroded_badlands_extension(
-                        chunk,
-                        local_x,
-                        local_z,
-                        block_x,
-                        block_z,
-                        start_height,
-                        min_y,
-                    );
-                }
-
-                // Snapshot the column once — avoids per-block section locking in the Y scan.
-                // Taken after eroded_badlands_extension which may write blocks above the surface.
-                chunk.read_column_into(local_x, local_z, &mut column_buf);
-
-                // Surface depth for this column
-                let surface_depth = self.surface_system.get_surface_depth(block_x, block_z);
-
-                let surface_secondary = if surface_rule_uses_surface_secondary {
-                    self.surface_system.get_surface_secondary(block_x, block_z)
-                } else {
-                    0.0
-                };
-                condition_noise_cache.reset();
-
-                let min_surface_level = if let Some(corners) = preliminary_surface_corners {
-                    // Vanilla: (float)(blockX & 15) / 16.0F — exact for 0-15.
-                    let t_x = f64::from(local_x as u8) / 16.0;
-                    let t_z = f64::from(local_z as u8) / 16.0;
-                    let interp = lerp2(
-                        t_x,
-                        t_z,
-                        f64::from(corners.nw),
-                        f64::from(corners.ne),
-                        f64::from(corners.sw),
-                        f64::from(corners.se),
-                    );
-                    interp.floor() as i32 + surface_depth - 8
-                } else {
-                    0
-                };
-
-                // Steep condition: vanilla only checks south >= north + 4 and
-                // west >= east + 4 (asymmetric, not absolute difference).
-                let steep = surface_rule_uses_steep && {
-                    let z_north = local_z.saturating_sub(1);
-                    let z_south = (local_z + 1).min(15);
-                    let h_north = chunk.world_surface_height_at(local_x, z_north) - 1;
-                    let h_south = chunk.world_surface_height_at(local_x, z_south) - 1;
-                    if h_south >= h_north + 4 {
-                        true
-                    } else {
-                        let x_west = local_x.saturating_sub(1);
-                        let x_east = (local_x + 1).min(15);
-                        let h_west = chunk.world_surface_height_at(x_west, local_z) - 1;
-                        let h_east = chunk.world_surface_height_at(x_east, local_z) - 1;
-                        h_west >= h_east + 4
-                    }
-                };
-
-                let mut stone_depth_above: i32 = 0;
-                let mut water_height: i32 = i32::MIN;
-                let mut next_ceiling_stone_y: i32 = i32::MAX;
-                pending_writes.clear();
-
-                for y in (min_y..=start_height).rev() {
-                    let relative_y = (y - min_y) as usize;
-                    let state = column_buf[relative_y];
-
-                    if state.is_air() {
-                        stone_depth_above = 0;
-                        water_height = i32::MIN;
-                        continue;
-                    }
-
-                    if state.get_block().config.liquid {
-                        if water_height == i32::MIN {
-                            water_height = y + 1;
-                        }
-                        continue;
-                    }
-
-                    // Solid block — scan for stone_depth_below (lookahead)
-                    if next_ceiling_stone_y >= y {
-                        next_ceiling_stone_y = i32::MIN;
-                        for la_y in (min_y - 1..y).rev() {
-                            if la_y < min_y {
-                                next_ceiling_stone_y = la_y + 1;
-                                break;
-                            }
-                            let la_rel = (la_y - min_y) as usize;
-                            let la_state = column_buf[la_rel];
-                            // isStone = !isAir && !isLiquid
-                            if la_state.is_air() || la_state.get_block().config.liquid {
-                                next_ceiling_stone_y = la_y + 1;
-                                break;
-                            }
-                        }
-                    }
-
-                    stone_depth_above += 1;
-                    let stone_depth_below = y - next_ceiling_stone_y + 1;
-
-                    // Only apply surface rules to the default block
-                    if state == default_block_id {
-                        let eager_biome_id = if surface_rule_uses_biome && !lazy_surface_rule_biome
-                        {
-                            biome_col.as_mut().map(|biome_col| biome_col.get(y))
-                        } else {
-                            None
-                        };
-                        let biome_provider = if lazy_surface_rule_biome {
-                            biome_col
-                                .as_mut()
-                                .map(|biome_col| biome_col as &mut dyn SurfaceBiomeProvider)
-                        } else {
-                            None
-                        };
-
-                        let mut ctx = SurfaceRuleContext::new(
-                            block_x,
-                            block_z,
-                            surface_depth,
-                            surface_secondary,
-                            min_surface_level,
-                            steep,
-                            y,
-                            stone_depth_above,
-                            stone_depth_below,
-                            water_height,
-                            eager_biome_id,
-                            biome_provider,
-                            &self.surface_system,
-                            &condition_noise_cache,
-                            surface_rule_block_states,
-                        );
-
-                        let rule_result = N::try_apply_surface_rule(&mut ctx);
-
-                        if let Some(new_block) = rule_result {
-                            pending_writes.push((relative_y, new_block));
-                        }
-                    }
-                }
-
-                // Flush batched writes — holds each section's write guard once
-                if !pending_writes.is_empty() {
-                    chunk.write_column(local_x, local_z, &pending_writes);
-                    for &(relative_y, state) in &pending_writes {
-                        column_buf[relative_y] = state;
-                    }
-                }
-
-                // Frozen ocean iceberg extension: add packed ice and snow
-                if self.surface_extension_biomes.frozen_ocean
-                    && let Some(surface_biome_id) = surface_biome_id
-                        .filter(|id| *id == frozen_ocean_id || *id == deep_frozen_ocean_id)
-                {
-                    pending_writes.clear();
-                    self.surface_system.collect_frozen_ocean_extension_writes(
-                        surface_biome_id,
-                        block_x,
-                        block_z,
-                        start_height,
-                        min_surface_level,
-                        min_y,
-                        &column_buf,
-                        &mut pending_writes,
-                    );
-                    if !pending_writes.is_empty() {
-                        chunk.write_column(local_x, local_z, &pending_writes);
-                    }
-                }
-            }
-        }
+        let biome_data = stage.needs_biomes().then(|| chunk.read_all_biomes());
+        let mut biome_access = NativeSurfaceBiomeAccess::new(
+            biome_data.as_deref().unwrap_or(&[]),
+            chunk.section_count(),
+            chunk.min_y(),
+            pos.0.x * 4,
+            pos.0.y * 4,
+            neighbor_biomes,
+        );
+        let mut blocks = chunk;
+        stage.build_surface(&mut blocks, &mut biome_access, preliminary_surface_corners);
     }
 
     fn apply_carvers(&self, chunk: GenerationChunk<'_, CarversPhase>) {
@@ -1035,203 +834,6 @@ pub(crate) fn fuzzed_biome_at_block<F: FnMut(IVec3) -> u16>(
         },
     );
     quart_biome(b)
-}
-
-/// Column-local cache for fuzzed biome lookups (vanilla `BiomeManager.getBiome()`).
-///
-/// Within a column, `parent_x`, `parent_z`, `fract_x`, `fract_z` are constant.
-/// The 8 Voronoi candidate fiddle values (computed via 8 serial LCG calls each)
-/// only change when `parent_y` changes (every 4 blocks). This cache precomputes
-/// the fiddle values and X/Z distance components per `parent_y` group, reducing
-/// per-block work to 8 additions + 8 multiplies + 8 comparisons.
-struct FuzzedBiomeColumn<'a> {
-    biome_data: &'a [u16],
-    section_count: usize,
-    biome_zoom_seed: i64,
-    parent_x: i32,
-    parent_z: i32,
-    fract_x: f64,
-    fract_z: f64,
-    min_y: i32,
-    chunk_quart_x: i32,
-    chunk_quart_z: i32,
-    neighbor_biomes: &'a dyn Fn(IVec3) -> u16,
-    cached_parent_y: i32,
-    /// Per-candidate cached values: (`fy`, `xz_partial_distance`).
-    candidates: [(f64, f64); 8],
-    /// Precomputed `lcg_next(seed, parent_x)` and `lcg_next(seed, parent_x + 1)`.
-    rval_after_cx: [i64; 2],
-}
-
-impl<'a> FuzzedBiomeColumn<'a> {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "matches vanilla BiomeManager.getBiome signature"
-    )]
-    fn new(
-        biome_data: &'a [u16],
-        section_count: usize,
-        biome_zoom_seed: i64,
-        block_x: i32,
-        block_z: i32,
-        min_y: i32,
-        chunk_quart_x: i32,
-        chunk_quart_z: i32,
-        neighbor_biomes: &'a dyn Fn(IVec3) -> u16,
-    ) -> Self {
-        let abs_x = block_x - 2;
-        let abs_z = block_z - 2;
-        let parent_x = abs_x >> 2;
-        let parent_z = abs_z >> 2;
-        Self {
-            biome_data,
-            section_count,
-            biome_zoom_seed,
-            parent_x,
-            parent_z,
-            fract_x: f64::from(abs_x & 3) / 4.0,
-            fract_z: f64::from(abs_z & 3) / 4.0,
-            min_y,
-            chunk_quart_x,
-            chunk_quart_z,
-            neighbor_biomes,
-            cached_parent_y: i32::MIN,
-            candidates: [(0.0, 0.0); 8],
-            rval_after_cx: [
-                lcg_next(biome_zoom_seed, i64::from(parent_x)),
-                lcg_next(biome_zoom_seed, i64::from(parent_x + 1)),
-            ],
-        }
-    }
-
-    /// Compute candidates for a given `cy`, writing to either the low (bit1=0)
-    /// or high (bit1=1) slots. Shares the `lcg_next(seed, cx)` precomputation
-    /// and the `lcg_next(_, cy)` step within each cx group.
-    #[inline]
-    fn compute_cy_group(&mut self, cy: i32, high: bool) {
-        let base_idx = if high { 2 } else { 0 };
-        for cx_idx in 0..2usize {
-            let cx = self.parent_x + cx_idx as i32;
-            let dx = if cx_idx == 0 {
-                self.fract_x
-            } else {
-                self.fract_x - 1.0
-            };
-            let rval_cy = lcg_next(self.rval_after_cx[cx_idx], i64::from(cy));
-            for cz_off in 0..2usize {
-                let cz = self.parent_z + cz_off as i32;
-                let dz = if cz_off == 0 {
-                    self.fract_z
-                } else {
-                    self.fract_z - 1.0
-                };
-
-                let mut rval = lcg_next(rval_cy, i64::from(cz));
-                rval = lcg_next(rval, i64::from(cx));
-                rval = lcg_next(rval, i64::from(cy));
-                rval = lcg_next(rval, i64::from(cz));
-                let fx = get_fiddle(rval);
-                rval = lcg_next(rval, self.biome_zoom_seed);
-                let fy = get_fiddle(rval);
-                rval = lcg_next(rval, self.biome_zoom_seed);
-                let fz = get_fiddle(rval);
-
-                let xz_partial = (dx + fx) * (dx + fx) + (dz + fz) * (dz + fz);
-                self.candidates[cx_idx * 4 + base_idx + cz_off] = (fy, xz_partial);
-            }
-        }
-    }
-
-    /// Recompute the 8 candidate fiddle values and X/Z distance for a new `parent_y`.
-    ///
-    /// When scanning downward (`parent_y` decreases by 1), the old low-cy candidates
-    /// (`cy=old_parent_y`) match the new high-cy slots (`cy=new_parent_y+1`), so only
-    /// the 4 new low-cy candidates need fresh LCG computation.
-    fn recompute_candidates(&mut self, parent_y: i32) {
-        if self.cached_parent_y != i32::MIN && parent_y == self.cached_parent_y - 1 {
-            // Reuse: old low-cy group → new high-cy group
-            self.candidates[2] = self.candidates[0];
-            self.candidates[3] = self.candidates[1];
-            self.candidates[6] = self.candidates[4];
-            self.candidates[7] = self.candidates[5];
-            self.compute_cy_group(parent_y, false);
-        } else {
-            self.compute_cy_group(parent_y, false);
-            self.compute_cy_group(parent_y + 1, true);
-        }
-        self.cached_parent_y = parent_y;
-    }
-
-    /// Fuzzed biome lookup for a given `block_y`.
-    #[expect(
-        clippy::similar_names,
-        reason = "matches vanilla variable names: fract_x/y/z, parent_x/y/z"
-    )]
-    #[inline]
-    fn get(&mut self, block_y: i32) -> u16 {
-        let abs_y = block_y - 2;
-        let parent_y = abs_y >> 2;
-        let fract_y = f64::from(abs_y & 3) / 4.0;
-
-        if parent_y != self.cached_parent_y {
-            self.recompute_candidates(parent_y);
-        }
-
-        let mut min_i = 0usize;
-        let mut min_dist = f64::INFINITY;
-        for i in 0..8usize {
-            let (fy, xz_partial) = self.candidates[i];
-            let dy = if (i & 2) == 0 { fract_y } else { fract_y - 1.0 };
-            let dist = xz_partial + (dy + fy) * (dy + fy);
-            if min_dist > dist {
-                min_i = i;
-                min_dist = dist;
-            }
-        }
-
-        let biome_quart = IVec3::new(
-            if (min_i & 4) == 0 {
-                self.parent_x
-            } else {
-                self.parent_x + 1
-            },
-            if (min_i & 2) == 0 {
-                parent_y
-            } else {
-                parent_y + 1
-            },
-            if (min_i & 1) == 0 {
-                self.parent_z
-            } else {
-                self.parent_z + 1
-            },
-        );
-
-        let in_chunk = biome_quart.x >= self.chunk_quart_x
-            && biome_quart.x < self.chunk_quart_x + 4
-            && biome_quart.z >= self.chunk_quart_z
-            && biome_quart.z < self.chunk_quart_z + 4;
-
-        if in_chunk {
-            let min_qy = self.min_y >> 2;
-            let total_quarts_y = self.section_count * 4;
-            let local_qx = (biome_quart.x - self.chunk_quart_x) as usize;
-            let local_qz = (biome_quart.z - self.chunk_quart_z) as usize;
-            let qy_in_chunk = (biome_quart.y - min_qy).clamp(0, total_quarts_y as i32 - 1) as usize;
-            let section_idx = qy_in_chunk / 4;
-            let local_qy = qy_in_chunk % 4;
-            self.biome_data[section_idx * 64 + local_qy * 16 + local_qz * 4 + local_qx]
-        } else {
-            (self.neighbor_biomes)(biome_quart)
-        }
-    }
-}
-
-impl SurfaceBiomeProvider for FuzzedBiomeColumn<'_> {
-    #[inline]
-    fn biome_id(&mut self, block_y: i32) -> u16 {
-        self.get(block_y)
-    }
 }
 
 #[cfg(test)]

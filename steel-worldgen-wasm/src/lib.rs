@@ -420,6 +420,35 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn terrain_tile_serializes_final_surface_blocks_parallel_to_samples() {
+        let generator = SteelWorldgen::new("0", "overworld")
+            .unwrap_or_else(|error| panic!("surface generator should initialize: {error:?}"));
+        let value: serde_json::Value = serde_json::from_str(
+            &generator
+                .terrain_tile(0, 0, 16, 16)
+                .unwrap_or_else(|error| panic!("surface tile should serialize: {error:?}")),
+        )
+        .unwrap_or_else(|error| panic!("surface tile response must be JSON: {error}"));
+        let blocks = value["surfaceBlocks"]
+            .as_array()
+            .unwrap_or_else(|| panic!("surface tile response must include surfaceBlocks"));
+        let heights = value["heights"]
+            .as_array()
+            .unwrap_or_else(|| panic!("surface tile response must include heights"));
+        let present = value["present"]
+            .as_array()
+            .unwrap_or_else(|| panic!("surface tile response must include present"));
+
+        assert_eq!(blocks.len(), heights.len());
+        assert_eq!(blocks.len(), present.len());
+        assert!(
+            blocks
+                .iter()
+                .all(|block| matches!(block.as_str(), Some(key) if key.starts_with("minecraft:")))
+        );
+    }
 }
 
 #[derive(Serialize)]
@@ -438,6 +467,7 @@ struct TerrainResponse<'a> {
     colors: Vec<u8>,
     biomes: Vec<String>,
     biome_indices: Vec<u16>,
+    surface_blocks: Vec<String>,
     min_height: i16,
     max_height: i16,
     min_y: i16,
@@ -528,6 +558,7 @@ impl<'a> TerrainResponse<'a> {
             colors: tile.colors,
             biomes: tile.biomes,
             biome_indices: tile.biome_indices,
+            surface_blocks: tile.surface_blocks,
             min_height,
             max_height,
             min_y: tile.min_y,

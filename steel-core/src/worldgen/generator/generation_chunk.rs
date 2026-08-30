@@ -1,6 +1,7 @@
 use std::marker::PhantomData;
 
 use steel_utils::{BlockPos, BlockStateId, ChunkPos, DowncastType, types::UpdateFlags};
+use steel_worldgen::surface::SurfaceBlockAccess;
 
 use crate::chunk::Chunk;
 use crate::chunk::chunk_holder::ChunkHolder;
@@ -248,6 +249,57 @@ impl GenerationChunk<'_, SurfacePhase> {
             relative_z,
             state,
         );
+    }
+}
+
+/// Adapts the native status-scoped chunk capability to the portable Surface
+/// kernel without exposing the underlying chunk to lower-level worldgen code.
+impl SurfaceBlockAccess for GenerationChunk<'_, SurfacePhase> {
+    fn min_y(&self) -> i32 {
+        (*self).min_y()
+    }
+
+    fn chunk_min_x(&self) -> i32 {
+        (*self).pos().0.x * 16
+    }
+
+    fn chunk_min_z(&self) -> i32 {
+        (*self).pos().0.y * 16
+    }
+
+    fn prime_world_surface_heightmap(&mut self) {
+        (*self).prime_world_surface_heightmap();
+    }
+
+    fn world_surface_height_at(&mut self, local_x: usize, local_z: usize) -> i32 {
+        (*self).world_surface_height_at(local_x, local_z)
+    }
+
+    fn read_column_into(&mut self, local_x: usize, local_z: usize, output: &mut Vec<BlockStateId>) {
+        (*self).read_column_into(local_x, local_z, output);
+    }
+
+    fn write_column(&mut self, local_x: usize, local_z: usize, blocks: &[(usize, BlockStateId)]) {
+        (*self).write_column(local_x, local_z, blocks);
+    }
+
+    fn get_relative_block(
+        &mut self,
+        local_x: usize,
+        relative_y: usize,
+        local_z: usize,
+    ) -> Option<BlockStateId> {
+        (*self).get_relative_block(local_x, relative_y, local_z)
+    }
+
+    fn set_relative_block(
+        &mut self,
+        local_x: usize,
+        relative_y: usize,
+        local_z: usize,
+        state: BlockStateId,
+    ) {
+        (*self).set_relative_block(local_x, relative_y, local_z, state);
     }
 }
 

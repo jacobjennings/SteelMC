@@ -21,6 +21,8 @@ use steel_utils::{BlockPos, BlockStateId, Identifier};
 use steel_worldgen::density::DimensionNoises;
 use steel_worldgen::surface::{SurfaceConditionNoiseCache, SurfaceRuleContext};
 
+pub use steel_worldgen::surface::PreliminarySurfaceCorners;
+
 use crate::chunk::heightmap::Heightmap;
 use crate::worldgen::generator::{CarversPhase, GenerationChunk};
 use crate::worldgen::surface::SurfaceSystem;
@@ -31,21 +33,6 @@ pub mod cave;
 mod mask;
 
 pub use mask::CarvingMask;
-
-/// The four preliminary-surface-level samples at a chunk's block corners, in
-/// world Y. Indexed by local `(x, z)` corner as `(0,0)`, `(16,0)`, `(0,16)`,
-/// `(16,16)`.
-#[derive(Debug, Clone, Copy)]
-pub struct PreliminarySurfaceCorners {
-    /// Corner at `(chunk_min_x, chunk_min_z)`.
-    pub nw: i32,
-    /// Corner at `(chunk_min_x + 16, chunk_min_z)`.
-    pub ne: i32,
-    /// Corner at `(chunk_min_x, chunk_min_z + 16)`.
-    pub sw: i32,
-    /// Corner at `(chunk_min_x + 16, chunk_min_z + 16)`.
-    pub se: i32,
-}
 
 /// A source chunk's position and carver-list biome — the unit of work in the
 /// 17×17 `apply_carvers` loop. Each entry feeds one or more carver

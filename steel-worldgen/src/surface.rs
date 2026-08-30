@@ -4,6 +4,12 @@ use std::cell::Cell;
 
 use crate::BlockStateId;
 
+pub use crate::surface_stage::{
+    PreliminarySurfaceCorners, SurfaceBiomeAccess, SurfaceBlockAccess, SurfaceExtensions,
+    SurfaceStage,
+};
+pub use crate::surface_system::{SurfaceSystem, TemperatureXzCache};
+
 /// Context data passed to transpiled surface rule functions.
 ///
 /// This is a flat struct holding all the values a surface rule condition might need.

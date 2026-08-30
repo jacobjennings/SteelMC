@@ -46,41 +46,50 @@ for `wasm32-unknown-unknown` through the pinned 32-bit-capable `simdnbt` fork.
 
 The `steel-worldgen-wasm` leaf crate exposes a reusable seeded sampler for the
 Overworld, Nether, and End. It runs the real Steel density functions and biome
-source and is integrated into the viewer through Web Workers. Its current tile
-DTO is a surface height/color grid, so it does not yet expose vertical cave and
-overhang geometry or run the native Features pipeline (surface blocks,
-structures, trees, and decoration). Those remain available through the native
-service. The generated web package is about 7 MiB before HTTP compression.
+source and is integrated into the viewer through Web Workers. Its tile DTO is a
+surface height/color grid with canonical final `surfaceBlocks` IDs, but it does
+not expose vertical cave and overhang geometry or run the native Features
+pipeline (structures, trees, and decoration). Those remain available through
+the native service. The generated web package is about 7 MiB before HTTP
+compression.
 
 ### Final-surface and foliage boundary
 
-`terrain_tile` currently ends after `steel-worldgen::surface_sampler` has
-sampled density heights. It has not executed the canonical Surface phase, so a
-missing `surfaceBlocks` field means exactly "no post-surface-rule block IDs",
-not stone or a viewer-selected material. Consumers may select an exact renderer
-asset directly for a supplied canonical ID when that asset exists; unrepresented
-IDs must remain explicitly unmodeled rather than being collapsed into a
-lookalike atlas cell. The viewer contract validates this optional
-`surfaceBlocks` array as one canonical block key per terrain sample.
+`terrain_tile` now fills an in-memory 16×16 noise/aquifer chunk and executes
+the same reusable `steel-worldgen` Surface kernel used by the native generator.
+`surfaceBlocks` is a required, sample-parallel array of canonical final
+non-fluid top-block IDs (or `minecraft:air` where no solid column exists).
+The retained terrain height is the Y of that same final solid state, leaving
+the viewer's water plane independent. Consumers may select an exact renderer
+asset directly for a supplied canonical ID when that asset exists;
+unrepresented IDs must remain explicitly unmodeled rather than being collapsed
+into a lookalike atlas cell.
 
-The implementation boundary is presently concrete:
+The implementation boundary is concrete:
 
 1. `steel-core::worldgen::generator::VanillaGenerator::fill_from_noise` builds
    the mutable noise/aquifer column state in a `GenerationChunk<NoisePhase>`.
-2. `VanillaGenerator::build_surface` then evaluates generated surface rules
-   against that complete column through `SurfaceSystem`,
-   `FuzzedBiomeColumn`, and `GenerationChunk<SurfacePhase>`.
+2. `VanillaGenerator::build_surface` and the WASM host both evaluate generated
+   surface rules through `SurfaceStage`, `SurfaceSystem`, and a
+   `SurfaceBlockAccess` host. The browser host supplies the exact aquifer
+   preliminary-surface corners and a 3×3 chunk biome-palette ring consumed by
+   the shared fuzzed-biome lookup.
 3. Decoration is later run by `FeatureDecorationRunner` against a
    `WorldGenRegion`; tree and foliage placements can cross chunk boundaries and
    cannot be reduced to independent terrain samples without changing vanilla
    placement semantics.
 
-Therefore the next correct WASM slice is a reusable surface-stage kernel that
-owns the same mutable 16x16 noise/aquifer columns and `SurfaceSystem` inputs as
-step 2, exposed as `surfaceBlocks` after the final top-block selection. It must
-be shared with the native terrain adapter rather than reimplementing the rules
-in JavaScript. Feature/foliage output remains a subsequent region-generation
-slice; do not synthesize decoration from biome, height, or random noise.
+The shared surface implementation lives below `steel-core`, so it remains safe
+for `wasm32-unknown-unknown`; native `GenerationChunk<SurfacePhase>` adapts to
+the same traits. Feature/foliage output remains a subsequent
+region-generation slice; do not synthesize decoration from biome, height, or
+random noise.
+
+The existing `steel-core` generator cannot simply be linked into the browser
+leaf crate: its unconditional Tokio networking feature currently pulls in Mio,
+which rejects `wasm32-unknown-unknown`. A WASM-ready surface kernel must be
+extracted below that server dependency boundary, rather than weakening the
+target check or adding a browser-only approximation.
 
 ## Milestones
 
