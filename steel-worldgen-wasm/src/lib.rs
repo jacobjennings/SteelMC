@@ -115,6 +115,7 @@ impl SteelWorldgen {
             size,
             resolution,
             tile,
+            None,
         ))
         .map_err(|error| JsValue::from_str(&error.to_string()))
     }
@@ -146,6 +147,7 @@ impl SteelWorldgen {
             size,
             resolution,
             tile,
+            None,
         ))
         .map_err(|error| JsValue::from_str(&error.to_string()))
     }
@@ -174,6 +176,7 @@ impl SteelWorldgen {
             size,
             resolution,
             tile,
+            Some("preliminary_surface_level"),
         ))
         .map_err(|error| JsValue::from_str(&error.to_string()))
     }
@@ -592,6 +595,8 @@ struct TerrainResponse<'a> {
     resolution: u32,
     samples_per_side: u32,
     heights: Vec<i16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height_approximation: Option<&'static str>,
     colors: Vec<u8>,
     biomes: Vec<String>,
     biome_indices: Vec<u16>,
@@ -672,6 +677,7 @@ impl<'a> TerrainResponse<'a> {
         size: u32,
         resolution: u32,
         tile: SurfaceTile,
+        height_approximation: Option<&'static str>,
     ) -> Self {
         let mut terrain_heights = tile
             .heights
@@ -694,6 +700,7 @@ impl<'a> TerrainResponse<'a> {
             resolution,
             samples_per_side: tile.samples_per_side,
             heights: tile.heights,
+            height_approximation,
             colors: tile.colors,
             biomes: tile.biomes,
             biome_indices: tile.biome_indices,
