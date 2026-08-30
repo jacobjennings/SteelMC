@@ -12,7 +12,7 @@ Environment:
   WASM_OPT=LEVEL    Run wasm-opt after wasm-bindgen (for example, -Oz or -O3).
 
 SIMD compatibility: WebAssembly SIMD is supported by Chrome 91+, Firefox 89+,
-and Safari 16.4+. Keep WASM_SIMD unset for older browsers.
+and Safari 16.4+. Set WASM_SIMD=0 for older browsers.
 EOF
 }
 
