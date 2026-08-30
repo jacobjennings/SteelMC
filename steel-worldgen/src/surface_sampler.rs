@@ -36,6 +36,10 @@ pub struct SurfaceTile {
     pub heights: Vec<i16>,
     /// RGB bytes derived from the sampled biome's configured grass colour.
     pub colors: Vec<u8>,
+    /// Canonical registry identifiers for the sampled biomes, in palette order.
+    pub biomes: Vec<String>,
+    /// Palette index for each sample, parallel to `heights` and `present`.
+    pub biome_indices: Vec<u16>,
     /// Whether the sampled column contains solid terrain.
     pub present: Vec<u8>,
     /// Dimension minimum build height.
@@ -114,6 +118,9 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         let mut heights = Vec::with_capacity(capacity);
         let mut colors = Vec::with_capacity(capacity * 3);
         let mut present = Vec::with_capacity(capacity);
+        let mut biomes = Vec::new();
+        let mut biome_lookup = HashMap::new();
+        let mut biome_indices = Vec::with_capacity(capacity);
 
         for sample_z in 0..samples_per_side {
             for sample_x in 0..samples_per_side {
@@ -137,6 +144,20 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
 
                 let mut biome_sampler = self.biome_source.chunk_sampler();
                 let biome = biome_sampler.sample(x >> 2, i32::from(display_height) >> 2, z >> 2);
+                let biome_key = format!("{}:{}", biome.key.namespace, biome.key.path);
+                let palette_index = if let Some(index) = biome_lookup.get(&biome_key) {
+                    *index
+                } else {
+                    assert!(
+                        biomes.len() < usize::from(u16::MAX),
+                        "biome palette exceeds u16"
+                    );
+                    let index = biomes.len() as u16;
+                    biome_lookup.insert(biome_key.clone(), index);
+                    biomes.push(biome_key);
+                    index
+                };
+                biome_indices.push(palette_index);
                 let color = biome.effects.grass_color.unwrap_or(0x6a_a8_4f) as u32;
                 colors.extend_from_slice(&[(color >> 16) as u8, (color >> 8) as u8, color as u8]);
             }
@@ -146,6 +167,8 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             samples_per_side,
             heights,
             colors,
+            biomes,
+            biome_indices,
             present,
             min_y: N::Settings::MIN_Y as i16,
         }
