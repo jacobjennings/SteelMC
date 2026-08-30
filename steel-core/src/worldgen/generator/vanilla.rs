@@ -282,6 +282,21 @@ impl<N: DimensionNoises> VanillaGenerator<N> {
 }
 
 impl<N: VanillaPostNoiseStateType> VanillaGenerator<N> {
+    #[cfg(test)]
+    pub(crate) fn apply_selected_biome_decorations_for_test(
+        &self,
+        region: &mut WorldGenRegion<'_>,
+        selected: &FxHashSet<Identifier>,
+    ) {
+        self.feature_runner.decorate_selected_features_for_test(
+            region,
+            &REGISTRY,
+            self.seed,
+            self.biome_zoom_seed,
+            selected,
+        );
+    }
+
     fn preliminary_surface_corners(
         &self,
         chunk: GenerationChunk<'_, SurfacePhase>,

@@ -6,8 +6,12 @@ extern crate self as steel_worldgen;
 
 pub use steel_utils::{BlockStateId, random};
 
+/// Vanilla biome-coordinate fuzzing shared by worldgen stages.
+pub mod biome_zoom;
 /// Biome sources and climate samplers.
 pub mod biomes;
+/// Portable Vanilla carver runtime and host traits.
+pub mod carver;
 /// Density function system for world generation.
 pub mod density;
 /// Noise generation utilities for world generation.
@@ -26,6 +30,8 @@ pub mod surface_stage;
 pub mod surface_system;
 /// utils
 pub mod utils;
+/// Portable placed-feature vegetation runtime used by native and WASM hosts.
+pub mod vegetation;
 
 #[expect(warnings)]
 #[rustfmt::skip]

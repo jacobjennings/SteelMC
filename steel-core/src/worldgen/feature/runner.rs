@@ -187,6 +187,66 @@ impl FeatureDecorationRunner {
         }
     }
 
+    /// Runs only an explicitly selected set of placed features for an
+    /// isolated transaction-parity fixture.
+    ///
+    /// This deliberately omits structure placement and every unselected
+    /// feature. It is test-only: production decoration must always execute
+    /// the complete, ordered feature union because neighbouring features can
+    /// alter later placement eligibility.
+    #[cfg(test)]
+    pub(crate) fn decorate_selected_features_for_test(
+        &self,
+        region: &mut WorldGenRegion<'_>,
+        registry: &Registry,
+        seed: i64,
+        biome_zoom_seed: i64,
+        selected: &FxHashSet<Identifier>,
+    ) {
+        let center = region.center();
+        let origin = BlockPos::new(center.0.x * 16, region.min_y(), center.0.y * 16);
+        let possible_biomes = self.collect_possible_biome_ids(region);
+
+        let mut random = WorldgenRandom::from_seed(0);
+        let decoration_seed = random.set_decoration_seed(seed, origin.x(), origin.z());
+        for step in 0..self.sorter.step_count() {
+            let Some(step_features) = self.sorter.step(step) else {
+                continue;
+            };
+            let mut feature_indices = SmallVec::<[usize; 64]>::new();
+            for &biome_id in &possible_biomes {
+                if let Some(indices) = step_features.feature_indices_for_biome(biome_id) {
+                    feature_indices.extend_from_slice(indices);
+                }
+            }
+            feature_indices.sort_unstable();
+            feature_indices.dedup();
+
+            for feature_index in feature_indices {
+                let Some(feature) = step_features.feature(feature_index) else {
+                    panic!(
+                        "decoration step {step} references missing feature index {feature_index}"
+                    );
+                };
+                if !selected.contains(&feature.key) {
+                    continue;
+                }
+                let feature_index = i32::try_from(feature_index)
+                    .expect("decoration feature index exceeds i32 range");
+                let step = i32::try_from(step).expect("decoration step exceeds i32 range");
+                random.set_feature_seed(decoration_seed, feature_index, step);
+                Self::place_placed_feature_entry(
+                    region,
+                    registry,
+                    &mut random,
+                    origin,
+                    feature,
+                    biome_zoom_seed,
+                );
+            }
+        }
+    }
+
     pub(super) fn collect_possible_biome_ids(&self, region: &WorldGenRegion<'_>) -> Vec<usize> {
         let center = region.center();
         let mut seen = vec![false; self.source_biome_lookup.len()];

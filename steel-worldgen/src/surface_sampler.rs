@@ -13,6 +13,7 @@ use steel_utils::random::{
 };
 
 use crate::biomes::{BiomeSourceKind, obfuscate_biome_seed};
+use crate::carver::{CarverBlockAccess, CarverStage};
 use crate::density::{ColumnCache, DimensionNoises, NoiseSettings};
 use crate::density_functions::{end::EndNoises, nether::NetherNoises, overworld::OverworldNoises};
 use crate::noise::NoiseChunk;
@@ -22,6 +23,9 @@ use crate::surface::{
     PreliminarySurfaceCorners, SurfaceBiomeAccess, SurfaceBlockAccess, SurfaceExtensions,
     SurfaceStage, SurfaceSystem,
 };
+use crate::vegetation::{VegetationBlockAccess, VegetationStage};
+use steel_registry::feature::FeatureHeightmap;
+use steel_utils::BlockPos;
 
 /// Dimension supported by the static sampler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,8 +58,29 @@ pub struct SurfaceTile {
     /// Air samples use minecraft:air. This data ends after the Surface stage:
     /// carvers, structures and feature decoration have not run.
     pub surface_blocks: Vec<String>,
+    /// Sparse final states written by the portable vegetation Features slice.
+    ///
+    /// Positions are absolute world coordinates.  The list is sorted by X/Y/Z
+    /// and contains only the final state at each coordinate after all source
+    /// chunks in this tile have been processed.
+    pub vegetation_blocks: Vec<SurfaceVegetationBlock>,
     /// Dimension minimum build height.
     pub min_y: i16,
+}
+
+/// Canonical sparse vegetation placement returned with a surface tile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfaceVegetationBlock {
+    /// Absolute world X coordinate.
+    pub x: i32,
+    /// Absolute world Y coordinate.
+    pub y: i32,
+    /// Absolute world Z coordinate.
+    pub z: i32,
+    /// Canonical registry block identifier (without state properties).
+    pub block: String,
+    /// Canonical state identifier including every explicit property.
+    pub state: String,
 }
 
 /// Compact base-noise volume for one 16×16 chunk footprint.
@@ -76,6 +101,16 @@ pub struct NoiseVolume {
     pub lod: u16,
     /// Compact material-class data in X/Z/Y order.
     pub voxels: Vec<u8>,
+}
+
+/// Raw post-Carvers chunk data exposed only for cross-host regression tests.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct CarvedChunkSnapshot {
+    /// Block-state IDs in native section Y/Z/X order.
+    pub states: Vec<BlockStateId>,
+    /// `WORLD_SURFACE_WG` first-available height in local Z/X order.
+    pub world_surface_wg: [i32; 256],
 }
 
 /// Seeded sampler reusable across many tile requests.
@@ -151,6 +186,40 @@ impl SurfaceSampler {
             }
         }
     }
+
+    /// Returns a post-Carvers chunk snapshot for native/portable parity tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn carved_chunk_snapshot(&self, chunk_x: i32, chunk_z: i32) -> CarvedChunkSnapshot {
+        match self {
+            Self::Overworld(sampler) => sampler.carved_chunk_snapshot(chunk_x, chunk_z),
+            Self::Nether(sampler) => sampler.carved_chunk_snapshot(chunk_x, chunk_z),
+            Self::End(sampler) => sampler.carved_chunk_snapshot(chunk_x, chunk_z),
+        }
+    }
+
+    /// Returns one isolated sparse vegetation source transaction after Surface
+    /// and Carvers. This exists for native/portable transaction-parity tests;
+    /// normal callers should use [`Self::tile`], which includes the source halo.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn selected_vegetation_transaction_snapshot(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+    ) -> Vec<SurfaceVegetationBlock> {
+        match self {
+            Self::Overworld(sampler) => {
+                sampler.selected_vegetation_transaction_snapshot(chunk_x, chunk_z)
+            }
+            Self::Nether(sampler) => {
+                sampler.selected_vegetation_transaction_snapshot(chunk_x, chunk_z)
+            }
+            Self::End(sampler) => {
+                sampler.selected_vegetation_transaction_snapshot(chunk_x, chunk_z)
+            }
+        }
+    }
 }
 
 /// Generic dimension implementation kept public so native adapters can reuse it.
@@ -162,6 +231,7 @@ pub struct DimensionSurfaceSampler<N: DimensionNoises> {
     surface_system: SurfaceSystem,
     surface_extensions: SurfaceExtensions,
     biome_zoom_seed: i64,
+    vegetation_stage: VegetationStage,
 }
 
 impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
@@ -184,6 +254,13 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             N::Settings::SEA_LEVEL,
         );
         let ore_veinifier = N::Settings::ORE_VEINS_ENABLED.then(|| OreVeinifier::new(&splitter));
+        let biome_zoom_seed = obfuscate_biome_seed(seed as i64);
+        let vegetation_stage = VegetationStage::new(
+            seed as i64,
+            biome_zoom_seed,
+            &biome_source.possible_biome_refs(),
+            &REGISTRY,
+        );
         Self {
             noises: Box::new(N::create(seed, &splitter, &noise_parameters)),
             biome_source,
@@ -191,7 +268,8 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             ore_veinifier,
             surface_system,
             surface_extensions,
-            biome_zoom_seed: obfuscate_biome_seed(seed as i64),
+            biome_zoom_seed,
+            vegetation_stage,
         }
     }
 
@@ -216,7 +294,7 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
                 let chunk_z = z.div_euclid(16);
                 let chunk = chunks
                     .entry((chunk_x, chunk_z))
-                    .or_insert_with(|| self.sample_surface_chunk(chunk_x, chunk_z));
+                    .or_insert_with(|| self.sample_surface_chunk_data(chunk_x, chunk_z));
                 let index = (z.rem_euclid(16) * 16 + x.rem_euclid(16)) as usize;
                 let (height, state, exists) = chunk.top_surface(index);
                 heights.push(height);
@@ -244,6 +322,8 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             }
         }
 
+        let vegetation_blocks = self.vegetation_tile(origin_x, origin_z, size, &mut chunks);
+
         SurfaceTile {
             samples_per_side,
             heights,
@@ -252,11 +332,96 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             biome_indices,
             present,
             surface_blocks,
+            vegetation_blocks,
             min_y: N::Settings::MIN_Y as i16,
         }
     }
 
-    fn sample_surface_chunk(&self, chunk_x: i32, chunk_z: i32) -> SurfaceChunkTop {
+    fn vegetation_tile(
+        &self,
+        origin_x: i32,
+        origin_z: i32,
+        size: u32,
+        chunks: &mut HashMap<(i32, i32), InMemorySurfaceChunk>,
+    ) -> Vec<SurfaceVegetationBlock> {
+        let min_chunk_x = origin_x.div_euclid(16);
+        let min_chunk_z = origin_z.div_euclid(16);
+        let max_x = origin_x + size as i32 - 1;
+        let max_z = origin_z + size as i32 - 1;
+        let max_chunk_x = max_x.div_euclid(16);
+        let max_chunk_z = max_z.div_euclid(16);
+
+        // Features writes can cross one chunk boundary.  Sources in the first
+        // surrounding ring may therefore contribute a tree crown or flower to
+        // this tile; each such source itself requires a 3×3 read halo.
+        let source_min_chunk_x = min_chunk_x - 1;
+        let source_min_chunk_z = min_chunk_z - 1;
+        let source_max_chunk_x = max_chunk_x + 1;
+        let source_max_chunk_z = max_chunk_z + 1;
+        for chunk_z in source_min_chunk_z - 1..=source_max_chunk_z + 1 {
+            for chunk_x in source_min_chunk_x - 1..=source_max_chunk_x + 1 {
+                chunks
+                    .entry((chunk_x, chunk_z))
+                    .or_insert_with(|| self.sample_surface_chunk_data(chunk_x, chunk_z));
+            }
+        }
+
+        // Vanilla Features reads post-Carvers chunks. Carvers do not write
+        // across chunk boundaries, so every retained terrain chunk can be
+        // carved independently after its complete Surface state exists.
+        for chunk_z in source_min_chunk_z - 1..=source_max_chunk_z + 1 {
+            for chunk_x in source_min_chunk_x - 1..=source_max_chunk_x + 1 {
+                let chunk = chunks
+                    .get_mut(&(chunk_x, chunk_z))
+                    .expect("terrain halo chunk must have been initialized");
+                self.apply_carvers_to_chunk(chunk);
+            }
+        }
+
+        let mut region = InMemoryVegetationRegion::new(
+            chunks,
+            &self.biome_source,
+            N::Settings::MIN_Y,
+            N::Settings::HEIGHT,
+        );
+        let mut changed_positions = std::collections::HashSet::<(i32, i32, i32)>::new();
+        // Native feature tasks are submitted in canonical X/Z ascending
+        // order. Preserve that write order for overlapping crowns from
+        // neighboring source chunks.
+        for chunk_x in source_min_chunk_x..=source_max_chunk_x {
+            for chunk_z in source_min_chunk_z..=source_max_chunk_z {
+                for block in
+                    self.vegetation_stage
+                        .decorate_chunk(&mut region, &REGISTRY, chunk_x, chunk_z)
+                {
+                    if block.x >= origin_x
+                        && block.x <= max_x
+                        && block.z >= origin_z
+                        && block.z <= max_z
+                    {
+                        changed_positions.insert((block.x, block.y, block.z));
+                    }
+                }
+            }
+        }
+        let mut final_blocks = changed_positions
+            .into_iter()
+            .map(|(x, y, z)| {
+                let state = region.block_state(BlockPos::new(x, y, z));
+                SurfaceVegetationBlock {
+                    x,
+                    y,
+                    z,
+                    block: canonical_block_key(state),
+                    state: canonical_block_state_key(state),
+                }
+            })
+            .collect::<Vec<_>>();
+        final_blocks.sort_by_key(|block| (block.x, block.y, block.z));
+        final_blocks
+    }
+
+    fn sample_surface_chunk_data(&self, chunk_x: i32, chunk_z: i32) -> InMemorySurfaceChunk {
         let chunk_min_x = chunk_x * 16;
         let chunk_min_z = chunk_z * 16;
         let min_y = N::Settings::MIN_Y;
@@ -339,7 +504,70 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         let mut biomes =
             InMemorySurfaceBiomeAccess::new(&self.biome_source, chunk_x, chunk_z, min_y, height);
         stage.build_surface(&mut blocks, &mut biomes, preliminary_surface_corners);
-        blocks.into_top_surface()
+        blocks
+    }
+
+    fn apply_carvers_to_chunk(&self, chunk: &mut InMemorySurfaceChunk) {
+        let carvers = CarverStage::<N>::new(
+            &self.noises,
+            &self.splitter,
+            &self.surface_system,
+            self.vegetation_stage.seed(),
+            self.biome_zoom_seed,
+        );
+        let mut biome_sampler = self.biome_source.chunk_sampler();
+        carvers.apply_chunk(chunk, |quart_x, quart_y, quart_z| {
+            biome_sampler.sample(quart_x, quart_y, quart_z).id() as u16
+        });
+    }
+
+    fn carved_chunk_snapshot(&self, chunk_x: i32, chunk_z: i32) -> CarvedChunkSnapshot {
+        let mut chunk = self.sample_surface_chunk_data(chunk_x, chunk_z);
+        self.apply_carvers_to_chunk(&mut chunk);
+        chunk.snapshot()
+    }
+
+    fn selected_vegetation_transaction_snapshot(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+    ) -> Vec<SurfaceVegetationBlock> {
+        let mut chunks = HashMap::new();
+        for source_z in chunk_z - 1..=chunk_z + 1 {
+            for source_x in chunk_x - 1..=chunk_x + 1 {
+                let mut chunk = self.sample_surface_chunk_data(source_x, source_z);
+                self.apply_carvers_to_chunk(&mut chunk);
+                chunks.insert((source_x, source_z), chunk);
+            }
+        }
+        let mut region = InMemoryVegetationRegion::new(
+            &mut chunks,
+            &self.biome_source,
+            N::Settings::MIN_Y,
+            N::Settings::HEIGHT,
+        );
+        let mut changed_positions = std::collections::HashSet::new();
+        for block in self
+            .vegetation_stage
+            .decorate_chunk(&mut region, &REGISTRY, chunk_x, chunk_z)
+        {
+            changed_positions.insert((block.x, block.y, block.z));
+        }
+        let mut blocks = changed_positions
+            .into_iter()
+            .map(|(x, y, z)| {
+                let state = region.block_state(BlockPos::new(x, y, z));
+                SurfaceVegetationBlock {
+                    x,
+                    y,
+                    z,
+                    block: canonical_block_key(state),
+                    state: canonical_block_state_key(state),
+                }
+            })
+            .collect::<Vec<_>>();
+        blocks.sort_by_key(|block| (block.x, block.y, block.z));
+        blocks
     }
 
     fn noise_volume_chunk(
@@ -417,25 +645,12 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
     }
 }
 
-/// Final non-fluid top state for every local column of a generated chunk.
-struct SurfaceChunkTop {
-    heights: [i16; 256],
-    states: Vec<BlockStateId>,
-}
-
-impl SurfaceChunkTop {
-    fn top_surface(&self, index: usize) -> (i16, BlockStateId, bool) {
-        let height = self.heights[index];
-        let state = self.states[index];
-        (height, state, !state.is_air())
-    }
-}
-
 /// Minimal mutable chunk representation used by the browser-safe Surface host.
 ///
 /// It intentionally contains only pre-Features block data and the world-surface
 /// heights read by the shared Surface stage. Native chunks remain responsible
 /// for persistence, postprocessing and status publication.
+#[derive(Clone)]
 struct InMemorySurfaceChunk {
     chunk_min_x: i32,
     chunk_min_z: i32,
@@ -476,6 +691,54 @@ impl InMemorySurfaceChunk {
         }
     }
 
+    fn top_surface(&self, index: usize) -> (i16, BlockStateId, bool) {
+        let local_x = index % 16;
+        let local_z = index / 16;
+        let air = vanilla_blocks::AIR.default_state();
+        for relative_y in (0..self.height).rev() {
+            let state = self.blocks[self.block_index(local_x, relative_y, local_z)];
+            if !state.is_air() && !state.get_block().config.liquid {
+                return (self.min_y as i16 + relative_y as i16, state, true);
+            }
+        }
+        (self.min_y as i16, air, false)
+    }
+
+    fn block_at(&self, local_x: usize, world_y: i32, local_z: usize) -> Option<BlockStateId> {
+        if local_x >= 16
+            || local_z >= 16
+            || !(self.min_y..self.min_y + self.height as i32).contains(&world_y)
+        {
+            return None;
+        }
+        let relative_y = (world_y - self.min_y) as usize;
+        Some(self.blocks[self.block_index(local_x, relative_y, local_z)])
+    }
+
+    fn feature_height_at(&self, kind: FeatureHeightmap, local_x: usize, local_z: usize) -> i32 {
+        for relative_y in (0..self.height).rev() {
+            let state = self.blocks[self.block_index(local_x, relative_y, local_z)];
+            let block = state.get_block();
+            let opaque = match kind {
+                FeatureHeightmap::WorldSurface | FeatureHeightmap::WorldSurfaceWg => {
+                    !state.is_air()
+                }
+                FeatureHeightmap::OceanFloor | FeatureHeightmap::OceanFloorWg => {
+                    state.blocks_motion()
+                }
+                FeatureHeightmap::MotionBlocking => state.blocks_motion() || state.has_fluid(),
+                FeatureHeightmap::MotionBlockingNoLeaves => {
+                    (state.blocks_motion() || state.has_fluid())
+                        && !block.has_tag(&steel_registry::vanilla_block_tags::BlockTag::LEAVES)
+                }
+            };
+            if opaque {
+                return self.min_y + relative_y as i32 + 1;
+            }
+        }
+        self.min_y
+    }
+
     fn update_surface_after_write(
         &mut self,
         local_x: usize,
@@ -506,24 +769,19 @@ impl InMemorySurfaceChunk {
         }
     }
 
-    fn into_top_surface(self) -> SurfaceChunkTop {
-        let air = vanilla_blocks::AIR.default_state();
-        let mut heights = [self.min_y as i16; 256];
-        let mut states = vec![air; 256];
-        for local_x in 0..16usize {
-            for local_z in 0..16usize {
-                let column = Self::column_index(local_x, local_z);
-                for relative_y in (0..self.height).rev() {
-                    let state = self.blocks[self.block_index(local_x, relative_y, local_z)];
-                    if !state.is_air() && !state.get_block().config.liquid {
-                        heights[column] = (self.min_y + relative_y as i32) as i16;
-                        states[column] = state;
-                        break;
-                    }
+    fn snapshot(&self) -> CarvedChunkSnapshot {
+        let mut states = Vec::with_capacity(self.blocks.len());
+        for relative_y in 0..self.height {
+            for local_z in 0..16 {
+                for local_x in 0..16 {
+                    states.push(self.blocks[self.block_index(local_x, relative_y, local_z)]);
                 }
             }
         }
-        SurfaceChunkTop { heights, states }
+        CarvedChunkSnapshot {
+            states,
+            world_surface_wg: self.world_surface,
+        }
     }
 }
 
@@ -582,6 +840,47 @@ impl SurfaceBlockAccess for InMemorySurfaceChunk {
         let previous = self.blocks[index];
         self.blocks[index] = state;
         self.update_surface_after_write(local_x, relative_y, local_z, previous, state);
+    }
+}
+
+impl CarverBlockAccess for InMemorySurfaceChunk {
+    fn min_y(&self) -> i32 {
+        self.min_y
+    }
+
+    fn height(&self) -> i32 {
+        self.height as i32
+    }
+
+    fn chunk_min_x(&self) -> i32 {
+        self.chunk_min_x
+    }
+
+    fn chunk_min_z(&self) -> i32 {
+        self.chunk_min_z
+    }
+
+    fn block_state(&self, pos: BlockPos) -> BlockStateId {
+        let local_x = pos.x().rem_euclid(16) as usize;
+        let local_z = pos.z().rem_euclid(16) as usize;
+        self.block_at(local_x, pos.y(), local_z)
+            .unwrap_or_else(|| vanilla_blocks::AIR.default_state())
+    }
+
+    fn set_block_state(&mut self, pos: BlockPos, state: BlockStateId) {
+        if !(self.min_y..self.min_y + self.height as i32).contains(&pos.y()) {
+            return;
+        }
+        self.set_relative_block(
+            pos.x().rem_euclid(16) as usize,
+            (pos.y() - self.min_y) as usize,
+            pos.z().rem_euclid(16) as usize,
+            state,
+        );
+    }
+
+    fn world_surface_wg_first_available(&self, local_x: usize, local_z: usize) -> i32 {
+        self.world_surface[Self::column_index(local_x, local_z)]
     }
 }
 
@@ -667,11 +966,113 @@ impl SurfaceBiomeAccess for InMemorySurfaceBiomeAccess {
     }
 }
 
+/// Mutable post-Carvers terrain halo for the portable Features slice.
+struct InMemoryVegetationRegion<'a> {
+    chunks: &'a mut HashMap<(i32, i32), InMemorySurfaceChunk>,
+    biome_source: &'a BiomeSourceKind,
+    biome_access: HashMap<(i32, i32), InMemorySurfaceBiomeAccess>,
+    min_y: i32,
+    height: i32,
+}
+
+impl<'a> InMemoryVegetationRegion<'a> {
+    fn new(
+        chunks: &'a mut HashMap<(i32, i32), InMemorySurfaceChunk>,
+        biome_source: &'a BiomeSourceKind,
+        min_y: i32,
+        height: i32,
+    ) -> Self {
+        Self {
+            chunks,
+            biome_source,
+            biome_access: HashMap::new(),
+            min_y,
+            height,
+        }
+    }
+
+    fn chunk_and_local(value: i32) -> (i32, usize) {
+        (value.div_euclid(16), value.rem_euclid(16) as usize)
+    }
+}
+
+impl VegetationBlockAccess for InMemoryVegetationRegion<'_> {
+    fn min_y(&self) -> i32 {
+        self.min_y
+    }
+
+    fn max_y_exclusive(&self) -> i32 {
+        self.min_y + self.height
+    }
+
+    fn block_state(&self, pos: BlockPos) -> BlockStateId {
+        let (chunk_x, local_x) = Self::chunk_and_local(pos.x());
+        let (chunk_z, local_z) = Self::chunk_and_local(pos.z());
+        self.chunks
+            .get(&(chunk_x, chunk_z))
+            .and_then(|chunk| chunk.block_at(local_x, pos.y(), local_z))
+            .unwrap_or_else(|| vanilla_blocks::AIR.default_state())
+    }
+
+    fn set_block_state(&mut self, pos: BlockPos, state: BlockStateId) {
+        let (chunk_x, local_x) = Self::chunk_and_local(pos.x());
+        let (chunk_z, local_z) = Self::chunk_and_local(pos.z());
+        let Some(chunk) = self.chunks.get_mut(&(chunk_x, chunk_z)) else {
+            return;
+        };
+        if !(self.min_y..self.min_y + self.height).contains(&pos.y()) {
+            return;
+        }
+        chunk.set_relative_block(local_x, (pos.y() - self.min_y) as usize, local_z, state);
+    }
+
+    fn height_at(&self, kind: FeatureHeightmap, x: i32, z: i32) -> i32 {
+        let (chunk_x, local_x) = Self::chunk_and_local(x);
+        let (chunk_z, local_z) = Self::chunk_and_local(z);
+        self.chunks
+            .get(&(chunk_x, chunk_z))
+            .map_or(self.min_y, |chunk| {
+                chunk.feature_height_at(kind, local_x, local_z)
+            })
+    }
+
+    fn biome_id_at_quart(&mut self, quart_x: i32, quart_y: i32, quart_z: i32) -> u16 {
+        let chunk_x = quart_x.div_euclid(4);
+        let chunk_z = quart_z.div_euclid(4);
+        let access = self
+            .biome_access
+            .entry((chunk_x, chunk_z))
+            .or_insert_with(|| {
+                InMemorySurfaceBiomeAccess::new(
+                    self.biome_source,
+                    chunk_x,
+                    chunk_z,
+                    self.min_y,
+                    self.height,
+                )
+            });
+        access.biome_id_at_quart(quart_x, quart_y, quart_z)
+    }
+}
+
 fn canonical_block_key(state: BlockStateId) -> String {
     let Some(block) = REGISTRY.blocks.by_state_id(state) else {
         panic!("surface host produced an unknown block state {}", state.0);
     };
     block.key.to_string()
+}
+
+fn canonical_block_state_key(state: BlockStateId) -> String {
+    let block = canonical_block_key(state);
+    let properties = REGISTRY.blocks.get_properties(state);
+    if properties.is_empty() {
+        return block;
+    }
+    let properties = properties
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
+    format!("{block}[{}]", properties.join(","))
 }
 
 #[cfg(test)]
@@ -708,6 +1109,30 @@ mod tests {
                 .iter()
                 .zip(&tile.present)
                 .all(|(block, present)| *present != 0 || block == "minecraft:air")
+        );
+    }
+
+    #[test]
+    fn cherry_grove_fixture_emits_sparse_final_vegetation_states() {
+        // This chunk is a fixed cherry-grove fixture used by the native
+        // Features parity harness. It deliberately exercises logs, leaf
+        // distance states, petals and the tall-grass double-block path.
+        let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+        let tile = sampler.tile(-108 * 16, -36 * 16, 16, 1);
+        assert!(
+            tile.vegetation_blocks
+                .iter()
+                .any(|block| block.block == "minecraft:cherry_log")
+        );
+        assert!(
+            tile.vegetation_blocks
+                .iter()
+                .any(|block| block.block == "minecraft:cherry_leaves")
+        );
+        assert!(
+            tile.vegetation_blocks
+                .iter()
+                .any(|block| block.block == "minecraft:pink_petals")
         );
     }
 }

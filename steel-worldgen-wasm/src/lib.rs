@@ -449,6 +449,45 @@ mod tests {
                 .all(|block| matches!(block.as_str(), Some(key) if key.starts_with("minecraft:")))
         );
     }
+
+    #[test]
+    fn terrain_tile_serializes_canonical_cherry_vegetation_states() {
+        let generator = SteelWorldgen::new("1", "overworld").unwrap_or_else(|error| {
+            panic!("cherry fixture generator should initialize: {error:?}")
+        });
+        let value: serde_json::Value = serde_json::from_str(
+            &generator
+                .terrain_tile(-108 * 16, -36 * 16, 16, 1)
+                .unwrap_or_else(|error| panic!("cherry fixture should serialize: {error:?}")),
+        )
+        .unwrap_or_else(|error| panic!("cherry fixture response must be JSON: {error}"));
+        let vegetation = value["vegetationBlocks"]
+            .as_array()
+            .unwrap_or_else(|| panic!("cherry fixture must include vegetationBlocks"));
+        assert!(
+            vegetation
+                .iter()
+                .any(|block| block["block"] == "minecraft:cherry_log")
+        );
+        assert!(
+            vegetation
+                .iter()
+                .any(|block| block["block"] == "minecraft:cherry_leaves")
+        );
+        assert!(
+            vegetation
+                .iter()
+                .any(|block| block["block"] == "minecraft:pink_petals")
+        );
+        assert!(vegetation.iter().all(|block| {
+            block["x"].is_i64()
+                && block["y"].is_i64()
+                && block["z"].is_i64()
+                && block["state"]
+                    .as_str()
+                    .is_some_and(|state| state.starts_with("minecraft:"))
+        }));
+    }
 }
 
 #[derive(Serialize)]
@@ -468,11 +507,22 @@ struct TerrainResponse<'a> {
     biomes: Vec<String>,
     biome_indices: Vec<u16>,
     surface_blocks: Vec<String>,
+    vegetation_blocks: Vec<TerrainVegetationBlock>,
     min_height: i16,
     max_height: i16,
     min_y: i16,
     present: Vec<u8>,
     decorations: [u8; 0],
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerrainVegetationBlock {
+    x: i32,
+    y: i32,
+    z: i32,
+    block: String,
+    state: String,
 }
 
 #[derive(Serialize)]
@@ -559,6 +609,17 @@ impl<'a> TerrainResponse<'a> {
             biomes: tile.biomes,
             biome_indices: tile.biome_indices,
             surface_blocks: tile.surface_blocks,
+            vegetation_blocks: tile
+                .vegetation_blocks
+                .into_iter()
+                .map(|block| TerrainVegetationBlock {
+                    x: block.x,
+                    y: block.y,
+                    z: block.z,
+                    block: block.block,
+                    state: block.state,
+                })
+                .collect(),
             min_height,
             max_height,
             min_y: tile.min_y,

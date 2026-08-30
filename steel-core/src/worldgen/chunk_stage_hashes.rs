@@ -901,6 +901,334 @@ fn chunk_stage_hashes() {
     }
 }
 
+/// Locks the portable WASM carver host to the native no-structure chunk path.
+///
+/// Static terrain intentionally has no structure starts or pieces, so this
+/// fixture exercises the exact shared Noise → Surface → Carvers path it owns.
+/// The chosen cherry-grove coordinate has substantial carving activity; a
+/// Surface-only host differs there in hundreds of blocks.
+#[test]
+fn portable_carvers_match_native_cherry_grove_fixture() {
+    use crate::bootstrap::init_globals_once;
+    use crate::worldgen::OverworldGenerator;
+    use steel_worldgen::biomes::BiomeSourceKind;
+    use steel_worldgen::surface_sampler::{SurfaceDimension, SurfaceSampler};
+
+    const SEED: u64 = 1;
+    const CHUNK_X: i32 = -108;
+    const CHUNK_Z: i32 = -36;
+
+    init_globals_once();
+    let thread_pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("failed to create parity-test rayon pool"),
+    );
+    let generator =
+        OverworldGenerator::new(None, BiomeSourceKind::overworld(SEED), SEED, &thread_pool);
+    let min_y = vanilla_dimension_types::OVERWORLD.min_y;
+    let height = vanilla_dimension_types::OVERWORLD.height;
+    let section_count = (height / 16) as usize;
+    let min_quart_y = min_y >> 2;
+    let total_quarts_y = section_count as i32 * 4;
+    let mut chunks = FxHashMap::default();
+    for chunk_z in CHUNK_Z - 1..=CHUNK_Z + 1 {
+        for chunk_x in CHUNK_X - 1..=CHUNK_X + 1 {
+            chunks.insert(
+                (chunk_x, chunk_z),
+                empty_proto_chunk((chunk_x, chunk_z), section_count, min_y, height),
+            );
+        }
+    }
+    for chunk in chunks.values() {
+        generator.create_biomes(chunk);
+    }
+
+    let center = chunk_or_panic(&chunks, (CHUNK_X, CHUNK_Z));
+    generator.fill_from_noise(GenerationChunk::<NoisePhase>::for_test(center), None);
+    let neighbor_biomes = |quart: IVec3| -> u16 {
+        let biome_chunk_x = quart.x >> 2;
+        let biome_chunk_z = quart.z >> 2;
+        let chunk = chunk_or_panic(&chunks, (biome_chunk_x, biome_chunk_z));
+        let local_x = (quart.x - biome_chunk_x * 4) as usize;
+        let local_z = (quart.z - biome_chunk_z * 4) as usize;
+        let quart_y = (quart.y - min_quart_y).clamp(0, total_quarts_y - 1) as usize;
+        let section = quart_y / 4;
+        let local_y = quart_y % 4;
+        chunk.sections.sections[section]
+            .read()
+            .biomes
+            .get(local_x, local_y, local_z)
+    };
+    generator.build_surface(
+        GenerationChunk::<SurfacePhase>::for_test(center),
+        &neighbor_biomes,
+    );
+    recalculate_section_counts(center);
+    generator.apply_carvers(GenerationChunk::<CarversPhase>::for_test(center));
+
+    let portable = SurfaceSampler::new(SEED, SurfaceDimension::Overworld)
+        .carved_chunk_snapshot(CHUNK_X, CHUNK_Z);
+    let mut native_states = Vec::with_capacity(portable.states.len());
+    for section in &center.sections.sections {
+        let section = section.read();
+        for local_y in 0..16 {
+            for local_z in 0..16 {
+                for local_x in 0..16 {
+                    native_states.push(section.states.get(local_x, local_y, local_z));
+                }
+            }
+        }
+    }
+    assert_eq!(
+        portable.states, native_states,
+        "post-Carvers block states differ"
+    );
+
+    let native_heights = GenerationChunk::<CarversPhase>::for_test(center)
+        .with_world_surface_heightmap(|heightmap| {
+            std::array::from_fn(|index| heightmap.get_first_available(index % 16, index / 16))
+        })
+        .expect("Carvers must retain WORLD_SURFACE_WG");
+    assert_eq!(
+        portable.world_surface_wg, native_heights,
+        "post-Carvers WORLD_SURFACE_WG differs"
+    );
+}
+
+/// Compares selected cherry-grove feature transactions with the native runner.
+///
+/// The fixture starts both hosts from the same post-Carvers terrain, decorates
+/// the full one-chunk source halo in canonical X/Z task order, and runs only
+/// the sparse portable slice's real placed-feature keys.  It deliberately does
+/// not claim full Features-stage parity: native also runs co-resident features
+/// which can change later placement eligibility through shared writes.
+#[test]
+fn portable_selected_features_match_native_cherry_grove_fixture() {
+    use std::collections::BTreeMap;
+
+    use crate::bootstrap::init_globals_once;
+    use crate::worldgen::OverworldGenerator;
+    use steel_registry::REGISTRY;
+    use steel_utils::{BlockPos, BlockStateId};
+    use steel_worldgen::biomes::BiomeSourceKind;
+    use steel_worldgen::surface_sampler::{SurfaceDimension, SurfaceSampler};
+
+    const SEED: u64 = 1;
+    const CHUNK_X: i32 = -108;
+    const CHUNK_Z: i32 = -36;
+
+    init_globals_once();
+    let thread_pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("failed to create feature-parity rayon pool"),
+    );
+    let generator = Arc::new(ChunkGeneratorType::Overworld(OverworldGenerator::new(
+        None,
+        BiomeSourceKind::overworld(SEED),
+        SEED,
+        &thread_pool,
+    )));
+    let min_y = vanilla_dimension_types::OVERWORLD.min_y;
+    let height = vanilla_dimension_types::OVERWORLD.height;
+    let section_count = (height / 16) as usize;
+    let min_quart_y = min_y >> 2;
+    let total_quarts_y = section_count as i32 * 4;
+    let feature_step = GENERATION_PYRAMID.get_step_to(ChunkStatus::Features);
+    let feature_cache_radius = feature_step.direct_dependencies.get_radius() as i32;
+
+    // One feature-source halo plus each source's one-chunk Features read
+    // dependency must reach Carvers. Surface additionally reads a biome ring.
+    let carver_min_x = CHUNK_X - 2;
+    let carver_max_x = CHUNK_X + 2;
+    let carver_min_z = CHUNK_Z - 2;
+    let carver_max_z = CHUNK_Z + 2;
+    let mut carver_positions = FxHashSet::default();
+    for chunk_x in carver_min_x..=carver_max_x {
+        for chunk_z in carver_min_z..=carver_max_z {
+            carver_positions.insert((chunk_x, chunk_z));
+        }
+    }
+    let mut chunks = FxHashMap::default();
+    for chunk_x in CHUNK_X - 1 - feature_cache_radius..=CHUNK_X + 1 + feature_cache_radius {
+        for chunk_z in CHUNK_Z - 1 - feature_cache_radius..=CHUNK_Z + 1 + feature_cache_radius {
+            chunks.insert(
+                (chunk_x, chunk_z),
+                empty_proto_chunk((chunk_x, chunk_z), section_count, min_y, height),
+            );
+        }
+    }
+    for chunk in chunks.values() {
+        generator.create_biomes(chunk);
+    }
+    let carver_positions_sorted = sorted_positions(&carver_positions);
+    for &(chunk_x, chunk_z) in &carver_positions_sorted {
+        let chunk = chunk_or_panic(&chunks, (chunk_x, chunk_z));
+        generator.fill_from_noise(GenerationChunk::<NoisePhase>::for_test(chunk), None);
+    }
+    for &(chunk_x, chunk_z) in &carver_positions_sorted {
+        let chunk = chunk_or_panic(&chunks, (chunk_x, chunk_z));
+        let neighbor_biomes = |quart: IVec3| -> u16 {
+            let biome_chunk_x = quart.x >> 2;
+            let biome_chunk_z = quart.z >> 2;
+            let biome_chunk = chunk_or_panic(&chunks, (biome_chunk_x, biome_chunk_z));
+            let local_x = (quart.x - biome_chunk_x * 4) as usize;
+            let local_z = (quart.z - biome_chunk_z * 4) as usize;
+            let quart_y = (quart.y - min_quart_y).clamp(0, total_quarts_y - 1) as usize;
+            let section = quart_y / 4;
+            let local_y = quart_y % 4;
+            biome_chunk.sections.sections[section]
+                .read()
+                .biomes
+                .get(local_x, local_y, local_z)
+        };
+        generator.build_surface(
+            GenerationChunk::<SurfacePhase>::for_test(chunk),
+            &neighbor_biomes,
+        );
+    }
+    for &(chunk_x, chunk_z) in &carver_positions_sorted {
+        let chunk = chunk_or_panic(&chunks, (chunk_x, chunk_z));
+        recalculate_section_counts(chunk);
+        generator.apply_carvers(GenerationChunk::<CarversPhase>::for_test(chunk));
+    }
+
+    let feature_world = create_test_world(
+        "minecraft:overworld",
+        &vanilla_dimension_types::OVERWORLD,
+        SEED,
+        generator.clone(),
+        thread_pool,
+    );
+    let context = feature_world.chunk_map.world_gen_context.clone();
+    let holders = Arc::new(build_feature_holders(
+        chunks,
+        &carver_positions,
+        min_y,
+        height,
+    ));
+    let source_positions = vec![(CHUNK_X, CHUNK_Z)];
+    let selected = [
+        Identifier::vanilla_static("trees_cherry"),
+        Identifier::vanilla_static("flower_cherry"),
+        Identifier::vanilla_static("patch_tall_grass_2"),
+        Identifier::vanilla_static("patch_grass_plain"),
+    ]
+    .into_iter()
+    .collect::<FxHashSet<_>>();
+    let mut generated_positions = FxHashSet::default();
+    generate_selected_features_for_positions(
+        &source_positions,
+        &mut generated_positions,
+        &selected,
+        FeatureGenerationInputs {
+            holders: &holders,
+            context: &context,
+            generator: &generator,
+            feature_step,
+            feature_cache_radius,
+            seed: SEED,
+        },
+    );
+
+    let is_portable_vegetation = |state: BlockStateId| {
+        REGISTRY.blocks.by_state_id(state).is_some_and(|block| {
+            matches!(
+                block.key.to_string().as_str(),
+                "minecraft:cherry_log"
+                    | "minecraft:cherry_leaves"
+                    | "minecraft:bee_nest"
+                    | "minecraft:pink_petals"
+                    | "minecraft:short_grass"
+                    | "minecraft:tall_grass"
+            )
+        })
+    };
+    let canonical_state = |state: BlockStateId| {
+        let block = REGISTRY
+            .blocks
+            .by_state_id(state)
+            .expect("generated state must be registered");
+        let key = block.key.to_string();
+        let properties = REGISTRY.blocks.get_properties(state);
+        if properties.is_empty() {
+            key
+        } else {
+            format!(
+                "{key}[{}]",
+                properties
+                    .into_iter()
+                    .map(|(property, value)| format!("{property}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+    };
+    let mut native = BTreeMap::new();
+    let native_chunk = holders
+        .get(&(CHUNK_X, CHUNK_Z))
+        .expect("native central chunk holder must exist")
+        .try_chunk(ChunkStatus::Carvers)
+        .expect("native central chunk must remain available after Features");
+    for local_y in 0..height {
+        for local_z in 0..16 {
+            for local_x in 0..16 {
+                let x = CHUNK_X * 16 + local_x;
+                let y = min_y + local_y;
+                let z = CHUNK_Z * 16 + local_z;
+                let state = native_chunk.get_block_state(BlockPos::new(x, y, z));
+                if is_portable_vegetation(state) {
+                    native.insert((x, y, z), canonical_state(state));
+                }
+            }
+        }
+    }
+    let portable = SurfaceSampler::new(SEED, SurfaceDimension::Overworld)
+        .selected_vegetation_transaction_snapshot(CHUNK_X, CHUNK_Z)
+        .into_iter()
+        .filter(|block| {
+            block.x >= CHUNK_X * 16
+                && block.x < (CHUNK_X + 1) * 16
+                && block.z >= CHUNK_Z * 16
+                && block.z < (CHUNK_Z + 1) * 16
+                && matches!(
+                    block.block.as_str(),
+                    "minecraft:cherry_log"
+                        | "minecraft:cherry_leaves"
+                        | "minecraft:bee_nest"
+                        | "minecraft:pink_petals"
+                        | "minecraft:short_grass"
+                        | "minecraft:tall_grass"
+                )
+        })
+        .map(|block| ((block.x, block.y, block.z), block.state))
+        .collect::<BTreeMap<_, _>>();
+    assert!(
+        !native.is_empty(),
+        "native selected fixture emitted no vegetation states"
+    );
+    if portable != native {
+        let portable_only = portable
+            .iter()
+            .filter(|(position, state)| native.get(position).is_none_or(|other| other != *state))
+            .take(12)
+            .collect::<Vec<_>>();
+        let native_only = native
+            .iter()
+            .filter(|(position, state)| portable.get(position).is_none_or(|other| other != *state))
+            .take(12)
+            .collect::<Vec<_>>();
+        panic!(
+            "portable selected vegetation differs from native selected Features: portable={} native={} portable-first={portable_only:?} native-first={native_only:?}",
+            portable.len(),
+            native.len(),
+        );
+    }
+}
+
 /// Dimension order for deterministic test output (`HashMap` iteration is unordered).
 const DIMENSION_ORDER: &[&str] = &[
     "minecraft:overworld",
@@ -1006,6 +1334,57 @@ fn generate_features_for_positions(
             region_random,
         );
         inputs.generator.apply_biome_decorations(&mut region);
+    }
+}
+
+/// Test-only selected-feature runner used to compare the portable vegetation
+/// slice against the native placed-feature implementation before unrelated
+/// Features writes can affect the shared terrain.
+fn generate_selected_features_for_positions(
+    positions: &[(i32, i32)],
+    generated_positions: &mut FxHashSet<(i32, i32)>,
+    selected: &FxHashSet<Identifier>,
+    inputs: FeatureGenerationInputs<'_>,
+) {
+    for &(chunk_x, chunk_z) in positions {
+        if !generated_positions.insert((chunk_x, chunk_z)) {
+            continue;
+        }
+
+        let center = ChunkPos::new(chunk_x, chunk_z);
+        let Some(center_holder) = inputs.holders.get(&(chunk_x, chunk_z)) else {
+            panic!("Missing feature center chunk ({chunk_x}, {chunk_z})");
+        };
+        {
+            let Some(chunk) = center_holder.try_chunk(ChunkStatus::Carvers) else {
+                panic!("Feature center chunk ({chunk_x}, {chunk_z}) missing");
+            };
+            chunk.prime_final_heightmaps();
+        }
+        let cache_holders = inputs.holders.clone();
+        let cache = Arc::new(StaticCache2D::create(
+            chunk_x,
+            chunk_z,
+            inputs.feature_cache_radius,
+            move |x, z| match cache_holders.get(&(x, z)) {
+                Some(holder) => holder.clone(),
+                None => panic!("Missing feature dependency chunk ({x}, {z})"),
+            },
+        ));
+        let region_random = inputs
+            .generator
+            .create_worldgen_region_random(inputs.seed as i64, center);
+        let mut region = crate::worldgen::WorldGenRegion::new(
+            inputs.context,
+            inputs.feature_step,
+            &cache,
+            center,
+            region_random,
+        );
+        let ChunkGeneratorType::Overworld(generator) = inputs.generator.as_ref() else {
+            panic!("cherry-grove selected-feature fixture requires an overworld generator");
+        };
+        generator.apply_selected_biome_decorations_for_test(&mut region, selected);
     }
 }
 

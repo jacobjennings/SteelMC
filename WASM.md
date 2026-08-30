@@ -47,11 +47,10 @@ for `wasm32-unknown-unknown` through the pinned 32-bit-capable `simdnbt` fork.
 The `steel-worldgen-wasm` leaf crate exposes a reusable seeded sampler for the
 Overworld, Nether, and End. It runs the real Steel density functions and biome
 source and is integrated into the viewer through Web Workers. Its tile DTO is a
-surface height/color grid with canonical final `surfaceBlocks` IDs, but it does
-not expose vertical cave and overhang geometry or run the native Features
-pipeline (structures, trees, and decoration). Those remain available through
-the native service. The generated web package is about 7 MiB before HTTP
-compression.
+surface height/color grid with canonical final `surfaceBlocks` IDs plus sparse
+portable vegetation placements. It does not expose vertical cave and overhang
+geometry, structures, or the complete native Features union. The generated web
+package is about 7 MiB before HTTP compression.
 
 ### Final-surface and foliage boundary
 
@@ -74,10 +73,21 @@ The implementation boundary is concrete:
    `SurfaceBlockAccess` host. The browser host supplies the exact aquifer
    preliminary-surface corners and a 3×3 chunk biome-palette ring consumed by
    the shared fuzzed-biome lookup.
-3. Decoration is later run by `FeatureDecorationRunner` against a
-   `WorldGenRegion`; tree and foliage placements can cross chunk boundaries and
-   cannot be reduced to independent terrain samples without changing vanilla
-   placement semantics.
+3. The portable host runs the reusable Carvers stage against its mutable
+   post-Surface chunks, including exact aquifer reconstruction and
+   `WORLD_SURFACE_WG` updates.
+4. A deliberately bounded Features slice then executes real placed-feature
+   modifier streams, seeded feature indices, cherry-tree trunk/foliage/
+   beehive/leaf-distance algorithms, pink petals, and grass against a
+   post-Carvers one-chunk source halo. Tree crowns are retained across source
+   chunk boundaries and emitted as canonical final block states.
+
+This is transaction-parity coverage for the selected placed features, not a
+claim of whole-Features final-state parity. Native co-resident features share a
+`WorldGenRegion` and can alter later collision, survival, and heightmap inputs.
+The native regression fixture therefore compares the selected chains on the
+same post-Carvers input before those omitted writes; extending the WASM slice to
+the full native feature union remains future work.
 
 The shared surface implementation lives below `steel-core`, so it remains safe
 for `wasm32-unknown-unknown`; native `GenerationChunk<SurfacePhase>` adapts to
@@ -96,7 +106,7 @@ target check or adding a browser-only approximation.
 1. Add deterministic native-versus-WASM vectors for biome, density, and complete
    chunk output.
 2. Replace the JSON bridge with a stable byte-oriented tile API to reduce copies.
-3. Expose full block-state sections and the Features pipeline to the browser.
+3. Expand the portable selected-feature slice to the complete Features union.
 4. Add structures and host-provided persistence, then evaluate optional threaded
    WASM separately.
 
