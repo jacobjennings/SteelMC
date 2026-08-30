@@ -117,7 +117,7 @@ pub fn generate_ring_positions<F>(
     spread: i32,
     count: i32,
     snap_biome: Option<&F>,
-    thread_pool: &rayon::ThreadPool,
+    thread_pool: Option<&rayon::ThreadPool>,
 ) -> Vec<ChunkPos>
 where
     F: Fn(i32, i32, &mut LegacyRandom) -> Option<(i32, i32)> + Sync,
@@ -186,20 +186,19 @@ where
         }
     }
 
-    match snap_biome {
-        Some(snap) if candidates.len() >= PARALLEL_RING_SNAP_THRESHOLD => {
-            thread_pool.install(|| {
+    match (snap_biome, thread_pool) {
+        (Some(snap), Some(pool)) if candidates.len() >= PARALLEL_RING_SNAP_THRESHOLD => pool
+            .install(|| {
                 candidates
                     .into_par_iter()
                     .map(|candidate| map_candidate(candidate, snap))
                     .collect()
-            })
-        }
-        Some(snap) => candidates
+            }),
+        (Some(snap), _) => candidates
             .into_iter()
             .map(|candidate| map_candidate(candidate, snap))
             .collect(),
-        None => candidates
+        (None, _) => candidates
             .into_iter()
             .map(|candidate| ChunkPos::new(candidate.initial_x, candidate.initial_z))
             .collect(),
@@ -667,7 +666,7 @@ mod tests {
             .expect("Couldn't create a new thread pool.");
         let positions = generate_ring_positions::<
             fn(i32, i32, &mut LegacyRandom) -> Option<(i32, i32)>,
-        >(0, 32, 3, 128, None, &thread_pool);
+        >(0, 32, 3, 128, None, Some(&thread_pool));
         assert_eq!(positions.len(), 128);
 
         // First ring should be roughly 4*32 = 128 chunks from origin
@@ -692,7 +691,7 @@ mod tests {
         // Deterministic: same seed produces same positions
         let positions2 = generate_ring_positions::<
             fn(i32, i32, &mut LegacyRandom) -> Option<(i32, i32)>,
-        >(0, 32, 3, 128, None, &thread_pool);
+        >(0, 32, 3, 128, None, Some(&thread_pool));
         assert_eq!(positions, positions2);
     }
 
@@ -703,7 +702,7 @@ mod tests {
             .expect("Couldn't create a new thread pool.");
         let positions = generate_ring_positions::<
             fn(i32, i32, &mut LegacyRandom) -> Option<(i32, i32)>,
-        >(0, 32, 3, 0, None, &thread_pool);
+        >(0, 32, 3, 0, None, Some(&thread_pool));
         assert_eq!(positions.len(), 0);
     }
 

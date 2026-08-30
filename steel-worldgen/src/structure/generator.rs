@@ -384,6 +384,71 @@ impl StructureLocatePlan {
 
         candidates
     }
+
+    /// Random-spread candidates whose vanilla locate positions fall inside a
+    /// horizontal block radius around `origin`.
+    ///
+    /// This is the bounded-map counterpart to the shell iterator above.  It
+    /// enumerates every placement cell that can contain a candidate in the
+    /// requested square, then applies the circular map radius to the resolved
+    /// vanilla locate position.  It deliberately does not approximate a
+    /// structure as a grid-cell centre.
+    #[must_use]
+    pub fn random_spread_candidates_in_block_radius(
+        &self,
+        origin: BlockPos,
+        radius_blocks: i32,
+    ) -> Vec<StructureLocateCandidate> {
+        if radius_blocks < 0 {
+            return Vec::new();
+        }
+
+        let radius_chunks = (radius_blocks.saturating_add(15)) / 16;
+        let origin_chunk_x = origin.0.x.div_euclid(16);
+        let origin_chunk_z = origin.0.z.div_euclid(16);
+        let radius_sqr = i64::from(radius_blocks) * i64::from(radius_blocks);
+        let mut candidates = Vec::new();
+
+        for (scan_id, locate_placement) in self.placements.iter().enumerate() {
+            let PlacementKind::RandomSpread {
+                spacing,
+                separation,
+                spread_type,
+            } = &locate_placement.placement.kind
+            else {
+                continue;
+            };
+
+            // A candidate can be anywhere within its `spacing`-wide placement
+            // cell. One adjacent cell on each edge is therefore sufficient.
+            let cell_radius = (radius_chunks + *spacing - 1) / *spacing + 1;
+            let center_cell_x = origin_chunk_x.div_euclid(*spacing);
+            let center_cell_z = origin_chunk_z.div_euclid(*spacing);
+            for cell_x in (center_cell_x - cell_radius)..=(center_cell_x + cell_radius) {
+                for cell_z in (center_cell_z - cell_radius)..=(center_cell_z + cell_radius) {
+                    let chunk_pos = StructurePlacement::get_potential_structure_chunk(
+                        self.seed,
+                        locate_placement.placement.salt,
+                        cell_x * *spacing,
+                        cell_z * *spacing,
+                        *spacing,
+                        *separation,
+                        *spread_type,
+                    );
+                    let locate_pos = locate_placement.placement.locate_pos(chunk_pos);
+                    let dx = i64::from(locate_pos.0.x) - i64::from(origin.0.x);
+                    let dz = i64::from(locate_pos.0.z) - i64::from(origin.0.z);
+                    if dx * dx + dz * dz <= radius_sqr {
+                        candidates.push(StructureLocateCandidate::new(
+                            scan_id, locate_pos, chunk_pos,
+                        ));
+                    }
+                }
+            }
+        }
+
+        candidates
+    }
 }
 
 impl StructureLocateCandidate {
@@ -555,7 +620,7 @@ impl RingPlacementInput<'_> {
 fn ring_positions_for_placement(
     input: RingPlacementInput<'_>,
     biome_provider: &(impl StructureBiomeProvider + Sync),
-    thread_pool: &rayon::ThreadPool,
+    thread_pool: Option<&rayon::ThreadPool>,
     persisted: Option<(&str, &mut RingPositionCache)>,
 ) -> (Vec<ChunkPos>, bool) {
     let preferred_biomes: FxHashSet<_> = input.preferred_biomes.iter().cloned().collect();
@@ -627,6 +692,27 @@ impl StructureGenerator {
         )
     }
 
+    /// Creates a vanilla structure generator without native worker threads.
+    ///
+    /// The placement and biome-snapping algorithms are identical to
+    /// [`Self::vanilla`]; only independent stronghold biome probes run
+    /// sequentially. This is intended for single-threaded WASM adapters.
+    #[must_use]
+    pub fn vanilla_single_threaded(
+        seed: i64,
+        biome_provider: &(impl StructureBiomeProvider + Sync),
+    ) -> Self {
+        Self::with_assets_for_ring_seed(
+            seed,
+            seed,
+            None,
+            biome_provider,
+            load_vanilla_structure_sets(),
+            StructureGeneratorAssets::vanilla(),
+            None,
+        )
+    }
+
     /// Creates a generator over an explicit structure-set list while keeping all
     /// template pools, templates, and structure implementation dispatch vanilla.
     #[must_use]
@@ -644,7 +730,7 @@ impl StructureGenerator {
             biome_provider,
             structure_sets,
             StructureGeneratorAssets::vanilla(),
-            thread_pool,
+            Some(thread_pool),
         )
     }
 
@@ -668,7 +754,7 @@ impl StructureGenerator {
             biome_provider,
             structure_sets,
             StructureGeneratorAssets::vanilla(),
-            thread_pool,
+            Some(thread_pool),
         )
     }
 
@@ -689,7 +775,7 @@ impl StructureGenerator {
             biome_provider,
             structure_sets,
             assets,
-            thread_pool,
+            Some(thread_pool),
         )
     }
 
@@ -700,7 +786,7 @@ impl StructureGenerator {
         biome_provider: &(impl StructureBiomeProvider + Sync),
         structure_sets: Vec<(Identifier, StructureSet)>,
         assets: StructureGeneratorAssets,
-        thread_pool: &rayon::ThreadPool,
+        thread_pool: Option<&rayon::ThreadPool>,
     ) -> Self {
         validate_structure_sets(&structure_sets);
 

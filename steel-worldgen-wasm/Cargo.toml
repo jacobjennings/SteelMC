@@ -11,6 +11,8 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+steel-registry.workspace = true
+steel-utils.workspace = true
 steel-worldgen.workspace = true
 wasm-bindgen.workspace = true
 

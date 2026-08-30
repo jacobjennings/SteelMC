@@ -2899,6 +2899,8 @@ version = "0.15.2+mc26.2"
 dependencies = [
  "serde",
  "serde_json",
+ "steel-registry",
+ "steel-utils",
  "steel-worldgen",
  "wasm-bindgen",
 ]
