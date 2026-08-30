@@ -106,9 +106,16 @@ pub struct SurfaceChunkCacheStats {
 }
 
 struct CachedSurfaceChunk {
-    pre_carver: InMemorySurfaceChunk,
+    pre_carver_surface: Box<[SurfaceColumn; 256]>,
     post_carver: InMemorySurfaceChunk,
     last_used: u64,
+}
+
+#[derive(Clone, Copy)]
+struct SurfaceColumn {
+    height: i16,
+    state: BlockStateId,
+    exists: bool,
 }
 
 /// Bounded least-recently-used cache for reusable surface-generation chunks.
@@ -148,7 +155,10 @@ impl SurfaceChunkCache {
     pub fn retained_payload_bytes(&self) -> usize {
         self.chunks
             .values()
-            .map(|entry| entry.pre_carver.payload_bytes() + entry.post_carver.payload_bytes())
+            .map(|entry| {
+                std::mem::size_of_val(entry.pre_carver_surface.as_ref())
+                    + entry.post_carver.payload_bytes()
+            })
             .sum()
     }
 
@@ -424,7 +434,11 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
                     .touch((chunk_x, chunk_z))
                     .expect("surface chunk must have been cached");
                 let index = (z.rem_euclid(16) * 16 + x.rem_euclid(16)) as usize;
-                let (height, state, exists) = chunk.pre_carver.top_surface(index);
+                let SurfaceColumn {
+                    height,
+                    state,
+                    exists,
+                } = chunk.pre_carver_surface[index];
                 heights.push(height);
                 present.push(u8::from(exists));
                 surface_blocks.push(canonical_block_key(state));
@@ -549,14 +563,21 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             return;
         }
         cache.stats.misses += 1;
-        let pre_carver = self.sample_surface_chunk_data(chunk_x, chunk_z);
-        let mut post_carver = pre_carver.clone();
+        let mut post_carver = self.sample_surface_chunk_data(chunk_x, chunk_z);
+        let pre_carver_surface = Box::new(std::array::from_fn(|index| {
+            let (height, state, exists) = post_carver.top_surface(index);
+            SurfaceColumn {
+                height,
+                state,
+                exists,
+            }
+        }));
         self.apply_carvers_to_chunk(&mut post_carver);
         cache.clock = cache.clock.wrapping_add(1);
         cache.insert(
             key,
             CachedSurfaceChunk {
-                pre_carver,
+                pre_carver_surface,
                 post_carver,
                 last_used: cache.clock,
             },
@@ -1256,6 +1277,12 @@ mod tests {
             let uncached = sampler.tile(x, z, size, 1);
             assert_tiles_equal(&cached, &uncached);
         }
+
+        // Exercise summarized pre-carver columns across constant eviction.
+        let mut tiny_cache = SurfaceChunkCache::new(1);
+        let cached = sampler.tile_with_cache(&mut tiny_cache, 0, 0, 16, 1);
+        let uncached = sampler.tile(0, 0, 16, 1);
+        assert_tiles_equal(&cached, &uncached);
     }
 
     fn median_ms(mut values: Vec<f64>) -> f64 {
