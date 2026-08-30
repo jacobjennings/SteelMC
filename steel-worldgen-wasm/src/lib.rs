@@ -16,12 +16,27 @@ use steel_worldgen::{
     noise_parameters::get_noise_parameters,
     structure::{GenerationContext, StructureGenerator, StructureStart},
     surface_sampler::{
-        NoiseVolume, SurfaceChunkCache, SurfaceDimension, SurfaceSampler, SurfaceTile,
+        DEFAULT_SURFACE_CHUNK_CACHE_CAPACITY, NoiseVolume, SurfaceChunkCache, SurfaceDimension,
+        SurfaceSampler, SurfaceTile,
     },
 };
 use wasm_bindgen::prelude::*;
 
 const MAX_STRUCTURE_MARKER_RADIUS: i32 = 4096;
+
+fn validate_terrain_grid(size: u32, resolution: u32) -> Result<(), JsValue> {
+    if size == 0
+        || size > 256
+        || resolution == 0
+        || resolution > size
+        || !size.is_multiple_of(resolution)
+    {
+        return Err(JsValue::from_str(
+            "size must be <= 256 and evenly divisible by resolution",
+        ));
+    }
+    Ok(())
+}
 
 /// Reusable single-seed generator intended to live inside a Web Worker.
 #[wasm_bindgen]
@@ -40,7 +55,7 @@ impl SteelWorldgen {
     /// # Errors
     /// Returns an error for an invalid signed 64-bit seed or dimension.
     #[wasm_bindgen(constructor)]
-    pub fn new(seed: &str, dimension: &str) -> Result<Self, JsValue> {
+    pub fn new(seed: &str, dimension: &str, cache_capacity: Option<u32>) -> Result<Self, JsValue> {
         let signed_seed = seed
             .parse::<i64>()
             .map_err(|_| JsValue::from_str("seed must be a signed 64-bit integer"))?;
@@ -52,9 +67,21 @@ impl SteelWorldgen {
         };
         let sampler = SurfaceSampler::new(signed_seed as u64, dimension);
         let markers = StructureMarkerSampler::new(signed_seed, dimension);
+        let cache_capacity = cache_capacity
+            .map(|capacity| {
+                usize::try_from(capacity)
+                    .map_err(|_| JsValue::from_str("surface chunk cache capacity is too large"))
+            })
+            .transpose()?
+            .unwrap_or(DEFAULT_SURFACE_CHUNK_CACHE_CAPACITY);
+        if cache_capacity == 0 {
+            return Err(JsValue::from_str(
+                "surface chunk cache capacity must be greater than zero",
+            ));
+        }
         Ok(Self {
             sampler,
-            surface_chunk_cache: RefCell::new(SurfaceChunkCache::default()),
+            surface_chunk_cache: RefCell::new(SurfaceChunkCache::new(cache_capacity)),
             markers,
             seed: seed.to_owned(),
             dimension: name,
@@ -72,17 +99,39 @@ impl SteelWorldgen {
         size: u32,
         resolution: u32,
     ) -> Result<String, JsValue> {
-        if size == 0
-            || size > 256
-            || resolution == 0
-            || resolution > size
-            || !size.is_multiple_of(resolution)
-        {
-            return Err(JsValue::from_str(
-                "size must be <= 256 and evenly divisible by resolution",
-            ));
-        }
+        validate_terrain_grid(size, resolution)?;
         let tile = self.sampler.tile_with_cache(
+            &mut self.surface_chunk_cache.borrow_mut(),
+            x,
+            z,
+            size,
+            resolution,
+        );
+        serde_json::to_string(&TerrainResponse::new(
+            &self.seed,
+            self.dimension,
+            x,
+            z,
+            size,
+            resolution,
+            tile,
+        ))
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Generates a terrain tile without vegetation generation or carving.
+    ///
+    /// # Errors
+    /// Returns an error when the requested grid is invalid or serialization fails.
+    pub fn terrain_tile_coarse(
+        &self,
+        x: i32,
+        z: i32,
+        size: u32,
+        resolution: u32,
+    ) -> Result<String, JsValue> {
+        validate_terrain_grid(size, resolution)?;
+        let tile = self.sampler.coarse_tile_with_cache(
             &mut self.surface_chunk_cache.borrow_mut(),
             x,
             z,
@@ -398,7 +447,7 @@ mod tests {
 
     #[test]
     fn generated_marker_response_has_unique_complete_bounds() {
-        let generator = SteelWorldgen::new("0", "overworld").unwrap_or_else(|error| {
+        let generator = SteelWorldgen::new("0", "overworld", None).unwrap_or_else(|error| {
             panic!("native structure generator should initialize: {error:?}")
         });
         let value: serde_json::Value = serde_json::from_str(
@@ -435,7 +484,7 @@ mod tests {
 
     #[test]
     fn terrain_tile_serializes_final_surface_blocks_parallel_to_samples() {
-        let generator = SteelWorldgen::new("0", "overworld")
+        let generator = SteelWorldgen::new("0", "overworld", None)
             .unwrap_or_else(|error| panic!("surface generator should initialize: {error:?}"));
         let value: serde_json::Value = serde_json::from_str(
             &generator
@@ -464,7 +513,7 @@ mod tests {
 
     #[test]
     fn terrain_tile_serializes_canonical_cherry_vegetation_states() {
-        let generator = SteelWorldgen::new("1", "overworld").unwrap_or_else(|error| {
+        let generator = SteelWorldgen::new("1", "overworld", None).unwrap_or_else(|error| {
             panic!("cherry fixture generator should initialize: {error:?}")
         });
         let value: serde_json::Value = serde_json::from_str(
