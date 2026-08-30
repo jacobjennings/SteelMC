@@ -25,10 +25,13 @@ function medianOfThree(run) {
   return median([timed(run), timed(run), timed(run)]);
 }
 
-const constructorMs = timed(() => new SteelWorldgen("3860052", "overworld").free());
+const constructorMs = medianOfThree(() =>
+  new SteelWorldgen("3860052", "overworld").free(),
+);
 const generator = new SteelWorldgen("3860052", "overworld");
 
 console.log(`package: ${packageDirectory}`);
+console.log("timing_repetitions: 3 (median)");
 console.log(`constructor_ms: ${constructorMs.toFixed(3)}`);
 console.log("terrain size | resolution | median_ms | ms_per_halo_chunk");
 
