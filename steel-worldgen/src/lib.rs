@@ -15,6 +15,7 @@ pub mod noise;
 /// `state_resolver`
 pub mod state_resolver;
 /// structure
+#[cfg(not(target_arch = "wasm32"))]
 pub mod structure;
 /// Surface rule context types for generated code.
 pub mod surface;

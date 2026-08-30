@@ -2847,6 +2847,7 @@ dependencies = [
  "crc32c",
  "criterion",
  "enum_dispatch",
+ "getrandom 0.4.3",
  "glam",
  "heck",
  "md5",

@@ -33,17 +33,7 @@ steel-worldgen = { path = "steel-worldgen" }
 steel-math = { path = "steel-math" }
 
 # Async runtime
-tokio = { version = "1.53.1", features = [
-    "macros",
-    "net",
-    "rt-multi-thread",
-    "sync",
-    "io-std",
-    "fs",
-    "io-util",
-    "time",
-    "signal",
-] }
+tokio = "1.53.1"
 tokio-util = { version = "0.7.19", features = ["rt"] }
 futures = "0.3.33"
 
@@ -81,7 +71,8 @@ phf = { version = "0.14.0", features = ["macros"] }
 chrono = "0.4.45"
 
 # UUID
-uuid = { version = "1.24.0", features = ["serde", "v4"] }
+uuid = { version = "1.24.0", features = ["serde"] }
+getrandom = "0.4.3"
 
 # Logging
 log = "0.4.33"

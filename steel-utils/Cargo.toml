@@ -10,7 +10,7 @@ build = "build/build.rs"
 steel-macros.workspace = true
 
 # Async runtime
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-util", "sync"] }
 
 # Serialization
 serde.workspace = true
@@ -48,6 +48,14 @@ unicode_names2.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 md5.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["fs"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { workspace = true, features = ["wasm_js"] }
+uuid = { workspace = true, features = ["js"] }
 
 [build-dependencies]
 # Serialization

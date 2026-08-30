@@ -13,7 +13,7 @@ steel-utils.workspace = true
 steel-registry.workspace = true
 
 # Async runtime
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "io-std", "fs", "io-util", "time", "signal"] }
 tokio-util.workspace = true
 futures.workspace = true
 

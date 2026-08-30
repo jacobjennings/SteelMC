@@ -24,7 +24,7 @@ steel-worldgen.workspace = true
 steel-math.workspace = true
 
 # Async runtime
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "io-std", "fs", "io-util", "time", "signal"] }
 tokio-util.workspace = true
 futures.workspace = true
 
@@ -54,7 +54,7 @@ small-map.workspace = true
 chrono.workspace = true
 
 # UUID
-uuid.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 
 # Networking
 reqwest.workspace = true
