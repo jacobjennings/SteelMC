@@ -1264,31 +1264,56 @@ mod tests {
     #[ignore = "measurement harness; run with --ignored --nocapture"]
     fn measure_surface_chunk_cache() {
         const REPETITIONS: usize = 3;
-        let mut grid_cached = Vec::new();
-        let mut grid_uncached = Vec::new();
+        const CAPACITIES: [usize; 4] = [96, 160, 256, 400];
         let mut isolated_cached = Vec::new();
         let mut isolated_uncached = Vec::new();
 
+        println!("capacity ratio hit_rate peak_chunks retained_payload_bytes evictions");
+        for capacity in CAPACITIES {
+            let mut grid_cached = Vec::new();
+            let mut grid_uncached = Vec::new();
+            let mut final_stats = None;
+            let mut retained_payload_bytes = 0;
+            for _ in 0..REPETITIONS {
+                let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+                let mut cache = SurfaceChunkCache::new(capacity);
+                let start = Instant::now();
+                for tile_z in 0..4 {
+                    for tile_x in 0..4 {
+                        let _ =
+                            sampler.tile_with_cache(&mut cache, tile_x * 64, tile_z * 64, 64, 1);
+                    }
+                }
+                grid_cached.push(start.elapsed().as_secs_f64() * 1_000.0);
+                final_stats = Some(cache.stats());
+                retained_payload_bytes = cache.retained_payload_bytes();
+
+                let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+                let start = Instant::now();
+                for tile_z in 0..4 {
+                    for tile_x in 0..4 {
+                        let _ = sampler.tile(tile_x * 64, tile_z * 64, 64, 1);
+                    }
+                }
+                grid_uncached.push(start.elapsed().as_secs_f64() * 1_000.0);
+            }
+            let cached = median_ms(grid_cached);
+            let uncached = median_ms(grid_uncached);
+            let stats = final_stats.expect("capacity sweep must execute");
+            let requests = stats.hits + stats.misses;
+            println!(
+                "{capacity} {:.3}x {:.2}% {} {} {} (cached={cached:.3} ms uncached={uncached:.3} ms hits={} misses={})",
+                uncached / cached,
+                stats.hits as f64 * 100.0 / requests as f64,
+                stats.peak_retained_chunks,
+                retained_payload_bytes,
+                stats.evictions,
+                stats.hits,
+                stats.misses,
+            );
+        }
+
         for _ in 0..REPETITIONS {
-            let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
-            let mut cache = SurfaceChunkCache::default();
-            let start = Instant::now();
-            for tile_z in 0..4 {
-                for tile_x in 0..4 {
-                    let _ = sampler.tile_with_cache(&mut cache, tile_x * 64, tile_z * 64, 64, 1);
-                }
-            }
-            grid_cached.push(start.elapsed().as_secs_f64() * 1_000.0);
-
-            let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
-            let start = Instant::now();
-            for tile_z in 0..4 {
-                for tile_x in 0..4 {
-                    let _ = sampler.tile(tile_x * 64, tile_z * 64, 64, 1);
-                }
-            }
-            grid_uncached.push(start.elapsed().as_secs_f64() * 1_000.0);
-
             let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
             let mut cache = SurfaceChunkCache::default();
             let start = Instant::now();
@@ -1301,19 +1326,12 @@ mod tests {
             isolated_uncached.push(start.elapsed().as_secs_f64() * 1_000.0);
         }
 
-        let grid_cached = median_ms(grid_cached);
-        let grid_uncached = median_ms(grid_uncached);
         let isolated_cached = median_ms(isolated_cached);
         let isolated_uncached = median_ms(isolated_uncached);
         println!(
-            "grid cached={grid_cached:.3} ms uncached={grid_uncached:.3} ms ratio={:.3}x; useful_chunk cached={:.3} ms uncached={:.3} ms",
-            grid_uncached / grid_cached,
-            grid_cached / 256.0,
-            grid_uncached / 256.0,
-        );
-        println!(
-            "isolated cached={isolated_cached:.3} ms uncached={isolated_uncached:.3} ms ratio={:.3}x",
+            "isolated cached={isolated_cached:.3} ms uncached={isolated_uncached:.3} ms ratio={:.3}x regression={:.2}%",
             isolated_uncached / isolated_cached,
+            (isolated_cached / isolated_uncached - 1.0) * 100.0,
         );
     }
 
