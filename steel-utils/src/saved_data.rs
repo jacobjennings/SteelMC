@@ -11,6 +11,7 @@ use std::{
 };
 
 use serde::{Serialize, de::DeserializeOwned};
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::fs;
 use wincode::{SchemaRead, SchemaWrite, config::DefaultConfig};
 
@@ -49,6 +50,7 @@ impl SavedDataName {
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn file_name(self) -> String {
         format!("{}.toml", self.0)
     }
@@ -164,20 +166,35 @@ impl SavedDataManager {
     where
         T: DeserializeOwned + Default,
     {
-        let Some(path) = self.path_for(name) else {
-            return Ok(T::default());
-        };
-        if !path.exists() {
-            return Ok(T::default());
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = name;
+            return if self.data_dir.is_none() {
+                Ok(T::default())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "browser persistence requires a host adapter",
+                ))
+            };
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(path) = self.path_for(name) else {
+                return Ok(T::default());
+            };
+            if !path.exists() {
+                return Ok(T::default());
+            }
 
-        let content = fs::read_to_string(&path).await?;
-        toml::from_str(&content).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Invalid saved data {}: {error}", path.display()),
-            )
-        })
+            let content = fs::read_to_string(&path).await?;
+            toml::from_str(&content).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid saved data {}: {error}", path.display()),
+                )
+            })
+        }
     }
 
     /// Saves a versioned wincode value.
@@ -206,18 +223,34 @@ impl SavedDataManager {
     where
         T: Serialize,
     {
-        let Some(path) = self.path_for(name) else {
-            return Ok(());
-        };
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (name, data);
+            return if self.data_dir.is_none() {
+                Ok(())
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "browser persistence requires a host adapter",
+                ))
+            };
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(path) = self.path_for(name) else {
+                return Ok(());
+            };
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).await?;
+            }
 
-        let content = toml::to_string_pretty(data)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        fs::write(path, content).await
+            let content = toml::to_string_pretty(data)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            fs::write(path, content).await
+        }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn path_for(&self, name: SavedDataName) -> Option<PathBuf> {
         self.data_dir
             .as_ref()

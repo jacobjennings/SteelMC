@@ -12,6 +12,7 @@ members = [
     "steel-core",
     "steel-crypto",
     "steel-math",
+    "steel-worldgen-wasm",
 ]
 
 [workspace.package]
@@ -73,6 +74,7 @@ chrono = "0.4.45"
 # UUID
 uuid = { version = "1.24.0", features = ["serde"] }
 getrandom = "0.4.3"
+wasm-bindgen = "0.2.126"
 
 # Logging
 log = "0.4.33"
@@ -199,3 +201,6 @@ debug = true
 [profile.samplydev]
 inherits = "dev"
 debug = true
+
+[patch.crates-io]
+simdnbt = { git = "https://github.com/jacobjennings/simdnbt.git", rev = "60dcb53c01d46e62ac5c50f814d8e67f4142a893" }

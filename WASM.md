@@ -39,29 +39,26 @@ Run the readiness check with:
 ```
 
 The workspace dependency features no longer force Tokio networking or native
-filesystem support into a WASM build. Filesystem-backed saved data and structure
-generation are excluded on `wasm32` until persistence has an explicit host
-interface. Native `steel-worldgen` still compiles with the same default API.
+filesystem support into a WASM build. Filesystem-backed saved data reports an
+unsupported host adapter on `wasm32`; an ephemeral manager remains usable.
+`steel-worldgen`, including its generated registry dependencies, now compiles
+for `wasm32-unknown-unknown` through the pinned 32-bit-capable `simdnbt` fork.
 
-The next blocking dependency is `simdnbt`, which intentionally supports only
-64-bit targets. It enters through the full `steel-registry` and `steel-utils`
-crates even though noise, biome, and density generation do not need network NBT
-encoding. The preferred fix is to give world generation a narrow generated-data
-crate/API containing only its block, biome, dimension, feature, and structure
-inputs. That avoids maintaining a browser fork of `simdnbt` and also reduces the
-WASM binary substantially.
+The `steel-worldgen-wasm` leaf crate exposes a reusable seeded sampler for the
+Overworld, Nether, and End. It runs the real Steel density functions and biome
+source and is integrated into the viewer through Web Workers. Its current tile
+DTO is a surface height/color grid, so it does not yet expose vertical cave and
+overhang geometry or run the native Features pipeline (surface blocks,
+structures, trees, and decoration). Those remain available through the native
+service. The generated web package is about 7 MiB before HTTP compression.
 
 ## Milestones
 
-1. Split the minimal generated worldgen registry boundary from protocol/gameplay
-   serialization and make `steel-worldgen` compile for `wasm32-unknown-unknown`.
-2. Add deterministic native-versus-WASM vectors for biome, density, and complete
+1. Add deterministic native-versus-WASM vectors for biome, density, and complete
    chunk output.
-3. Add a leaf `steel-worldgen-wasm` crate with a stable byte-oriented API and no
-   browser DOM dependency.
-4. Integrate it through a Web Worker while retaining the same DTO and cache keys
-   used by the native backend.
-5. Add structures and host-provided persistence, then evaluate optional threaded
+2. Replace the JSON bridge with a stable byte-oriented tile API to reduce copies.
+3. Expose full block-state sections and the Features pipeline to the browser.
+4. Add structures and host-provided persistence, then evaluate optional threaded
    WASM separately.
 
 Do not add browser conditionals to vanilla generation algorithms. Target-specific

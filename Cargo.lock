@@ -2580,8 +2580,7 @@ dependencies = [
 [[package]]
 name = "simdnbt"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7893a73842e21e674dde2bb31be1b949c127294f13dd52ee530d2f75a90ffe44"
+source = "git+https://github.com/jacobjennings/simdnbt.git?rev=60dcb53c01d46e62ac5c50f814d8e67f4142a893#60dcb53c01d46e62ac5c50f814d8e67f4142a893"
 dependencies = [
  "byteorder",
  "flate2",
@@ -2594,8 +2593,7 @@ dependencies = [
 [[package]]
 name = "simdnbt-derive"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4518807f59223e4e9c6765b7fb98d1eb70799a2dcee7db485a45cc422870afdb"
+source = "git+https://github.com/jacobjennings/simdnbt.git?rev=60dcb53c01d46e62ac5c50f814d8e67f4142a893#60dcb53c01d46e62ac5c50f814d8e67f4142a893"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2893,6 +2891,16 @@ dependencies = [
  "steel-utils",
  "tracing",
  "wincode",
+]
+
+[[package]]
+name = "steel-worldgen-wasm"
+version = "0.15.2+mc26.2"
+dependencies = [
+ "serde",
+ "serde_json",
+ "steel-worldgen",
+ "wasm-bindgen",
 ]
 
 [[package]]

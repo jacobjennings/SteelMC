@@ -36,7 +36,6 @@ pub mod random;
 pub mod registry;
 pub mod rotation;
 /// Data saving helpers
-#[cfg(not(target_arch = "wasm32"))]
 pub mod saved_data;
 pub mod serial;
 pub mod text;
