@@ -1,5 +1,7 @@
 //! Byte-oriented WebAssembly adapter for Steel world generation.
 
+use std::cell::RefCell;
+
 use serde::Serialize;
 use steel_registry::REGISTRY;
 use steel_utils::random::{
@@ -13,7 +15,9 @@ use steel_worldgen::{
     noise::LazyAquifer,
     noise_parameters::get_noise_parameters,
     structure::{GenerationContext, StructureGenerator, StructureStart},
-    surface_sampler::{NoiseVolume, SurfaceDimension, SurfaceSampler, SurfaceTile},
+    surface_sampler::{
+        NoiseVolume, SurfaceChunkCache, SurfaceDimension, SurfaceSampler, SurfaceTile,
+    },
 };
 use wasm_bindgen::prelude::*;
 
@@ -23,6 +27,7 @@ const MAX_STRUCTURE_MARKER_RADIUS: i32 = 4096;
 #[wasm_bindgen]
 pub struct SteelWorldgen {
     sampler: SurfaceSampler,
+    surface_chunk_cache: RefCell<SurfaceChunkCache>,
     markers: StructureMarkerSampler,
     seed: String,
     dimension: &'static str,
@@ -49,6 +54,7 @@ impl SteelWorldgen {
         let markers = StructureMarkerSampler::new(signed_seed, dimension);
         Ok(Self {
             sampler,
+            surface_chunk_cache: RefCell::new(SurfaceChunkCache::default()),
             markers,
             seed: seed.to_owned(),
             dimension: name,
@@ -76,7 +82,13 @@ impl SteelWorldgen {
                 "size must be <= 256 and evenly divisible by resolution",
             ));
         }
-        let tile = self.sampler.tile(x, z, size, resolution);
+        let tile = self.sampler.tile_with_cache(
+            &mut self.surface_chunk_cache.borrow_mut(),
+            x,
+            z,
+            size,
+            resolution,
+        );
         serde_json::to_string(&TerrainResponse::new(
             &self.seed,
             self.dimension,

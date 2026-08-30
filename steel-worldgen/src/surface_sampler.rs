@@ -83,6 +83,67 @@ pub struct SurfaceVegetationBlock {
     pub state: String,
 }
 
+/// Maximum number of reusable terrain chunks retained by the browser sampler.
+///
+/// Each entry retains pre- and post-Carvers copies: 2 * 192 KiB * 96 entries
+/// is about 36 MiB per worker, or 576 MiB across the viewer's maximum 16 workers.
+pub const DEFAULT_SURFACE_CHUNK_CACHE_CAPACITY: usize = 96;
+
+struct CachedSurfaceChunk {
+    pre_carver: InMemorySurfaceChunk,
+    post_carver: InMemorySurfaceChunk,
+    last_used: u64,
+}
+
+/// Bounded least-recently-used cache for reusable surface-generation chunks.
+pub struct SurfaceChunkCache {
+    capacity: usize,
+    clock: u64,
+    chunks: HashMap<(i32, i32), CachedSurfaceChunk>,
+}
+
+impl Default for SurfaceChunkCache {
+    fn default() -> Self {
+        Self::new(DEFAULT_SURFACE_CHUNK_CACHE_CAPACITY)
+    }
+}
+
+impl SurfaceChunkCache {
+    /// Creates a cache retaining at most `capacity` chunks.
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            clock: 0,
+            chunks: HashMap::new(),
+        }
+    }
+
+    fn touch(&mut self, key: (i32, i32)) -> Option<&CachedSurfaceChunk> {
+        self.clock = self.clock.wrapping_add(1);
+        let entry = self.chunks.get_mut(&key)?;
+        entry.last_used = self.clock;
+        Some(entry)
+    }
+
+    fn insert(&mut self, key: (i32, i32), entry: CachedSurfaceChunk) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.chunks.len() == self.capacity {
+            let oldest = self
+                .chunks
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(&key, _)| key);
+            if let Some(oldest) = oldest {
+                self.chunks.remove(&oldest);
+            }
+        }
+        self.chunks.insert(key, entry);
+    }
+}
+
 /// Compact base-noise volume for one 16×16 chunk footprint.
 ///
 /// `voxels` is X-major inside Z-major inside Y-major order. Its values are a
@@ -150,10 +211,35 @@ impl SurfaceSampler {
     /// Panics when size or resolution do not describe a positive exact grid.
     #[must_use]
     pub fn tile(&self, origin_x: i32, origin_z: i32, size: u32, resolution: u32) -> SurfaceTile {
+        self.tile_with_cache(
+            &mut SurfaceChunkCache::new(usize::MAX),
+            origin_x,
+            origin_z,
+            size,
+            resolution,
+        )
+    }
+
+    /// Samples an exact square while reusing generated chunks from `cache`.
+    #[must_use]
+    pub fn tile_with_cache(
+        &self,
+        cache: &mut SurfaceChunkCache,
+        origin_x: i32,
+        origin_z: i32,
+        size: u32,
+        resolution: u32,
+    ) -> SurfaceTile {
         match self {
-            Self::Overworld(sampler) => sampler.tile(origin_x, origin_z, size, resolution),
-            Self::Nether(sampler) => sampler.tile(origin_x, origin_z, size, resolution),
-            Self::End(sampler) => sampler.tile(origin_x, origin_z, size, resolution),
+            Self::Overworld(sampler) => {
+                sampler.tile_with_cache(cache, origin_x, origin_z, size, resolution)
+            }
+            Self::Nether(sampler) => {
+                sampler.tile_with_cache(cache, origin_x, origin_z, size, resolution)
+            }
+            Self::End(sampler) => {
+                sampler.tile_with_cache(cache, origin_x, origin_z, size, resolution)
+            }
         }
     }
 
@@ -273,11 +359,17 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         }
     }
 
-    fn tile(&self, origin_x: i32, origin_z: i32, size: u32, resolution: u32) -> SurfaceTile {
+    fn tile_with_cache(
+        &self,
+        cache: &mut SurfaceChunkCache,
+        origin_x: i32,
+        origin_z: i32,
+        size: u32,
+        resolution: u32,
+    ) -> SurfaceTile {
         assert!(size > 0 && resolution > 0 && size.is_multiple_of(resolution));
         let samples_per_side = size / resolution + 1;
         let capacity = (samples_per_side * samples_per_side) as usize;
-        let mut chunks = HashMap::new();
         let mut heights = Vec::with_capacity(capacity);
         let mut colors = Vec::with_capacity(capacity * 3);
         let mut present = Vec::with_capacity(capacity);
@@ -292,11 +384,12 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
                 let z = origin_z.saturating_add((sample_z * resolution) as i32);
                 let chunk_x = x.div_euclid(16);
                 let chunk_z = z.div_euclid(16);
-                let chunk = chunks
-                    .entry((chunk_x, chunk_z))
-                    .or_insert_with(|| self.sample_surface_chunk_data(chunk_x, chunk_z));
+                self.ensure_cached_chunk(cache, chunk_x, chunk_z);
+                let chunk = cache
+                    .touch((chunk_x, chunk_z))
+                    .expect("surface chunk must have been cached");
                 let index = (z.rem_euclid(16) * 16 + x.rem_euclid(16)) as usize;
-                let (height, state, exists) = chunk.top_surface(index);
+                let (height, state, exists) = chunk.pre_carver.top_surface(index);
                 heights.push(height);
                 present.push(u8::from(exists));
                 surface_blocks.push(canonical_block_key(state));
@@ -322,7 +415,7 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             }
         }
 
-        let vegetation_blocks = self.vegetation_tile(origin_x, origin_z, size, &mut chunks);
+        let vegetation_blocks = self.vegetation_tile(origin_x, origin_z, size, cache);
 
         SurfaceTile {
             samples_per_side,
@@ -342,7 +435,7 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         origin_x: i32,
         origin_z: i32,
         size: u32,
-        chunks: &mut HashMap<(i32, i32), InMemorySurfaceChunk>,
+        cache: &mut SurfaceChunkCache,
     ) -> Vec<SurfaceVegetationBlock> {
         let min_chunk_x = origin_x.div_euclid(16);
         let min_chunk_z = origin_z.div_euclid(16);
@@ -358,28 +451,21 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         let source_min_chunk_z = min_chunk_z - 1;
         let source_max_chunk_x = max_chunk_x + 1;
         let source_max_chunk_z = max_chunk_z + 1;
+        let mut chunks = HashMap::new();
         for chunk_z in source_min_chunk_z - 1..=source_max_chunk_z + 1 {
             for chunk_x in source_min_chunk_x - 1..=source_max_chunk_x + 1 {
-                chunks
-                    .entry((chunk_x, chunk_z))
-                    .or_insert_with(|| self.sample_surface_chunk_data(chunk_x, chunk_z));
-            }
-        }
-
-        // Vanilla Features reads post-Carvers chunks. Carvers do not write
-        // across chunk boundaries, so every retained terrain chunk can be
-        // carved independently after its complete Surface state exists.
-        for chunk_z in source_min_chunk_z - 1..=source_max_chunk_z + 1 {
-            for chunk_x in source_min_chunk_x - 1..=source_max_chunk_x + 1 {
-                let chunk = chunks
-                    .get_mut(&(chunk_x, chunk_z))
-                    .expect("terrain halo chunk must have been initialized");
-                self.apply_carvers_to_chunk(chunk);
+                self.ensure_cached_chunk(cache, chunk_x, chunk_z);
+                let chunk = cache
+                    .touch((chunk_x, chunk_z))
+                    .expect("vegetation halo chunk must have been cached")
+                    .post_carver
+                    .clone();
+                chunks.insert((chunk_x, chunk_z), chunk);
             }
         }
 
         let mut region = InMemoryVegetationRegion::new(
-            chunks,
+            &mut chunks,
             &self.biome_source,
             N::Settings::MIN_Y,
             N::Settings::HEIGHT,
@@ -419,6 +505,25 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             .collect::<Vec<_>>();
         final_blocks.sort_by_key(|block| (block.x, block.y, block.z));
         final_blocks
+    }
+
+    fn ensure_cached_chunk(&self, cache: &mut SurfaceChunkCache, chunk_x: i32, chunk_z: i32) {
+        let key = (chunk_x, chunk_z);
+        if cache.chunks.contains_key(&key) {
+            return;
+        }
+        let pre_carver = self.sample_surface_chunk_data(chunk_x, chunk_z);
+        let mut post_carver = pre_carver.clone();
+        self.apply_carvers_to_chunk(&mut post_carver);
+        cache.clock = cache.clock.wrapping_add(1);
+        cache.insert(
+            key,
+            CachedSurfaceChunk {
+                pre_carver,
+                post_carver,
+                last_used: cache.clock,
+            },
+        );
     }
 
     fn sample_surface_chunk_data(&self, chunk_x: i32, chunk_z: i32) -> InMemorySurfaceChunk {
@@ -1077,7 +1182,101 @@ fn canonical_block_state_key(state: BlockStateId) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{SurfaceDimension, SurfaceSampler};
+    use std::time::Instant;
+
+    use super::{SurfaceChunkCache, SurfaceDimension, SurfaceSampler, SurfaceTile};
+
+    fn assert_tiles_equal(actual: &SurfaceTile, expected: &SurfaceTile) {
+        assert_eq!(actual.samples_per_side, expected.samples_per_side);
+        assert_eq!(actual.heights, expected.heights);
+        assert_eq!(actual.colors, expected.colors);
+        assert_eq!(actual.biomes, expected.biomes);
+        assert_eq!(actual.biome_indices, expected.biome_indices);
+        assert_eq!(actual.present, expected.present);
+        assert_eq!(actual.surface_blocks, expected.surface_blocks);
+        assert_eq!(actual.vegetation_blocks, expected.vegetation_blocks);
+        assert_eq!(actual.min_y, expected.min_y);
+    }
+
+    #[test]
+    fn cached_tiles_are_identical_to_uncached_tiles() {
+        let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+        let mut cache = SurfaceChunkCache::default();
+        let cases = [
+            (0, 0, 64),
+            (64, 0, 64),
+            (-128, -64, 64),
+            (7, 11, 64),
+            (256, 256, 256),
+        ];
+        for (x, z, size) in cases {
+            let cached = sampler.tile_with_cache(&mut cache, x, z, size, 1);
+            let uncached = sampler.tile(x, z, size, 1);
+            assert_tiles_equal(&cached, &uncached);
+        }
+    }
+
+    fn median_ms(mut values: Vec<f64>) -> f64 {
+        values.sort_by(f64::total_cmp);
+        values[values.len() / 2]
+    }
+
+    #[test]
+    #[ignore = "measurement harness; run with --ignored --nocapture"]
+    fn measure_surface_chunk_cache() {
+        const REPETITIONS: usize = 3;
+        let mut grid_cached = Vec::new();
+        let mut grid_uncached = Vec::new();
+        let mut isolated_cached = Vec::new();
+        let mut isolated_uncached = Vec::new();
+
+        for _ in 0..REPETITIONS {
+            let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+            let mut cache = SurfaceChunkCache::default();
+            let start = Instant::now();
+            for tile_z in 0..4 {
+                for tile_x in 0..4 {
+                    let _ = sampler.tile_with_cache(&mut cache, tile_x * 64, tile_z * 64, 64, 1);
+                }
+            }
+            grid_cached.push(start.elapsed().as_secs_f64() * 1_000.0);
+
+            let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+            let start = Instant::now();
+            for tile_z in 0..4 {
+                for tile_x in 0..4 {
+                    let _ = sampler.tile(tile_x * 64, tile_z * 64, 64, 1);
+                }
+            }
+            grid_uncached.push(start.elapsed().as_secs_f64() * 1_000.0);
+
+            let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+            let mut cache = SurfaceChunkCache::default();
+            let start = Instant::now();
+            let _ = sampler.tile_with_cache(&mut cache, 0, 0, 64, 1);
+            isolated_cached.push(start.elapsed().as_secs_f64() * 1_000.0);
+
+            let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+            let start = Instant::now();
+            let _ = sampler.tile(0, 0, 64, 1);
+            isolated_uncached.push(start.elapsed().as_secs_f64() * 1_000.0);
+        }
+
+        let grid_cached = median_ms(grid_cached);
+        let grid_uncached = median_ms(grid_uncached);
+        let isolated_cached = median_ms(isolated_cached);
+        let isolated_uncached = median_ms(isolated_uncached);
+        println!(
+            "grid cached={grid_cached:.3} ms uncached={grid_uncached:.3} ms ratio={:.3}x; useful_chunk cached={:.3} ms uncached={:.3} ms",
+            grid_uncached / grid_cached,
+            grid_cached / 256.0,
+            grid_uncached / 256.0,
+        );
+        println!(
+            "isolated cached={isolated_cached:.3} ms uncached={isolated_uncached:.3} ms ratio={:.3}x",
+            isolated_uncached / isolated_cached,
+        );
+    }
 
     #[test]
     fn noise_volume_has_a_compact_palette_grid() {
