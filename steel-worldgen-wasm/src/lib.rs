@@ -115,6 +115,7 @@ impl SteelWorldgen {
             size,
             resolution,
             tile,
+            None,
         ))
         .map_err(|error| JsValue::from_str(&error.to_string()))
     }
@@ -146,6 +147,36 @@ impl SteelWorldgen {
             size,
             resolution,
             tile,
+            None,
+        ))
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Generates a biome-only overview tile with approximate heights.
+    ///
+    /// Heights are preliminary density-router estimates. Surface blocks and
+    /// vegetation are empty because no terrain stages are generated.
+    ///
+    /// # Errors
+    /// Returns an error when the requested grid is invalid or serialization fails.
+    pub fn terrain_tile_biome(
+        &self,
+        x: i32,
+        z: i32,
+        size: u32,
+        resolution: u32,
+    ) -> Result<String, JsValue> {
+        validate_terrain_grid(size, resolution)?;
+        let tile = self.sampler.biome_tile(x, z, size, resolution);
+        serde_json::to_string(&TerrainResponse::new(
+            &self.seed,
+            self.dimension,
+            x,
+            z,
+            size,
+            resolution,
+            tile,
+            Some("preliminary_surface_level"),
         ))
         .map_err(|error| JsValue::from_str(&error.to_string()))
     }
@@ -564,6 +595,8 @@ struct TerrainResponse<'a> {
     resolution: u32,
     samples_per_side: u32,
     heights: Vec<i16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    height_approximation: Option<&'static str>,
     colors: Vec<u8>,
     biomes: Vec<String>,
     biome_indices: Vec<u16>,
@@ -644,6 +677,7 @@ impl<'a> TerrainResponse<'a> {
         size: u32,
         resolution: u32,
         tile: SurfaceTile,
+        height_approximation: Option<&'static str>,
     ) -> Self {
         let mut terrain_heights = tile
             .heights
@@ -666,6 +700,7 @@ impl<'a> TerrainResponse<'a> {
             resolution,
             samples_per_side: tile.samples_per_side,
             heights: tile.heights,
+            height_approximation,
             colors: tile.colors,
             biomes: tile.biomes,
             biome_indices: tile.biome_indices,

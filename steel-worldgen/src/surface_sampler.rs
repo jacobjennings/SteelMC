@@ -17,7 +17,7 @@ use crate::carver::{CarverBlockAccess, CarverStage};
 use crate::density::{ColumnCache, DimensionNoises, NoiseSettings};
 use crate::density_functions::{end::EndNoises, nether::NetherNoises, overworld::OverworldNoises};
 use crate::noise::NoiseChunk;
-use crate::noise::{Aquifer, AquiferResult, OreVeinifier};
+use crate::noise::{Aquifer, AquiferResult, OreVeinifier, preliminary_surface_level};
 use crate::noise_parameters::get_noise_parameters;
 use crate::surface::{
     PreliminarySurfaceCorners, SurfaceBiomeAccess, SurfaceBlockAccess, SurfaceExtensions,
@@ -43,7 +43,10 @@ pub enum SurfaceDimension {
 pub struct SurfaceTile {
     /// Number of samples on one edge.
     pub samples_per_side: u32,
-    /// Y coordinate of the final highest non-fluid solid for each sample.
+    /// Y coordinate of the sampled surface.
+    ///
+    /// Exact and coarse tiles contain the final highest non-fluid solid. Biome
+    /// tiles contain the preliminary density-router estimate instead.
     pub heights: Vec<i16>,
     /// RGB bytes derived from the sampled biome's configured grass colour.
     pub colors: Vec<u8>,
@@ -294,6 +297,27 @@ impl SurfaceSampler {
         self.tile_with_cache_mode(cache, origin_x, origin_z, size, resolution, false)
     }
 
+    /// Samples biomes using the preliminary density-router surface estimate.
+    ///
+    /// This deliberately skips density-column filling, aquifers, ore veins,
+    /// surface rules, carvers, and vegetation. Heights are approximate and
+    /// block fields are empty so callers cannot mistake this for generated
+    /// terrain.
+    #[must_use]
+    pub fn biome_tile(
+        &self,
+        origin_x: i32,
+        origin_z: i32,
+        size: u32,
+        resolution: u32,
+    ) -> SurfaceTile {
+        match self {
+            Self::Overworld(sampler) => sampler.biome_tile(origin_x, origin_z, size, resolution),
+            Self::Nether(sampler) => sampler.biome_tile(origin_x, origin_z, size, resolution),
+            Self::End(sampler) => sampler.biome_tile(origin_x, origin_z, size, resolution),
+        }
+    }
+
     fn tile_with_cache_mode(
         &self,
         cache: &mut SurfaceChunkCache,
@@ -523,6 +547,62 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             present,
             surface_blocks,
             vegetation_blocks,
+            min_y: N::Settings::MIN_Y as i16,
+        }
+    }
+
+    fn biome_tile(&self, origin_x: i32, origin_z: i32, size: u32, resolution: u32) -> SurfaceTile {
+        assert!(size > 0 && resolution > 0 && size.is_multiple_of(resolution));
+        let samples_per_side = size / resolution + 1;
+        let capacity = (samples_per_side * samples_per_side) as usize;
+        let mut heights = Vec::with_capacity(capacity);
+        let mut colors = Vec::with_capacity(capacity * 3);
+        let mut present = Vec::with_capacity(capacity);
+        let mut biomes = Vec::new();
+        let mut biome_lookup = HashMap::new();
+        let mut biome_indices = Vec::with_capacity(capacity);
+        let mut column_cache = N::ColumnCache::default();
+        let mut biome_sampler = self.biome_source.chunk_sampler();
+
+        for sample_z in 0..samples_per_side {
+            for sample_x in 0..samples_per_side {
+                let x = origin_x.saturating_add((sample_x * resolution) as i32);
+                let z = origin_z.saturating_add((sample_z * resolution) as i32);
+                let height = preliminary_surface_level::<N>(&self.noises, &mut column_cache, x, z)
+                    .clamp(i32::from(i16::MIN), i32::from(i16::MAX))
+                    as i16;
+                heights.push(height);
+                present.push(u8::from(i32::from(height) >= N::Settings::MIN_Y));
+
+                let biome = biome_sampler.sample(x >> 2, i32::from(height) >> 2, z >> 2);
+                let biome_key = format!("{}:{}", biome.key.namespace, biome.key.path);
+                let palette_index = if let Some(index) = biome_lookup.get(&biome_key) {
+                    *index
+                } else {
+                    assert!(
+                        biomes.len() < usize::from(u16::MAX),
+                        "biome palette exceeds u16"
+                    );
+                    let index = biomes.len() as u16;
+                    biome_lookup.insert(biome_key.clone(), index);
+                    biomes.push(biome_key);
+                    index
+                };
+                biome_indices.push(palette_index);
+                let color = biome.effects.grass_color.unwrap_or(0x6a_a8_4f) as u32;
+                colors.extend_from_slice(&[(color >> 16) as u8, (color >> 8) as u8, color as u8]);
+            }
+        }
+
+        SurfaceTile {
+            samples_per_side,
+            heights,
+            colors,
+            biomes,
+            biome_indices,
+            present,
+            surface_blocks: Vec::new(),
+            vegetation_blocks: Vec::new(),
             min_y: N::Settings::MIN_Y as i16,
         }
     }
@@ -1490,6 +1570,21 @@ mod tests {
     }
 
     #[test]
+    fn biome_tile_matches_full_biomes_at_sample_positions() {
+        let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+        for (x, z, size, resolution) in [(0, 0, 64, 1), (-71, -93, 64, 4)] {
+            let mut full_cache = SurfaceChunkCache::default();
+            let full = sampler.tile_with_cache(&mut full_cache, x, z, size, resolution);
+            let biome = sampler.biome_tile(x, z, size, resolution);
+            assert_eq!(biome.biomes, full.biomes);
+            assert_eq!(biome.biome_indices, full.biome_indices);
+            assert_eq!(biome.colors, full.colors);
+            assert!(biome.surface_blocks.is_empty());
+            assert!(biome.vegetation_blocks.is_empty());
+        }
+    }
+
+    #[test]
     fn cached_tiles_are_identical_to_uncached_tiles() {
         let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
         let mut cache = SurfaceChunkCache::default();
@@ -1614,53 +1709,115 @@ mod tests {
     #[ignore = "measurement harness; run with --ignored --nocapture"]
     fn measure_coarse_surface_tiles() {
         const REPETITIONS: usize = 3;
-        let mut full_times = Vec::with_capacity(REPETITIONS);
-        let mut coarse_times = Vec::with_capacity(REPETITIONS);
-
-        for repetition in 0..REPETITIONS {
-            let mut measure_full = || {
-                let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
-                let mut cache = SurfaceChunkCache::default();
-                let start = Instant::now();
-                for tile_z in 0..4 {
-                    for tile_x in 0..4 {
-                        let _ =
-                            sampler.tile_with_cache(&mut cache, tile_x * 64, tile_z * 64, 64, 1);
+        fn measure_case(grid: bool) -> (f64, f64, f64) {
+            let mut full_times = Vec::with_capacity(REPETITIONS);
+            let mut coarse_times = Vec::with_capacity(REPETITIONS);
+            let mut biome_times = Vec::with_capacity(REPETITIONS);
+            for repetition in 0..REPETITIONS {
+                for path in 0..3 {
+                    let path = (path + repetition) % 3;
+                    let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+                    let mut cache = SurfaceChunkCache::default();
+                    let start = Instant::now();
+                    if grid {
+                        for tile_z in 0..4 {
+                            for tile_x in 0..4 {
+                                match path {
+                                    0 => {
+                                        let _ = sampler.tile_with_cache(
+                                            &mut cache,
+                                            tile_x * 64,
+                                            tile_z * 64,
+                                            64,
+                                            1,
+                                        );
+                                    }
+                                    1 => {
+                                        let _ = sampler.coarse_tile_with_cache(
+                                            &mut cache,
+                                            tile_x * 64,
+                                            tile_z * 64,
+                                            64,
+                                            1,
+                                        );
+                                    }
+                                    _ => {
+                                        let _ = sampler.biome_tile(tile_x * 64, tile_z * 64, 64, 1);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        match path {
+                            0 => {
+                                let _ = sampler.tile_with_cache(&mut cache, 0, 0, 256, 1);
+                            }
+                            1 => {
+                                let _ = sampler.coarse_tile_with_cache(&mut cache, 0, 0, 256, 1);
+                            }
+                            _ => {
+                                let _ = sampler.biome_tile(0, 0, 256, 1);
+                            }
+                        }
+                    }
+                    let elapsed = start.elapsed().as_secs_f64() * 1_000.0;
+                    match path {
+                        0 => full_times.push(elapsed),
+                        1 => coarse_times.push(elapsed),
+                        _ => biome_times.push(elapsed),
                     }
                 }
-                full_times.push(start.elapsed().as_secs_f64() * 1_000.0);
-            };
-            let mut measure_coarse = || {
-                let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
-                let mut cache = SurfaceChunkCache::default();
-                let start = Instant::now();
-                for tile_z in 0..4 {
-                    for tile_x in 0..4 {
-                        let _ = sampler.coarse_tile_with_cache(
-                            &mut cache,
-                            tile_x * 64,
-                            tile_z * 64,
-                            64,
-                            1,
-                        );
-                    }
-                }
-                coarse_times.push(start.elapsed().as_secs_f64() * 1_000.0);
-            };
-            if repetition.is_multiple_of(2) {
-                measure_full();
-                measure_coarse();
-            } else {
-                measure_coarse();
-                measure_full();
             }
+            (
+                median_ms(full_times),
+                median_ms(coarse_times),
+                median_ms(biome_times),
+            )
         }
 
-        let full_ms = median_ms(full_times);
-        let coarse_ms = median_ms(coarse_times);
+        for (label, grid) in [("contiguous_4x4_64", true), ("single_256", false)] {
+            let (full_ms, coarse_ms, biome_ms) = measure_case(grid);
+            println!(
+                "{label} full={full_ms:.3} ms coarse={coarse_ms:.3} ms biome={biome_ms:.3} ms full/biome={:.3}x coarse/biome={:.3}x",
+                full_ms / biome_ms,
+                coarse_ms / biome_ms,
+            );
+        }
+
+        let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+        let mut cache = SurfaceChunkCache::default();
+        let full = sampler.tile_with_cache(&mut cache, 0, 0, 256, 1);
+        let biome = sampler.biome_tile(0, 0, 256, 1);
+        let mut absolute_errors = full
+            .heights
+            .iter()
+            .zip(&biome.heights)
+            .map(|(exact, approximate)| {
+                (i32::from(*exact) - i32::from(*approximate)).unsigned_abs()
+            })
+            .collect::<Vec<_>>();
+        absolute_errors.sort_unstable();
+        let exact_heights = absolute_errors.iter().filter(|error| **error == 0).count();
+        let biome_mismatches = full
+            .biome_indices
+            .iter()
+            .zip(&biome.biome_indices)
+            .filter(|(exact, approximate)| exact != approximate)
+            .count();
+        let present_mismatches = full
+            .present
+            .iter()
+            .zip(&biome.present)
+            .filter(|(exact, approximate)| exact != approximate)
+            .count();
         println!(
-            "contiguous_4x4_64 full={full_ms:.3} ms coarse={coarse_ms:.3} ms ratio={:.3}x",
-            full_ms / coarse_ms,
+            "single_256_accuracy samples={} height_exact={} height_median_abs_error={} height_max_abs_error={} biome_index_mismatches={} present_mismatches={}",
+            absolute_errors.len(),
+            exact_heights,
+            absolute_errors[absolute_errors.len() / 2],
+            absolute_errors.last().copied().unwrap_or_default(),
+            biome_mismatches,
+            present_mismatches,
         );
     }
 
