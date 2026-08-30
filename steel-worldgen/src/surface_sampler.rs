@@ -275,16 +275,56 @@ impl SurfaceSampler {
         size: u32,
         resolution: u32,
     ) -> SurfaceTile {
+        self.tile_with_cache_mode(cache, origin_x, origin_z, size, resolution, true)
+    }
+
+    /// Samples an exact square without generating or carving the vegetation halo.
+    #[must_use]
+    pub fn coarse_tile_with_cache(
+        &self,
+        cache: &mut SurfaceChunkCache,
+        origin_x: i32,
+        origin_z: i32,
+        size: u32,
+        resolution: u32,
+    ) -> SurfaceTile {
+        self.tile_with_cache_mode(cache, origin_x, origin_z, size, resolution, false)
+    }
+
+    fn tile_with_cache_mode(
+        &self,
+        cache: &mut SurfaceChunkCache,
+        origin_x: i32,
+        origin_z: i32,
+        size: u32,
+        resolution: u32,
+        include_vegetation: bool,
+    ) -> SurfaceTile {
         match self {
-            Self::Overworld(sampler) => {
-                sampler.tile_with_cache(cache, origin_x, origin_z, size, resolution)
-            }
-            Self::Nether(sampler) => {
-                sampler.tile_with_cache(cache, origin_x, origin_z, size, resolution)
-            }
-            Self::End(sampler) => {
-                sampler.tile_with_cache(cache, origin_x, origin_z, size, resolution)
-            }
+            Self::Overworld(sampler) => sampler.tile_with_cache(
+                cache,
+                origin_x,
+                origin_z,
+                size,
+                resolution,
+                include_vegetation,
+            ),
+            Self::Nether(sampler) => sampler.tile_with_cache(
+                cache,
+                origin_x,
+                origin_z,
+                size,
+                resolution,
+                include_vegetation,
+            ),
+            Self::End(sampler) => sampler.tile_with_cache(
+                cache,
+                origin_x,
+                origin_z,
+                size,
+                resolution,
+                include_vegetation,
+            ),
         }
     }
 
@@ -411,6 +451,7 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         origin_z: i32,
         size: u32,
         resolution: u32,
+        include_vegetation: bool,
     ) -> SurfaceTile {
         assert!(size > 0 && resolution > 0 && size.is_multiple_of(resolution));
         let samples_per_side = size / resolution + 1;
@@ -464,7 +505,11 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             }
         }
 
-        let vegetation_blocks = self.vegetation_tile(origin_x, origin_z, size, cache);
+        let vegetation_blocks = if include_vegetation {
+            self.vegetation_tile(origin_x, origin_z, size, cache)
+        } else {
+            Vec::new()
+        };
 
         SurfaceTile {
             samples_per_side,
