@@ -1,7 +1,7 @@
 //! Byte-oriented WebAssembly adapter for Steel world generation.
 
 use serde::Serialize;
-use steel_worldgen::surface_sampler::{SurfaceDimension, SurfaceSampler, SurfaceTile};
+use steel_worldgen::surface_sampler::{NoiseVolume, SurfaceDimension, SurfaceSampler, SurfaceTile};
 use wasm_bindgen::prelude::*;
 
 /// Reusable single-seed generator intended to live inside a Web Worker.
@@ -69,6 +69,40 @@ impl SteelWorldgen {
         ))
         .map_err(|error| JsValue::from_str(&error.to_string()))
     }
+
+    /// Generates base-noise occupancy for one chunk footprint.
+    ///
+    /// `max_y` is exclusive, so it is directly suitable for a "max layer"
+    /// control. The result deliberately contains no surface-rule, ore, carver,
+    /// feature or structure blocks; see `material_keys` for its compact
+    /// classification palette.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid vertical range or unsupported LOD.
+    pub fn noise_volume_chunk(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+        min_y: i32,
+        max_y: i32,
+        lod: u32,
+    ) -> Result<String, JsValue> {
+        if min_y >= max_y {
+            return Err(JsValue::from_str("min_y must be below max_y"));
+        }
+        if !matches!(lod, 1 | 4 | 16 | 64 | 256) {
+            return Err(JsValue::from_str("LOD must be one of 1, 4, 16, 64, 256"));
+        }
+        serde_json::to_string(&VolumeResponse::new(
+            &self.seed,
+            self.dimension,
+            chunk_x,
+            chunk_z,
+            self.sampler
+                .noise_volume_chunk(chunk_x, chunk_z, min_y, max_y, lod),
+        ))
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
 }
 
 #[derive(Serialize)]
@@ -92,6 +126,55 @@ struct TerrainResponse<'a> {
     min_y: i16,
     present: Vec<u8>,
     decorations: [u8; 0],
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VolumeResponse<'a> {
+    generator: &'static str,
+    version: &'static str,
+    seed: &'a str,
+    dimension: &'a str,
+    chunk_x: i32,
+    chunk_z: i32,
+    min_y: i16,
+    cells_xz: u32,
+    cells_y: u32,
+    lod: u16,
+    /// `noise_default_solid` has no canonical block key: it is only the
+    /// dimension's base noise block before later worldgen stages.
+    material_keys: [&'static str; 4],
+    voxels: Vec<u8>,
+}
+
+impl<'a> VolumeResponse<'a> {
+    fn new(
+        seed: &'a str,
+        dimension: &'a str,
+        chunk_x: i32,
+        chunk_z: i32,
+        volume: NoiseVolume,
+    ) -> Self {
+        Self {
+            generator: "steelmc-wasm",
+            version: "26.2",
+            seed,
+            dimension,
+            chunk_x,
+            chunk_z,
+            min_y: volume.min_y,
+            cells_xz: volume.cells_xz,
+            cells_y: volume.cells_y,
+            lod: volume.lod,
+            material_keys: [
+                "minecraft:air",
+                "steel:noise_default_solid",
+                "minecraft:water",
+                "minecraft:lava",
+            ],
+            voxels: volume.voxels,
+        }
+    }
 }
 
 impl<'a> TerrainResponse<'a> {
