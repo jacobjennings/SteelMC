@@ -150,6 +150,34 @@ impl SteelWorldgen {
         .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
+    /// Generates a biome-only overview tile with approximate heights.
+    ///
+    /// Heights are preliminary density-router estimates. Surface blocks and
+    /// vegetation are empty because no terrain stages are generated.
+    ///
+    /// # Errors
+    /// Returns an error when the requested grid is invalid or serialization fails.
+    pub fn terrain_tile_biome(
+        &self,
+        x: i32,
+        z: i32,
+        size: u32,
+        resolution: u32,
+    ) -> Result<String, JsValue> {
+        validate_terrain_grid(size, resolution)?;
+        let tile = self.sampler.biome_tile(x, z, size, resolution);
+        serde_json::to_string(&TerrainResponse::new(
+            &self.seed,
+            self.dimension,
+            x,
+            z,
+            size,
+            resolution,
+            tile,
+        ))
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
     /// Generates base-noise occupancy for one chunk footprint.
     ///
     /// `max_y` is exclusive, so it is directly suitable for a "max layer"
