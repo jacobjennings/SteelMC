@@ -8,7 +8,7 @@ usage() {
 Usage: scripts/build-wasm-worldgen.sh [OUTPUT_DIRECTORY]
 
 Environment:
-  WASM_SIMD=1       Enable the WebAssembly simd128 target feature.
+  WASM_SIMD=0|1     Disable or enable simd128 (default: 1).
   WASM_OPT=LEVEL    Run wasm-opt after wasm-bindgen (for example, -Oz or -O3).
 
 SIMD compatibility: WebAssembly SIMD is supported by Chrome 91+, Firefox 89+,
@@ -24,11 +24,12 @@ case ${1:-} in
 esac
 
 output_dir=${1:-target/wasm-pkg}
+wasm_simd=${WASM_SIMD:-1}
 
-if [ "${WASM_SIMD:-0}" = 1 ]; then
+if [ "$wasm_simd" = 1 ]; then
     export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C target-feature=+simd128"
-elif [ "${WASM_SIMD:-0}" != 0 ]; then
-    printf 'WASM_SIMD must be 0 or 1, got: %s\n' "$WASM_SIMD" >&2
+elif [ "$wasm_simd" != 0 ]; then
+    printf 'WASM_SIMD must be 0 or 1, got: %s\n' "$wasm_simd" >&2
     exit 2
 fi
 
@@ -50,6 +51,6 @@ if [ -n "${WASM_OPT:-}" ]; then
 fi
 
 printf 'wasm-bindgen version: %s\n' "$(wasm-bindgen --version)"
-printf 'simd128 enabled: %s\n' "${WASM_SIMD:-0}"
+printf 'simd128 enabled: %s\n' "$wasm_simd"
 printf 'wasm-opt level: %s\n' "${WASM_OPT:-none}"
 printf 'WASM byte size: %s (%s)\n' "$(wc -c < "$wasm_file")" "$wasm_file"
