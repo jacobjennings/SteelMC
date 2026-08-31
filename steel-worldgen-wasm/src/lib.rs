@@ -558,6 +558,50 @@ mod tests {
     }
 
     #[test]
+    fn compact_terrain_tile_serializes_surface_block_palette() {
+        let generator = SteelWorldgen::new("0", "overworld", None)
+            .unwrap_or_else(|error| panic!("surface generator should initialize: {error:?}"));
+        let value: serde_json::Value = serde_json::from_str(
+            &generator
+                .terrain_tile(0, 0, 16, 1, Some(true))
+                .unwrap_or_else(|error| panic!("surface tile should serialize: {error:?}")),
+        )
+        .unwrap_or_else(|error| panic!("surface tile response must be JSON: {error}"));
+        let blocks = value["surfaceBlocks"]
+            .as_array()
+            .unwrap_or_else(|| panic!("surface tile response must include surfaceBlocks"));
+        let indices = value["surfaceBlockIndices"]
+            .as_array()
+            .unwrap_or_else(|| panic!("surface tile response must include surfaceBlockIndices"));
+        let heights = value["heights"]
+            .as_array()
+            .unwrap_or_else(|| panic!("surface tile response must include heights"));
+
+        assert!(blocks.len() < heights.len());
+        assert_eq!(indices.len(), heights.len());
+        assert!(indices.iter().all(|index| {
+            index
+                .as_u64()
+                .is_some_and(|index| index < blocks.len() as u64)
+        }));
+    }
+
+    #[test]
+    fn compact_biome_tile_serializes_empty_surface_palette() {
+        let generator = SteelWorldgen::new("0", "overworld", None)
+            .unwrap_or_else(|error| panic!("surface generator should initialize: {error:?}"));
+        let value: serde_json::Value = serde_json::from_str(
+            &generator
+                .terrain_tile_biome(0, 0, 16, 1, Some(true))
+                .unwrap_or_else(|error| panic!("biome tile should serialize: {error:?}")),
+        )
+        .unwrap_or_else(|error| panic!("biome tile response must be JSON: {error}"));
+
+        assert_eq!(value["surfaceBlocks"], serde_json::json!([]));
+        assert_eq!(value["surfaceBlockIndices"], serde_json::json!([]));
+    }
+
+    #[test]
     fn terrain_tile_serializes_canonical_cherry_vegetation_states() {
         let generator = SteelWorldgen::new("1", "overworld", None).unwrap_or_else(|error| {
             panic!("cherry fixture generator should initialize: {error:?}")
