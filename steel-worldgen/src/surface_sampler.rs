@@ -106,6 +106,8 @@ pub struct SurfaceChunkCacheStats {
     pub evictions: u64,
     /// Largest number of chunks retained simultaneously.
     pub peak_retained_chunks: usize,
+    /// Largest simultaneous payload of flat chunks used for vegetation.
+    pub peak_live_flat_chunk_bytes: usize,
 }
 
 struct CachedSurfaceChunk {
@@ -638,8 +640,10 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
                 let Some(chunk) = cached_chunk.post_carver.as_ref() else {
                     panic!("vegetation halo chunk must have been carved");
                 };
-                let chunk = chunk.to_in_memory();
-                chunks.insert((chunk_x, chunk_z), chunk);
+                chunks.insert(
+                    (chunk_x, chunk_z),
+                    VegetationChunk::Compact(PalettizedSurfaceChunk::from(chunk.to_in_memory())),
+                );
             }
         }
 
@@ -655,6 +659,11 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         // neighboring source chunks.
         for chunk_x in source_min_chunk_x..=source_max_chunk_x {
             for chunk_z in source_min_chunk_z..=source_max_chunk_z {
+                region.prepare_window(chunk_x, chunk_z);
+                cache.stats.peak_live_flat_chunk_bytes = cache
+                    .stats
+                    .peak_live_flat_chunk_bytes
+                    .max(region.flat_payload_bytes());
                 for block in
                     self.vegetation_stage
                         .decorate_chunk(&mut region, &REGISTRY, chunk_x, chunk_z)
@@ -852,7 +861,7 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             for source_x in chunk_x - 1..=chunk_x + 1 {
                 let mut chunk = self.sample_surface_chunk_data(source_x, source_z);
                 self.apply_carvers_to_chunk(&mut chunk);
-                chunks.insert((source_x, source_z), chunk);
+                chunks.insert((source_x, source_z), VegetationChunk::Flat(chunk));
             }
         }
         let mut region = InMemoryVegetationRegion::new(
@@ -1048,6 +1057,12 @@ impl PalettizedSurfaceSection {
 
 impl From<InMemorySurfaceChunk> for PalettizedSurfaceChunk {
     fn from(chunk: InMemorySurfaceChunk) -> Self {
+        Self::from_chunk(&chunk)
+    }
+}
+
+impl PalettizedSurfaceChunk {
+    fn from_chunk(chunk: &InMemorySurfaceChunk) -> Self {
         assert!(chunk.height.is_multiple_of(16));
         let sections = (0..chunk.height / 16)
             .map(|section_y| PalettizedSurfaceSection::from_chunk(&chunk, section_y))
@@ -1061,9 +1076,7 @@ impl From<InMemorySurfaceChunk> for PalettizedSurfaceChunk {
             world_surface: Box::new(chunk.world_surface),
         }
     }
-}
 
-impl PalettizedSurfaceChunk {
     fn payload_bytes(&self) -> usize {
         self.sections
             .iter()
@@ -1091,6 +1104,45 @@ impl PalettizedSurfaceChunk {
         }
         chunk.world_surface = *self.world_surface;
         chunk
+    }
+
+    fn block_at(&self, local_x: usize, world_y: i32, local_z: usize) -> Option<BlockStateId> {
+        if local_x >= 16
+            || local_z >= 16
+            || !(self.min_y..self.min_y + self.height as i32).contains(&world_y)
+        {
+            return None;
+        }
+        let relative_y = (world_y - self.min_y) as usize;
+        let section_y = relative_y / 16;
+        let local_y = relative_y % 16;
+        Some(self.sections[section_y].state_at(local_y * 256 + local_z * 16 + local_x))
+    }
+
+    fn feature_height_at(&self, kind: FeatureHeightmap, local_x: usize, local_z: usize) -> i32 {
+        for relative_y in (0..self.height).rev() {
+            let section_y = relative_y / 16;
+            let local_y = relative_y % 16;
+            let state = self.sections[section_y].state_at(local_y * 256 + local_z * 16 + local_x);
+            let block = state.get_block();
+            let opaque = match kind {
+                FeatureHeightmap::WorldSurface | FeatureHeightmap::WorldSurfaceWg => {
+                    !state.is_air()
+                }
+                FeatureHeightmap::OceanFloor | FeatureHeightmap::OceanFloorWg => {
+                    state.blocks_motion()
+                }
+                FeatureHeightmap::MotionBlocking => state.blocks_motion() || state.has_fluid(),
+                FeatureHeightmap::MotionBlockingNoLeaves => {
+                    (state.blocks_motion() || state.has_fluid())
+                        && !block.has_tag(&steel_registry::vanilla_block_tags::BlockTag::LEAVES)
+                }
+            };
+            if opaque {
+                return self.min_y + relative_y as i32 + 1;
+            }
+        }
+        self.min_y
     }
 }
 
@@ -1120,6 +1172,11 @@ impl InMemorySurfaceChunk {
             blocks: vec![air; 16 * 16 * height as usize],
             world_surface: [min_y; 256],
         }
+    }
+
+    fn payload_bytes(&self) -> usize {
+        self.blocks.capacity() * std::mem::size_of::<BlockStateId>()
+            + std::mem::size_of_val(&self.world_surface)
     }
 
     fn column_index(local_x: usize, local_z: usize) -> usize {
@@ -1415,9 +1472,57 @@ impl SurfaceBiomeAccess for InMemorySurfaceBiomeAccess {
     }
 }
 
+enum VegetationChunk {
+    Compact(PalettizedSurfaceChunk),
+    Flat(InMemorySurfaceChunk),
+}
+
+impl VegetationChunk {
+    fn compact(&mut self) {
+        if let Self::Flat(chunk) = self {
+            *self = Self::Compact(PalettizedSurfaceChunk::from_chunk(chunk));
+        }
+    }
+
+    fn flatten(&mut self) {
+        if let Self::Compact(chunk) = self {
+            *self = Self::Flat(chunk.to_in_memory());
+        }
+    }
+
+    fn flat(&self) -> Option<&InMemorySurfaceChunk> {
+        match self {
+            Self::Flat(chunk) => Some(chunk),
+            Self::Compact(_) => None,
+        }
+    }
+
+    fn flat_mut(&mut self) -> &mut InMemorySurfaceChunk {
+        self.flatten();
+        let Self::Flat(chunk) = self else {
+            unreachable!("flatten must produce a flat chunk");
+        };
+        chunk
+    }
+
+    fn block_at(&self, local_x: usize, world_y: i32, local_z: usize) -> Option<BlockStateId> {
+        match self {
+            Self::Flat(chunk) => chunk.block_at(local_x, world_y, local_z),
+            Self::Compact(chunk) => chunk.block_at(local_x, world_y, local_z),
+        }
+    }
+
+    fn feature_height_at(&self, kind: FeatureHeightmap, local_x: usize, local_z: usize) -> i32 {
+        match self {
+            Self::Flat(chunk) => chunk.feature_height_at(kind, local_x, local_z),
+            Self::Compact(chunk) => chunk.feature_height_at(kind, local_x, local_z),
+        }
+    }
+}
+
 /// Mutable post-Carvers terrain halo for the portable Features slice.
 struct InMemoryVegetationRegion<'a> {
-    chunks: &'a mut HashMap<(i32, i32), InMemorySurfaceChunk>,
+    chunks: &'a mut HashMap<(i32, i32), VegetationChunk>,
     biome_source: &'a BiomeSourceKind,
     biome_access: HashMap<(i32, i32), InMemorySurfaceBiomeAccess>,
     min_y: i32,
@@ -1426,7 +1531,7 @@ struct InMemoryVegetationRegion<'a> {
 
 impl<'a> InMemoryVegetationRegion<'a> {
     fn new(
-        chunks: &'a mut HashMap<(i32, i32), InMemorySurfaceChunk>,
+        chunks: &'a mut HashMap<(i32, i32), VegetationChunk>,
         biome_source: &'a BiomeSourceKind,
         min_y: i32,
         height: i32,
@@ -1442,6 +1547,24 @@ impl<'a> InMemoryVegetationRegion<'a> {
 
     fn chunk_and_local(value: i32) -> (i32, usize) {
         (value.div_euclid(16), value.rem_euclid(16) as usize)
+    }
+
+    fn prepare_window(&mut self, center_x: i32, center_z: i32) {
+        for (&(chunk_x, chunk_z), chunk) in self.chunks.iter_mut() {
+            if (chunk_x - center_x).abs() <= 1 && (chunk_z - center_z).abs() <= 1 {
+                chunk.flatten();
+            } else {
+                chunk.compact();
+            }
+        }
+    }
+
+    fn flat_payload_bytes(&self) -> usize {
+        self.chunks
+            .values()
+            .filter_map(VegetationChunk::flat)
+            .map(InMemorySurfaceChunk::payload_bytes)
+            .sum()
     }
 }
 
@@ -1472,7 +1595,12 @@ impl VegetationBlockAccess for InMemoryVegetationRegion<'_> {
         if !(self.min_y..self.min_y + self.height).contains(&pos.y()) {
             return;
         }
-        chunk.set_relative_block(local_x, (pos.y() - self.min_y) as usize, local_z, state);
+        chunk.flat_mut().set_relative_block(
+            local_x,
+            (pos.y() - self.min_y) as usize,
+            local_z,
+            state,
+        );
     }
 
     fn height_at(&self, kind: FeatureHeightmap, x: i32, z: i32) -> i32 {
@@ -1611,6 +1739,62 @@ mod tests {
     fn median_ms(mut values: Vec<f64>) -> f64 {
         values.sort_by(f64::total_cmp);
         values[values.len() / 2]
+    }
+
+    #[test]
+    #[ignore = "measurement harness; run with --ignored --nocapture"]
+    fn measure_worker_flat_chunk_peak_and_throughput() {
+        struct Baseline {
+            peak_live_flat_chunk_bytes: usize,
+            elapsed_ms: f64,
+        }
+
+        fn measure(label: &str, generate: impl Fn(&SurfaceSampler, &mut SurfaceChunkCache)) {
+            let baseline = match label {
+                "single_64" => Baseline {
+                    peak_live_flat_chunk_bytes: 12_648_448,
+                    elapsed_ms: 6_092.507,
+                },
+                "single_256" => Baseline {
+                    peak_live_flat_chunk_bytes: 79_052_800,
+                    elapsed_ms: 76_814.102,
+                },
+                "contiguous_4x4_64" => Baseline {
+                    peak_live_flat_chunk_bytes: 12_648_448,
+                    elapsed_ms: 99_185.782,
+                },
+                _ => unreachable!("measurement case has a committed baseline"),
+            };
+            let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+            let mut cache = SurfaceChunkCache::default();
+            let start = Instant::now();
+            generate(&sampler, &mut cache);
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+            println!(
+                "{label} before_elapsed_ms={:.3} after_elapsed_ms={elapsed_ms:.3} throughput_ratio={:.3}x before_peak_live_flat_chunk_bytes={} after_peak_live_flat_chunk_bytes={} flat_memory_reduction={:.3}x retained_payload_bytes={}",
+                baseline.elapsed_ms,
+                baseline.elapsed_ms / elapsed_ms,
+                baseline.peak_live_flat_chunk_bytes,
+                cache.stats().peak_live_flat_chunk_bytes,
+                baseline.peak_live_flat_chunk_bytes as f64
+                    / cache.stats().peak_live_flat_chunk_bytes as f64,
+                cache.retained_payload_bytes(),
+            );
+        }
+
+        measure("single_64", |sampler, cache| {
+            let _ = sampler.tile_with_cache(cache, 0, 0, 64, 1);
+        });
+        measure("single_256", |sampler, cache| {
+            let _ = sampler.tile_with_cache(cache, 0, 0, 256, 1);
+        });
+        measure("contiguous_4x4_64", |sampler, cache| {
+            for tile_z in 0..4 {
+                for tile_x in 0..4 {
+                    let _ = sampler.tile_with_cache(cache, tile_x * 64, tile_z * 64, 64, 1);
+                }
+            }
+        });
     }
 
     #[test]
