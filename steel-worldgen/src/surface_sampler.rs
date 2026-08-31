@@ -106,6 +106,8 @@ pub struct SurfaceChunkCacheStats {
     pub evictions: u64,
     /// Largest number of chunks retained simultaneously.
     pub peak_retained_chunks: usize,
+    /// Largest simultaneous payload of flat chunks used for vegetation.
+    pub peak_live_flat_chunk_bytes: usize,
 }
 
 struct CachedSurfaceChunk {
@@ -639,7 +641,12 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
                     panic!("vegetation halo chunk must have been carved");
                 };
                 let chunk = chunk.to_in_memory();
+                let flat_chunk_bytes = chunk.payload_bytes();
                 chunks.insert((chunk_x, chunk_z), chunk);
+                cache.stats.peak_live_flat_chunk_bytes = cache
+                    .stats
+                    .peak_live_flat_chunk_bytes
+                    .max(chunks.len() * flat_chunk_bytes);
             }
         }
 
@@ -1120,6 +1127,11 @@ impl InMemorySurfaceChunk {
             blocks: vec![air; 16 * 16 * height as usize],
             world_surface: [min_y; 256],
         }
+    }
+
+    fn payload_bytes(&self) -> usize {
+        self.blocks.capacity() * std::mem::size_of::<BlockStateId>()
+            + std::mem::size_of_val(&self.world_surface)
     }
 
     fn column_index(local_x: usize, local_z: usize) -> usize {
@@ -1611,6 +1623,37 @@ mod tests {
     fn median_ms(mut values: Vec<f64>) -> f64 {
         values.sort_by(f64::total_cmp);
         values[values.len() / 2]
+    }
+
+    #[test]
+    #[ignore = "measurement harness; run with --ignored --nocapture"]
+    fn measure_worker_flat_chunk_peak_and_throughput() {
+        fn measure(label: &str, generate: impl Fn(&SurfaceSampler, &mut SurfaceChunkCache)) {
+            let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+            let mut cache = SurfaceChunkCache::default();
+            let start = Instant::now();
+            generate(&sampler, &mut cache);
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
+            println!(
+                "{label} elapsed_ms={elapsed_ms:.3} peak_live_flat_chunk_bytes={} retained_payload_bytes={}",
+                cache.stats().peak_live_flat_chunk_bytes,
+                cache.retained_payload_bytes(),
+            );
+        }
+
+        measure("single_64", |sampler, cache| {
+            let _ = sampler.tile_with_cache(cache, 0, 0, 64, 1);
+        });
+        measure("single_256", |sampler, cache| {
+            let _ = sampler.tile_with_cache(cache, 0, 0, 256, 1);
+        });
+        measure("contiguous_4x4_64", |sampler, cache| {
+            for tile_z in 0..4 {
+                for tile_x in 0..4 {
+                    let _ = sampler.tile_with_cache(cache, tile_x * 64, tile_z * 64, 64, 1);
+                }
+            }
+        });
     }
 
     #[test]
