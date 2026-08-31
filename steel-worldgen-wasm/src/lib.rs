@@ -98,6 +98,7 @@ impl SteelWorldgen {
         z: i32,
         size: u32,
         resolution: u32,
+        compact_surface_blocks: Option<bool>,
     ) -> Result<String, JsValue> {
         validate_terrain_grid(size, resolution)?;
         let tile = self.sampler.tile_with_cache(
@@ -116,6 +117,7 @@ impl SteelWorldgen {
             resolution,
             tile,
             None,
+            compact_surface_blocks.unwrap_or(false),
         ))
         .map_err(|error| JsValue::from_str(&error.to_string()))
     }
@@ -139,6 +141,7 @@ impl SteelWorldgen {
         z: i32,
         size: u32,
         resolution: u32,
+        compact_surface_blocks: Option<bool>,
     ) -> Result<String, JsValue> {
         validate_terrain_grid(size, resolution)?;
         let tile = self.sampler.coarse_tile_with_cache(
@@ -157,6 +160,7 @@ impl SteelWorldgen {
             resolution,
             tile,
             None,
+            compact_surface_blocks.unwrap_or(false),
         ))
         .map_err(|error| JsValue::from_str(&error.to_string()))
     }
@@ -174,6 +178,7 @@ impl SteelWorldgen {
         z: i32,
         size: u32,
         resolution: u32,
+        compact_surface_blocks: Option<bool>,
     ) -> Result<String, JsValue> {
         validate_terrain_grid(size, resolution)?;
         let tile = self.sampler.biome_tile(x, z, size, resolution);
@@ -186,6 +191,7 @@ impl SteelWorldgen {
             resolution,
             tile,
             Some("preliminary_surface_level"),
+            compact_surface_blocks.unwrap_or(false),
         ))
         .map_err(|error| JsValue::from_str(&error.to_string()))
     }
@@ -528,7 +534,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("surface generator should initialize: {error:?}"));
         let value: serde_json::Value = serde_json::from_str(
             &generator
-                .terrain_tile(0, 0, 16, 16)
+                .terrain_tile(0, 0, 16, 16, None)
                 .unwrap_or_else(|error| panic!("surface tile should serialize: {error:?}")),
         )
         .unwrap_or_else(|error| panic!("surface tile response must be JSON: {error}"));
@@ -552,13 +558,57 @@ mod tests {
     }
 
     #[test]
+    fn compact_terrain_tile_serializes_surface_block_palette() {
+        let generator = SteelWorldgen::new("0", "overworld", None)
+            .unwrap_or_else(|error| panic!("surface generator should initialize: {error:?}"));
+        let value: serde_json::Value = serde_json::from_str(
+            &generator
+                .terrain_tile(0, 0, 16, 1, Some(true))
+                .unwrap_or_else(|error| panic!("surface tile should serialize: {error:?}")),
+        )
+        .unwrap_or_else(|error| panic!("surface tile response must be JSON: {error}"));
+        let blocks = value["surfaceBlocks"]
+            .as_array()
+            .unwrap_or_else(|| panic!("surface tile response must include surfaceBlocks"));
+        let indices = value["surfaceBlockIndices"]
+            .as_array()
+            .unwrap_or_else(|| panic!("surface tile response must include surfaceBlockIndices"));
+        let heights = value["heights"]
+            .as_array()
+            .unwrap_or_else(|| panic!("surface tile response must include heights"));
+
+        assert!(blocks.len() < heights.len());
+        assert_eq!(indices.len(), heights.len());
+        assert!(indices.iter().all(|index| {
+            index
+                .as_u64()
+                .is_some_and(|index| index < blocks.len() as u64)
+        }));
+    }
+
+    #[test]
+    fn compact_biome_tile_serializes_empty_surface_palette() {
+        let generator = SteelWorldgen::new("0", "overworld", None)
+            .unwrap_or_else(|error| panic!("surface generator should initialize: {error:?}"));
+        let value: serde_json::Value = serde_json::from_str(
+            &generator
+                .terrain_tile_biome(0, 0, 16, 1, Some(true))
+                .unwrap_or_else(|error| panic!("biome tile should serialize: {error:?}")),
+        )
+        .unwrap_or_else(|error| panic!("biome tile response must be JSON: {error}"));
+
+        assert_eq!(value["surfaceBlocks"], serde_json::json!([]));
+        assert_eq!(value["surfaceBlockIndices"], serde_json::json!([]));
+    }
+
+    #[test]
     fn terrain_tile_serializes_canonical_cherry_vegetation_states() {
         let generator = SteelWorldgen::new("1", "overworld", None).unwrap_or_else(|error| {
             panic!("cherry fixture generator should initialize: {error:?}")
         });
         let value: serde_json::Value = serde_json::from_str(
             &generator
-                .terrain_tile(-108 * 16, -36 * 16, 16, 1)
+                .terrain_tile(-108 * 16, -36 * 16, 16, 1, None)
                 .unwrap_or_else(|error| panic!("cherry fixture should serialize: {error:?}")),
         )
         .unwrap_or_else(|error| panic!("cherry fixture response must be JSON: {error}"));
@@ -610,6 +660,8 @@ struct TerrainResponse<'a> {
     biomes: Vec<String>,
     biome_indices: Vec<u16>,
     surface_blocks: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    surface_block_indices: Option<Vec<u16>>,
     vegetation_blocks: Vec<TerrainVegetationBlock>,
     min_height: i16,
     max_height: i16,
@@ -687,6 +739,7 @@ impl<'a> TerrainResponse<'a> {
         resolution: u32,
         tile: SurfaceTile,
         height_approximation: Option<&'static str>,
+        compact_surface_blocks: bool,
     ) -> Self {
         let mut terrain_heights = tile
             .heights
@@ -698,6 +751,16 @@ impl<'a> TerrainResponse<'a> {
             .fold((first, first), |(minimum, maximum), height| {
                 (minimum.min(height), maximum.max(height))
             });
+        let (surface_blocks, surface_block_indices) = if compact_surface_blocks {
+            (tile.surface_blocks, Some(tile.surface_block_indices))
+        } else {
+            let expanded = tile
+                .surface_block_indices
+                .iter()
+                .map(|index| tile.surface_blocks[usize::from(*index)].clone())
+                .collect();
+            (expanded, None)
+        };
         Self {
             generator: "steelmc-wasm",
             version: "26.2",
@@ -713,7 +776,8 @@ impl<'a> TerrainResponse<'a> {
             colors: tile.colors,
             biomes: tile.biomes,
             biome_indices: tile.biome_indices,
-            surface_blocks: tile.surface_blocks,
+            surface_blocks,
+            surface_block_indices,
             vegetation_blocks: tile
                 .vegetation_blocks
                 .into_iter()
