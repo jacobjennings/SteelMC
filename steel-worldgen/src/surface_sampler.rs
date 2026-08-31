@@ -1744,15 +1744,40 @@ mod tests {
     #[test]
     #[ignore = "measurement harness; run with --ignored --nocapture"]
     fn measure_worker_flat_chunk_peak_and_throughput() {
+        struct Baseline {
+            peak_live_flat_chunk_bytes: usize,
+            elapsed_ms: f64,
+        }
+
         fn measure(label: &str, generate: impl Fn(&SurfaceSampler, &mut SurfaceChunkCache)) {
+            let baseline = match label {
+                "single_64" => Baseline {
+                    peak_live_flat_chunk_bytes: 12_648_448,
+                    elapsed_ms: 6_092.507,
+                },
+                "single_256" => Baseline {
+                    peak_live_flat_chunk_bytes: 79_052_800,
+                    elapsed_ms: 76_814.102,
+                },
+                "contiguous_4x4_64" => Baseline {
+                    peak_live_flat_chunk_bytes: 12_648_448,
+                    elapsed_ms: 99_185.782,
+                },
+                _ => unreachable!("measurement case has a committed baseline"),
+            };
             let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
             let mut cache = SurfaceChunkCache::default();
             let start = Instant::now();
             generate(&sampler, &mut cache);
             let elapsed_ms = start.elapsed().as_secs_f64() * 1_000.0;
             println!(
-                "{label} elapsed_ms={elapsed_ms:.3} peak_live_flat_chunk_bytes={} retained_payload_bytes={}",
+                "{label} before_elapsed_ms={:.3} after_elapsed_ms={elapsed_ms:.3} throughput_ratio={:.3}x before_peak_live_flat_chunk_bytes={} after_peak_live_flat_chunk_bytes={} flat_memory_reduction={:.3}x retained_payload_bytes={}",
+                baseline.elapsed_ms,
+                baseline.elapsed_ms / elapsed_ms,
+                baseline.peak_live_flat_chunk_bytes,
                 cache.stats().peak_live_flat_chunk_bytes,
+                baseline.peak_live_flat_chunk_bytes as f64
+                    / cache.stats().peak_live_flat_chunk_bytes as f64,
                 cache.retained_payload_bytes(),
             );
         }
