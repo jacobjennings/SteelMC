@@ -70,11 +70,13 @@ pub struct SurfaceTile {
     pub biome_indices: Vec<u16>,
     /// Whether the sampled column contains solid terrain.
     pub present: Vec<u8>,
-    /// Canonical final top-block key for every sample.
+    /// Canonical final top-block keys, in palette order.
     ///
     /// Air samples use minecraft:air. This data ends after the Surface stage:
     /// carvers, structures and feature decoration have not run.
     pub surface_blocks: Vec<String>,
+    /// Surface-block palette index for each sample, parallel to `heights`.
+    pub surface_block_indices: Vec<u16>,
     /// Sparse final states written by the portable vegetation Features slice.
     ///
     /// Positions are absolute world coordinates.  The list is sorted by X/Y/Z
@@ -502,7 +504,9 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         let mut heights = Vec::with_capacity(capacity);
         let mut colors = Vec::with_capacity(capacity * 3);
         let mut present = Vec::with_capacity(capacity);
-        let mut surface_blocks = Vec::with_capacity(capacity);
+        let mut surface_blocks = Vec::new();
+        let mut surface_block_lookup = HashMap::new();
+        let mut surface_block_indices = Vec::with_capacity(capacity);
         let mut biomes = Vec::new();
         let mut biome_lookup = HashMap::new();
         let mut biome_indices = Vec::with_capacity(capacity);
@@ -525,7 +529,20 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
                 } = chunk.pre_carver_surface[index];
                 heights.push(height);
                 present.push(u8::from(exists));
-                surface_blocks.push(canonical_block_key(state));
+                let block_key = canonical_block_key(state);
+                let block_index = if let Some(index) = surface_block_lookup.get(&block_key) {
+                    *index
+                } else {
+                    assert!(
+                        surface_blocks.len() < usize::from(u16::MAX),
+                        "surface block palette exceeds u16"
+                    );
+                    let index = surface_blocks.len() as u16;
+                    surface_block_lookup.insert(block_key.clone(), index);
+                    surface_blocks.push(block_key);
+                    index
+                };
+                surface_block_indices.push(block_index);
 
                 let mut biome_sampler = self.biome_source.chunk_sampler();
                 let biome = biome_sampler.sample(x >> 2, i32::from(height) >> 2, z >> 2);
@@ -562,6 +579,7 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             biome_indices,
             present,
             surface_blocks,
+            surface_block_indices,
             vegetation_blocks,
             min_y: N::Settings::MIN_Y as i16,
         }
@@ -618,6 +636,7 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             biome_indices,
             present,
             surface_blocks: Vec::new(),
+            surface_block_indices: Vec::new(),
             vegetation_blocks: Vec::new(),
             min_y: N::Settings::MIN_Y as i16,
         }
@@ -1693,6 +1712,7 @@ mod tests {
         assert_eq!(actual.biome_indices, expected.biome_indices);
         assert_eq!(actual.present, expected.present);
         assert_eq!(actual.surface_blocks, expected.surface_blocks);
+        assert_eq!(actual.surface_block_indices, expected.surface_block_indices);
         assert_eq!(actual.vegetation_blocks, expected.vegetation_blocks);
         assert_eq!(actual.min_y, expected.min_y);
     }
@@ -1705,6 +1725,7 @@ mod tests {
         assert_eq!(coarse.biome_indices, full.biome_indices);
         assert_eq!(coarse.present, full.present);
         assert_eq!(coarse.surface_blocks, full.surface_blocks);
+        assert_eq!(coarse.surface_block_indices, full.surface_block_indices);
         assert!(coarse.vegetation_blocks.is_empty());
         assert_eq!(coarse.min_y, full.min_y);
     }
@@ -1732,6 +1753,7 @@ mod tests {
             assert_eq!(biome.biome_indices, full.biome_indices);
             assert_eq!(biome.colors, full.colors);
             assert!(biome.surface_blocks.is_empty());
+            assert!(biome.surface_block_indices.is_empty());
             assert!(biome.vegetation_blocks.is_empty());
         }
     }
@@ -2078,12 +2100,13 @@ mod tests {
     }
 
     #[test]
-    fn surface_tile_reports_one_canonical_final_block_for_each_sample() {
+    fn surface_tile_reports_canonical_final_block_palette_for_each_sample() {
         let sampler = SurfaceSampler::new(0, SurfaceDimension::Overworld);
         let tile = sampler.tile(0, 0, 16, 16);
         let expected_samples = (tile.samples_per_side * tile.samples_per_side) as usize;
 
-        assert_eq!(tile.surface_blocks.len(), expected_samples);
+        assert!(!tile.surface_blocks.is_empty());
+        assert_eq!(tile.surface_block_indices.len(), expected_samples);
         assert_eq!(tile.heights.len(), expected_samples);
         assert_eq!(tile.present.len(), expected_samples);
         assert!(
@@ -2092,10 +2115,11 @@ mod tests {
                 .all(|block| block.starts_with("minecraft:"))
         );
         assert!(
-            tile.surface_blocks
+            tile.surface_block_indices
                 .iter()
                 .zip(&tile.present)
-                .all(|(block, present)| *present != 0 || block == "minecraft:air")
+                .all(|(index, present)| *present != 0
+                    || tile.surface_blocks[usize::from(*index)] == "minecraft:air")
         );
     }
 
