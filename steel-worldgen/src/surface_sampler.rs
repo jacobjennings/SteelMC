@@ -27,6 +27,20 @@ use crate::vegetation::{VegetationBlockAccess, VegetationStage};
 use steel_registry::feature::FeatureHeightmap;
 use steel_utils::BlockPos;
 
+fn vegetation_flat_window_side() -> Option<i32> {
+    match option_env!("STEEL_FLAT_WINDOW_SIDE") {
+        Some("3") => Some(3),
+        Some("4") => Some(4),
+        Some("5") => Some(5),
+        Some("6") => Some(6),
+        Some("7") => Some(7),
+        Some("8") => Some(8),
+        Some("unbounded") => None,
+        None => Some(3),
+        Some(_) => panic!("STEEL_FLAT_WINDOW_SIDE must be 3 through 8 or unbounded"),
+    }
+}
+
 /// Dimension supported by the static sampler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SurfaceDimension {
@@ -1550,8 +1564,18 @@ impl<'a> InMemoryVegetationRegion<'a> {
     }
 
     fn prepare_window(&mut self, center_x: i32, center_z: i32) {
+        let Some(side) = vegetation_flat_window_side() else {
+            for chunk in self.chunks.values_mut() {
+                chunk.flatten();
+            }
+            return;
+        };
+        let lower_offset = (side - 1) / 2;
+        let upper_offset = side / 2;
         for (&(chunk_x, chunk_z), chunk) in self.chunks.iter_mut() {
-            if (chunk_x - center_x).abs() <= 1 && (chunk_z - center_z).abs() <= 1 {
+            if (center_x - lower_offset..=center_x + upper_offset).contains(&chunk_x)
+                && (center_z - lower_offset..=center_z + upper_offset).contains(&chunk_z)
+            {
                 chunk.flatten();
             } else {
                 chunk.compact();
