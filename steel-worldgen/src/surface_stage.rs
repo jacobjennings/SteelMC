@@ -288,7 +288,8 @@ impl<'a, N: DimensionNoises> SurfaceStage<'a, N> {
                 let mut next_ceiling_stone_y: i32 = i32::MAX;
                 pending_writes.clear();
 
-                for y in (min_y..=start_height).rev() {
+                let max_column_y = min_y + column_buf.len() as i32 - 1;
+                for y in (min_y..=start_height.min(max_column_y)).rev() {
                     let relative_y = (y - min_y) as usize;
                     let state = column_buf[relative_y];
 

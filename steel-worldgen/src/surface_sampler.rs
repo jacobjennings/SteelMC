@@ -23,6 +23,7 @@ use crate::surface::{
     PreliminarySurfaceCorners, SurfaceBiomeAccess, SurfaceBlockAccess, SurfaceExtensions,
     SurfaceStage, SurfaceSystem,
 };
+use crate::utils::{find_solid_surface_below_ceiling, iterate_noise_column_with_aquifer};
 use crate::vegetation::{VegetationBlockAccess, VegetationStage};
 use steel_registry::feature::FeatureHeightmap;
 use steel_utils::BlockPos;
@@ -52,6 +53,19 @@ pub enum SurfaceDimension {
     End,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SurfaceView {
+    Highest,
+    BelowCeiling,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BiomeHeightMode {
+    Preliminary,
+    BelowCeiling,
+    FullColumn,
+}
+
 /// Surface samples for an exact square, including the final shared edge.
 #[derive(Debug, Clone)]
 pub struct SurfaceTile {
@@ -59,8 +73,10 @@ pub struct SurfaceTile {
     pub samples_per_side: u32,
     /// Y coordinate of the sampled surface.
     ///
-    /// Exact and coarse tiles contain the final highest non-fluid solid. Biome
-    /// tiles contain the preliminary density-router estimate instead.
+    /// Exact and coarse tiles contain the visible non-fluid surface. The
+    /// Nether surface is the first solid below its ceiling. Biome tiles use a
+    /// cheaper density-column estimate for dimensions whose preliminary
+    /// surface router is constant.
     pub heights: Vec<i16>,
     /// RGB bytes derived from the sampled biome's configured grass colour.
     pub colors: Vec<u8>,
@@ -262,14 +278,20 @@ impl SurfaceSampler {
             SurfaceDimension::Overworld => Self::Overworld(DimensionSurfaceSampler::new(
                 seed,
                 BiomeSourceKind::overworld(seed),
+                SurfaceView::Highest,
+                BiomeHeightMode::Preliminary,
             )),
             SurfaceDimension::Nether => Self::Nether(DimensionSurfaceSampler::new(
                 seed,
                 BiomeSourceKind::nether(seed),
+                SurfaceView::BelowCeiling,
+                BiomeHeightMode::BelowCeiling,
             )),
             SurfaceDimension::End => Self::End(DimensionSurfaceSampler::new(
                 seed,
                 BiomeSourceKind::end(seed),
+                SurfaceView::Highest,
+                BiomeHeightMode::FullColumn,
             )),
         }
     }
@@ -315,12 +337,14 @@ impl SurfaceSampler {
         self.tile_with_cache_mode(cache, origin_x, origin_z, size, resolution, false)
     }
 
-    /// Samples biomes using the preliminary density-router surface estimate.
+    /// Samples biomes using a dimension-appropriate approximate surface.
     ///
-    /// This deliberately skips density-column filling, aquifers, ore veins,
-    /// surface rules, carvers, and vegetation. Heights are approximate and
-    /// block fields are empty so callers cannot mistake this for generated
-    /// terrain.
+    /// This deliberately skips chunk filling, ore veins, surface rules,
+    /// carvers, and vegetation. The Overworld uses its preliminary surface
+    /// router. The Nether and End scan one density column per quart position
+    /// because their preliminary surface routers are constant. Heights are
+    /// approximate and block fields are empty so callers cannot mistake this
+    /// for generated terrain.
     #[must_use]
     pub fn biome_tile(
         &self,
@@ -448,10 +472,17 @@ pub struct DimensionSurfaceSampler<N: DimensionNoises> {
     surface_extensions: SurfaceExtensions,
     biome_zoom_seed: i64,
     vegetation_stage: VegetationStage,
+    surface_view: SurfaceView,
+    biome_height_mode: BiomeHeightMode,
 }
 
 impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
-    fn new(seed: u64, biome_source: BiomeSourceKind) -> Self {
+    fn new(
+        seed: u64,
+        biome_source: BiomeSourceKind,
+        surface_view: SurfaceView,
+        biome_height_mode: BiomeHeightMode,
+    ) -> Self {
         let splitter: RandomSplitter = if N::Settings::LEGACY_RANDOM_SOURCE {
             LegacyRandom::from_seed(seed).next_positional()
         } else {
@@ -486,6 +517,8 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             surface_extensions,
             biome_zoom_seed,
             vegetation_stage,
+            surface_view,
+            biome_height_mode,
         }
     }
 
@@ -585,6 +618,10 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps shared tile palette construction beside dimension-specific height sampling"
+    )]
     fn biome_tile(&self, origin_x: i32, origin_z: i32, size: u32, resolution: u32) -> SurfaceTile {
         assert!(size > 0 && resolution > 0 && size.is_multiple_of(resolution));
         let samples_per_side = size / resolution + 1;
@@ -597,16 +634,77 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         let mut biome_indices = Vec::with_capacity(capacity);
         let mut column_cache = N::ColumnCache::default();
         let mut biome_sampler = self.biome_source.chunk_sampler();
+        let mut sampled_heights = HashMap::<(i32, i32), Option<i16>>::new();
+        let mut aquifer =
+            (!matches!(self.biome_height_mode, BiomeHeightMode::Preliminary)).then(|| {
+                Aquifer::<N>::new_sized(
+                    origin_x,
+                    origin_z,
+                    size as i32 + 1,
+                    size as i32 + 1,
+                    N::Settings::MIN_Y,
+                    N::Settings::HEIGHT,
+                    &self.splitter,
+                    &self.noises,
+                    column_cache.clone(),
+                )
+            });
 
         for sample_z in 0..samples_per_side {
             for sample_x in 0..samples_per_side {
                 let x = origin_x.saturating_add((sample_x * resolution) as i32);
                 let z = origin_z.saturating_add((sample_z * resolution) as i32);
-                let height = preliminary_surface_level::<N>(&self.noises, &mut column_cache, x, z)
-                    .clamp(i32::from(i16::MIN), i32::from(i16::MAX))
-                    as i16;
+                let height = match self.biome_height_mode {
+                    BiomeHeightMode::Preliminary => Some(
+                        preliminary_surface_level::<N>(&self.noises, &mut column_cache, x, z)
+                            .clamp(i32::from(i16::MIN), i32::from(i16::MAX))
+                            as i16,
+                    ),
+                    BiomeHeightMode::BelowCeiling | BiomeHeightMode::FullColumn => {
+                        let sample_x = (x >> 2) << 2;
+                        let sample_z = (z >> 2) << 2;
+                        *sampled_heights.entry((sample_x, sample_z)).or_insert_with(|| {
+                            let Some(aquifer) = aquifer.as_mut() else {
+                                unreachable!("non-preliminary height mode must create an aquifer");
+                            };
+                            let height = match self.biome_height_mode {
+                                BiomeHeightMode::BelowCeiling => {
+                                    find_solid_surface_below_ceiling::<N>(
+                                        &mut column_cache,
+                                        &self.noises,
+                                        aquifer,
+                                        sample_x,
+                                        sample_z,
+                                        N::Settings::MIN_Y + N::Settings::HEIGHT - 1,
+                                        N::Settings::MIN_Y,
+                                    )
+                                }
+                                BiomeHeightMode::FullColumn => {
+                                    let first_available = iterate_noise_column_with_aquifer::<N>(
+                                        &mut column_cache,
+                                        &self.noises,
+                                        aquifer,
+                                        sample_x,
+                                        sample_z,
+                                        false,
+                                    );
+                                    (first_available > N::Settings::MIN_Y)
+                                        .then_some(first_available - 1)
+                                }
+                                BiomeHeightMode::Preliminary => unreachable!(
+                                    "preliminary height mode is handled before the cache"
+                                ),
+                            };
+                            height.map(|height| {
+                                height.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+                            })
+                        })
+                    }
+                };
+                let exists = height.is_some();
+                let height = height.unwrap_or(N::Settings::MIN_Y as i16);
                 heights.push(height);
-                present.push(u8::from(i32::from(height) >= N::Settings::MIN_Y));
+                present.push(u8::from(exists));
 
                 let biome = biome_sampler.sample(x >> 2, i32::from(height) >> 2, z >> 2);
                 let biome_key = format!("{}:{}", biome.key.namespace, biome.key.path);
@@ -755,7 +853,7 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         cache.stats.misses += 1;
         let pre_carver_chunk = self.sample_surface_chunk_data(chunk_x, chunk_z);
         let pre_carver_surface = Box::new(std::array::from_fn(|index| {
-            let (height, state, exists) = pre_carver_chunk.top_surface(index);
+            let (height, state, exists) = pre_carver_chunk.surface_column(index, self.surface_view);
             SurfaceColumn {
                 height,
                 state,
@@ -1230,13 +1328,17 @@ impl InMemorySurfaceChunk {
         }
     }
 
-    fn top_surface(&self, index: usize) -> (i16, BlockStateId, bool) {
+    fn surface_column(&self, index: usize, surface_view: SurfaceView) -> (i16, BlockStateId, bool) {
         let local_x = index % 16;
         let local_z = index / 16;
         let air = vanilla_blocks::AIR.default_state();
+        let mut found_opening = matches!(surface_view, SurfaceView::Highest);
         for relative_y in (0..self.height).rev() {
             let state = self.blocks[self.block_index(local_x, relative_y, local_z)];
-            if !state.is_air() && !state.get_block().config.liquid {
+            let solid = !state.is_air() && !state.get_block().config.liquid;
+            if !solid {
+                found_opening = true;
+            } else if found_opening {
                 return (self.min_y as i16 + relative_y as i16, state, true);
             }
         }
@@ -1740,6 +1842,35 @@ mod tests {
             let coarse = sampler.coarse_tile_with_cache(&mut coarse_cache, x, z, size, 1);
             assert_coarse_tile_matches_full(&coarse, &full);
         }
+    }
+
+    #[test]
+    fn nether_surface_tiles_generate() {
+        let sampler = SurfaceSampler::new(1, SurfaceDimension::Nether);
+        let mut coarse_cache = SurfaceChunkCache::default();
+        let coarse = sampler.coarse_tile_with_cache(&mut coarse_cache, 0, 0, 64, 1);
+        let mut full_cache = SurfaceChunkCache::default();
+        let full = sampler.tile_with_cache(&mut full_cache, 0, 0, 16, 1);
+
+        assert_eq!(coarse.samples_per_side, 65);
+        assert!(coarse.present.contains(&1));
+        assert!(coarse.heights.iter().all(|height| *height < 127));
+        assert!(coarse.heights.windows(2).any(|pair| pair[0] != pair[1]));
+        assert_eq!(full.samples_per_side, 17);
+        assert!(full.present.contains(&1));
+        assert!(full.heights.iter().all(|height| *height < 127));
+    }
+
+    #[test]
+    fn overview_tiles_report_dimension_surface_heights() {
+        let nether = SurfaceSampler::new(12_345, SurfaceDimension::Nether).biome_tile(0, 0, 64, 1);
+        assert!(nether.present.contains(&1));
+        assert!(nether.heights.iter().all(|height| *height < 127));
+        assert!(nether.heights.windows(2).any(|pair| pair[0] != pair[1]));
+
+        let end = SurfaceSampler::new(12_345, SurfaceDimension::End).biome_tile(0, 0, 64, 1);
+        assert!(end.present.contains(&1));
+        assert!(end.heights.iter().any(|height| *height > 0));
     }
 
     #[test]

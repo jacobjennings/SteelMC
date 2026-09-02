@@ -41,10 +41,6 @@ pub(crate) fn column_interpolated_density<N: DimensionNoises>(
 /// Used by structure placement probes such as nether fossils. This preserves the
 /// same base terrain classification as repeated `column_state` calls, but shares
 /// the eight cell-corner density evaluations across adjacent Y positions.
-#[expect(
-    clippy::too_many_lines,
-    reason = "keeps the vanilla density interpolation flow in one readable pass"
-)]
 pub(crate) fn find_solid_block_below_air<N: DimensionNoises>(
     cache: &mut N::ColumnCache,
     noises: &N,
@@ -53,6 +49,59 @@ pub(crate) fn find_solid_block_below_air<N: DimensionNoises>(
     block_z: i32,
     start_y: i32,
     min_solid_y: i32,
+) -> Option<i32> {
+    find_solid_block_below_opening(
+        cache,
+        noises,
+        aquifer,
+        block_x,
+        block_z,
+        start_y,
+        min_solid_y,
+        false,
+    )
+}
+
+/// Finds the first solid surface below the roof, treating air and fluid as the
+/// opening that separates the visible terrain from the ceiling.
+pub(crate) fn find_solid_surface_below_ceiling<N: DimensionNoises>(
+    cache: &mut N::ColumnCache,
+    noises: &N,
+    aquifer: &mut Aquifer<N>,
+    block_x: i32,
+    block_z: i32,
+    start_y: i32,
+    min_solid_y: i32,
+) -> Option<i32> {
+    find_solid_block_below_opening(
+        cache,
+        noises,
+        aquifer,
+        block_x,
+        block_z,
+        start_y,
+        min_solid_y,
+        true,
+    )
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "keeps the vanilla density interpolation flow in one readable pass"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the column scan needs its generation state, bounds, coordinates, and opening rule"
+)]
+fn find_solid_block_below_opening<N: DimensionNoises>(
+    cache: &mut N::ColumnCache,
+    noises: &N,
+    aquifer: &mut Aquifer<N>,
+    block_x: i32,
+    block_z: i32,
+    start_y: i32,
+    min_solid_y: i32,
+    fluid_is_open: bool,
 ) -> Option<i32> {
     const MAX_INTERP: usize = 16;
 
@@ -111,7 +160,7 @@ pub(crate) fn find_solid_block_below_air<N: DimensionNoises>(
         raw.clamp(0, cell_count_y - 1)
     };
 
-    let mut above_is_air = false;
+    let mut above_is_open = false;
     let mut have_above = false;
     let mut blended_scratch = [0.0_f64; 2];
 
@@ -175,14 +224,15 @@ pub(crate) fn find_solid_block_below_air<N: DimensionNoises>(
                 0,
             );
             let state = aquifer.compute_substance(noises, block_x, pos_y, block_z, density);
-            let is_air = matches!(state, AquiferResult::Air);
+            let is_open = matches!(state, AquiferResult::Air)
+                || fluid_is_open && matches!(state, AquiferResult::Fluid(_));
             let is_solid = matches!(state, AquiferResult::Solid);
 
-            if have_above && above_is_air && is_solid {
+            if have_above && above_is_open && is_solid {
                 return Some(pos_y);
             }
 
-            above_is_air = is_air;
+            above_is_open = is_open;
             have_above = true;
         }
     }
