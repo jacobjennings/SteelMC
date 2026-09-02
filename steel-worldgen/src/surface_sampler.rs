@@ -23,7 +23,7 @@ use crate::surface::{
     PreliminarySurfaceCorners, SurfaceBiomeAccess, SurfaceBlockAccess, SurfaceExtensions,
     SurfaceStage, SurfaceSystem,
 };
-use crate::utils::{find_solid_surface_below_ceiling, iterate_noise_column_with_aquifer};
+use crate::utils::find_solid_surface_below_ceiling;
 use crate::vegetation::{VegetationBlockAccess, VegetationStage};
 use steel_registry::feature::FeatureHeightmap;
 use steel_utils::BlockPos;
@@ -63,7 +63,30 @@ enum SurfaceView {
 enum BiomeHeightMode {
     Preliminary,
     BelowCeiling,
-    FullColumn,
+    EndIslands,
+}
+
+/// Estimates the End surface from its two-dimensional island density.
+///
+/// This applies the End router's vertical slides while treating its expensive
+/// three-dimensional blended noise as zero. The final density squeeze preserves
+/// the sign, so the unsqueezed density is sufficient to find the top block.
+fn approximate_end_island_height(island_density: f64) -> Option<i16> {
+    // A small positive allowance represents the zero-centered blended-noise
+    // contribution without evaluating that three-dimensional noise column.
+    let approximate_sloped_cheese = island_density + 0.031_25;
+    (0_i16..128).rev().find(|height| {
+        let y = f64::from(*height);
+        let lower_slide = ((y - 4.0) / (32.0 - 4.0)).clamp(0.0, 1.0);
+        let upper_slide = ((y - 56.0) / (312.0 - 56.0)).clamp(0.0, 1.0);
+        let upper_value = 1.0 - upper_slide;
+        let density = 0.64
+            * (-0.234_375
+                + lower_slide
+                    * (0.234_375
+                        + (-23.437_5 + upper_value * (23.437_5 + approximate_sloped_cheese))));
+        density > 0.0
+    })
 }
 
 /// Surface samples for an exact square, including the final shared edge.
@@ -291,7 +314,7 @@ impl SurfaceSampler {
                 seed,
                 BiomeSourceKind::end(seed),
                 SurfaceView::Highest,
-                BiomeHeightMode::FullColumn,
+                BiomeHeightMode::EndIslands,
             )),
         }
     }
@@ -341,10 +364,11 @@ impl SurfaceSampler {
     ///
     /// This deliberately skips chunk filling, ore veins, surface rules,
     /// carvers, and vegetation. The Overworld uses its preliminary surface
-    /// router. The Nether and End scan one density column per quart position
-    /// because their preliminary surface routers are constant. Heights are
-    /// approximate and block fields are empty so callers cannot mistake this
-    /// for generated terrain.
+    /// router. The Nether scans one density column per quart position because
+    /// its preliminary surface router is constant. The End derives an island
+    /// height from its two-dimensional island density. Heights are approximate
+    /// and block fields are empty so callers cannot mistake this for generated
+    /// terrain.
     #[must_use]
     pub fn biome_tile(
         &self,
@@ -636,7 +660,7 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         let mut biome_sampler = self.biome_source.chunk_sampler();
         let mut sampled_heights = HashMap::<(i32, i32), Option<i16>>::new();
         let mut aquifer =
-            (!matches!(self.biome_height_mode, BiomeHeightMode::Preliminary)).then(|| {
+            matches!(self.biome_height_mode, BiomeHeightMode::BelowCeiling).then(|| {
                 Aquifer::<N>::new_sized(
                     origin_x,
                     origin_z,
@@ -660,45 +684,45 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
                             .clamp(i32::from(i16::MIN), i32::from(i16::MAX))
                             as i16,
                     ),
-                    BiomeHeightMode::BelowCeiling | BiomeHeightMode::FullColumn => {
+                    BiomeHeightMode::BelowCeiling => {
                         let sample_x = (x >> 2) << 2;
                         let sample_z = (z >> 2) << 2;
-                        *sampled_heights.entry((sample_x, sample_z)).or_insert_with(|| {
-                            let Some(aquifer) = aquifer.as_mut() else {
-                                unreachable!("non-preliminary height mode must create an aquifer");
-                            };
-                            let height = match self.biome_height_mode {
-                                BiomeHeightMode::BelowCeiling => {
-                                    find_solid_surface_below_ceiling::<N>(
-                                        &mut column_cache,
-                                        &self.noises,
-                                        aquifer,
-                                        sample_x,
-                                        sample_z,
-                                        N::Settings::MIN_Y + N::Settings::HEIGHT - 1,
-                                        N::Settings::MIN_Y,
-                                    )
-                                }
-                                BiomeHeightMode::FullColumn => {
-                                    let first_available = iterate_noise_column_with_aquifer::<N>(
-                                        &mut column_cache,
-                                        &self.noises,
-                                        aquifer,
-                                        sample_x,
-                                        sample_z,
-                                        false,
+                        *sampled_heights
+                            .entry((sample_x, sample_z))
+                            .or_insert_with(|| {
+                                let Some(aquifer) = aquifer.as_mut() else {
+                                    unreachable!(
+                                        "non-preliminary height mode must create an aquifer"
                                     );
-                                    (first_available > N::Settings::MIN_Y)
-                                        .then_some(first_available - 1)
-                                }
-                                BiomeHeightMode::Preliminary => unreachable!(
-                                    "preliminary height mode is handled before the cache"
-                                ),
-                            };
-                            height.map(|height| {
-                                height.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+                                };
+                                let height = find_solid_surface_below_ceiling::<N>(
+                                    &mut column_cache,
+                                    &self.noises,
+                                    aquifer,
+                                    sample_x,
+                                    sample_z,
+                                    N::Settings::MIN_Y + N::Settings::HEIGHT - 1,
+                                    N::Settings::MIN_Y,
+                                );
+                                height.map(|height| {
+                                    height.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
+                                })
                             })
-                        })
+                    }
+                    BiomeHeightMode::EndIslands => {
+                        let sample_x = (x >> 2) << 2;
+                        let sample_z = (z >> 2) << 2;
+                        *sampled_heights
+                            .entry((sample_x, sample_z))
+                            .or_insert_with(|| {
+                                column_cache.ensure(sample_x, sample_z, &self.noises);
+                                approximate_end_island_height(self.noises.router_erosion(
+                                    &mut column_cache,
+                                    sample_x,
+                                    0,
+                                    sample_z,
+                                ))
+                            })
                     }
                 };
                 let exists = height.is_some();
@@ -1871,6 +1895,10 @@ mod tests {
         let end = SurfaceSampler::new(12_345, SurfaceDimension::End).biome_tile(0, 0, 64, 1);
         assert!(end.present.contains(&1));
         assert!(end.heights.iter().any(|height| *height > 0));
+
+        let end_void =
+            SurfaceSampler::new(12_345, SurfaceDimension::End).biome_tile(40_000, 40_000, 64, 1);
+        assert!(end_void.present.iter().all(|present| *present == 0));
     }
 
     #[test]
