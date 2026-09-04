@@ -491,6 +491,54 @@ mod tests {
 
     use super::*;
 
+    /// Rebuilds the flat placement list from the palette transport.
+    fn generated_blocks(value: &serde_json::Value) -> Vec<(i32, i32, i32, String, String)> {
+        let palette = value["generatedBlockPalette"]
+            .as_array()
+            .unwrap_or_else(|| panic!("response must include generatedBlockPalette"));
+        let positions = value["generatedBlockPositions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("response must include generatedBlockPositions"));
+        let indices = value["generatedBlockIndices"]
+            .as_array()
+            .unwrap_or_else(|| panic!("response must include generatedBlockIndices"));
+        assert_eq!(
+            positions.len(),
+            indices.len() * 3,
+            "each placement must carry exactly one x, y, z triple"
+        );
+        indices
+            .iter()
+            .enumerate()
+            .map(|(placement, index)| {
+                let index = usize::try_from(
+                    index
+                        .as_u64()
+                        .unwrap_or_else(|| panic!("palette index must be an integer")),
+                )
+                .unwrap_or_else(|error| panic!("palette index must fit a usize: {error}"));
+                let entry = palette
+                    .get(index)
+                    .unwrap_or_else(|| panic!("palette index {index} is out of range"));
+                let coordinate = |offset: usize| {
+                    i32::try_from(
+                        positions[placement * 3 + offset]
+                            .as_i64()
+                            .unwrap_or_else(|| panic!("position must be an integer")),
+                    )
+                    .unwrap_or_else(|error| panic!("position must fit an i32: {error}"))
+                };
+                (
+                    coordinate(0),
+                    coordinate(1),
+                    coordinate(2),
+                    entry["block"].as_str().unwrap_or_default().to_owned(),
+                    entry["state"].as_str().unwrap_or_default().to_owned(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn generated_marker_response_has_unique_complete_bounds() {
         let generator = SteelWorldgen::new("0", "overworld", None).unwrap_or_else(|error| {
@@ -612,32 +660,22 @@ mod tests {
                 .unwrap_or_else(|error| panic!("cherry fixture should serialize: {error:?}")),
         )
         .unwrap_or_else(|error| panic!("cherry fixture response must be JSON: {error}"));
-        let generated = value["generatedBlocks"]
-            .as_array()
-            .unwrap_or_else(|| panic!("cherry fixture must include generatedBlocks"));
+        let generated = generated_blocks(&value);
+        for expected in [
+            "minecraft:cherry_log",
+            "minecraft:cherry_leaves",
+            "minecraft:pink_petals",
+        ] {
+            assert!(
+                generated.iter().any(|(_, _, _, block, _)| block == expected),
+                "cherry fixture must place {expected}"
+            );
+        }
         assert!(
             generated
                 .iter()
-                .any(|block| block["block"] == "minecraft:cherry_log")
+                .all(|(_, _, _, block, state)| state.starts_with(block.as_str()))
         );
-        assert!(
-            generated
-                .iter()
-                .any(|block| block["block"] == "minecraft:cherry_leaves")
-        );
-        assert!(
-            generated
-                .iter()
-                .any(|block| block["block"] == "minecraft:pink_petals")
-        );
-        assert!(generated.iter().all(|block| {
-            block["x"].is_i64()
-                && block["y"].is_i64()
-                && block["z"].is_i64()
-                && block["state"]
-                    .as_str()
-                    .is_some_and(|state| state.starts_with("minecraft:"))
-        }));
     }
 
     /// The generated-block field must carry more than vegetation.
@@ -663,19 +701,13 @@ mod tests {
                         }),
                 )
                 .unwrap_or_else(|error| panic!("ice spike response must be JSON: {error}"));
-                let generated = value["generatedBlocks"]
-                    .as_array()
-                    .unwrap_or_else(|| panic!("ice spike fixture must include generatedBlocks"));
-                for block in generated {
-                    if block["block"] != "minecraft:packed_ice" {
+                for (_, y, _, block, _) in generated_blocks(&value) {
+                    if block != "minecraft:packed_ice" {
                         continue;
                     }
                     packed_ice += 1;
-                    let y = block["y"]
-                        .as_i64()
-                        .unwrap_or_else(|| panic!("generated block must have a y coordinate"));
-                    min_y = min_y.min(y);
-                    max_y = max_y.max(y);
+                    min_y = min_y.min(i64::from(y));
+                    max_y = max_y.max(i64::from(y));
                 }
             }
         }
@@ -711,14 +743,24 @@ struct TerrainResponse<'a> {
     surface_blocks: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     surface_block_indices: Option<Vec<u16>>,
-    /// Sparse generated blocks from every stage that runs after the surface.
+    /// Distinct block states placed by every stage that runs after the surface.
     ///
     /// This is deliberately general and carries no per-feature or per-structure
     /// discrimination. Consumers classify by block, not by which producer wrote
     /// it, so a stage that becomes generatable later flows through unchanged.
     /// An entry may be `minecraft:air` where a generated feature or structure
     /// clears terrain that the surface stage had filled.
-    generated_blocks: Vec<TerrainGeneratedBlock>,
+    ///
+    /// This is a palette, read together with `generated_block_positions` and
+    /// `generated_block_indices`. A tile in an ice spikes biome holds tens of
+    /// thousands of placements drawn from a handful of distinct states, and
+    /// repeating the two identifier strings per placement cost more than every
+    /// other field in the response combined.
+    generated_block_palette: Vec<TerrainGeneratedBlockState>,
+    /// Absolute world coordinates as flat `x, y, z` triples, one per placement.
+    generated_block_positions: Vec<i32>,
+    /// Palette index for each placement, parallel to the position triples.
+    generated_block_indices: Vec<u16>,
     min_height: i16,
     max_height: i16,
     min_y: i16,
@@ -726,13 +768,10 @@ struct TerrainResponse<'a> {
     decorations: [u8; 0],
 }
 
-/// One sparse generated block placed after the surface stage.
+/// One distinct block state in the generated-block palette.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TerrainGeneratedBlock {
-    x: i32,
-    y: i32,
-    z: i32,
+struct TerrainGeneratedBlockState {
     block: String,
     state: String,
 }
@@ -808,6 +847,30 @@ impl<'a> TerrainResponse<'a> {
             .fold((first, first), |(minimum, maximum), height| {
                 (minimum.min(height), maximum.max(height))
             });
+        let mut generated_block_palette: Vec<TerrainGeneratedBlockState> = Vec::new();
+        let mut palette_lookup: std::collections::HashMap<(String, String), u16> =
+            std::collections::HashMap::new();
+        let mut generated_block_positions = Vec::with_capacity(tile.vegetation_blocks.len() * 3);
+        let mut generated_block_indices = Vec::with_capacity(tile.vegetation_blocks.len());
+        for block in tile.vegetation_blocks {
+            let key = (block.block, block.state);
+            let index = match palette_lookup.get(&key) {
+                Some(&index) => index,
+                None => {
+                    let index = u16::try_from(generated_block_palette.len())
+                        .expect("generated block palette exceeds u16");
+                    generated_block_palette.push(TerrainGeneratedBlockState {
+                        block: key.0.clone(),
+                        state: key.1.clone(),
+                    });
+                    palette_lookup.insert(key, index);
+                    index
+                }
+            };
+            generated_block_positions.extend_from_slice(&[block.x, block.y, block.z]);
+            generated_block_indices.push(index);
+        }
+
         let (surface_blocks, surface_block_indices) = if compact_surface_blocks {
             (tile.surface_blocks, Some(tile.surface_block_indices))
         } else {
@@ -835,17 +898,9 @@ impl<'a> TerrainResponse<'a> {
             biome_indices: tile.biome_indices,
             surface_blocks,
             surface_block_indices,
-            generated_blocks: tile
-                .vegetation_blocks
-                .into_iter()
-                .map(|block| TerrainGeneratedBlock {
-                    x: block.x,
-                    y: block.y,
-                    z: block.z,
-                    block: block.block,
-                    state: block.state,
-                })
-                .collect(),
+            generated_block_palette,
+            generated_block_positions,
+            generated_block_indices,
             min_height,
             max_height,
             min_y: tile.min_y,

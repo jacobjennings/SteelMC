@@ -26,11 +26,12 @@ use steel_registry::blocks::{
     block_state_ext::BlockStateExt as _,
     properties::{BlockStateProperties, DoubleBlockHalf},
 };
+use steel_registry::blocks::Block;
 use steel_registry::feature::{
-    BlockPredicate, CherryFoliagePlacer, CherryTrunkPlacer, ConfiguredFeatureKind,
-    ConfiguredFeatureRef, DiskConfiguration, FeatureHeightmap, FeatureSize, FoliagePlacer,
-    PlacedFeatureData, PlacedFeatureEntryRef, PlacementModifier, SpikeConfiguration,
-    TreeConfiguration, TreeDecorator, TrunkPlacer,
+    BlockPredicate, BlockStateData, BlockStateProvider, CherryFoliagePlacer, CherryTrunkPlacer,
+    ConfiguredFeatureKind, ConfiguredFeatureRef, DiskConfiguration, FeatureHeightmap, FeatureSize,
+    FoliagePlacer, PlacedFeatureData, PlacedFeatureEntryRef, PlacedFeatureRef, PlacementModifier,
+    SpikeConfiguration, TreeConfiguration, TreeDecorator, TrunkPlacer,
 };
 use steel_registry::vanilla_block_tags::BlockTag;
 use steel_registry::{Registry, RegistryEntry as _, RegistryExt as _, vanilla_blocks};
@@ -38,7 +39,7 @@ use steel_utils::axis::Axis;
 use steel_utils::random::{
     Random as _, RandomSource, legacy_random::LegacyRandom, worldgen_random::WorldgenRandom,
 };
-use steel_utils::{BlockPos, BlockStateId, Direction};
+use steel_utils::{BlockPos, BlockStateId, Direction, Identifier};
 
 use crate::biome_zoom::fuzzed_biome_at_block;
 use crate::noise::PerlinSimplexNoise;
@@ -420,7 +421,7 @@ impl VegetationStage {
                         "vegetation step {step} references missing feature index {feature_index}"
                     );
                 };
-                if !is_portable_sparse_feature(feature) {
+                if !is_portable_sparse_feature(registry, feature) {
                     continue;
                 }
                 random.set_feature_seed(decoration_seed, feature_index as i32, step as i32);
@@ -493,37 +494,71 @@ impl VegetationStage {
         writes: &mut Vec<VegetationBlock>,
         modifier_index: usize,
     ) -> bool {
-        let Some(modifier) = feature.data.placement.get(modifier_index) else {
+        self.place_placed_feature_data(
+            host,
+            registry,
+            random,
+            origin,
+            &feature.data,
+            Some(&feature.key),
+            writes,
+            modifier_index,
+        )
+    }
+
+    /// Runs one placed feature's modifier chain.
+    ///
+    /// The key is absent for a placed feature written inline inside a selector.
+    /// Only the biome modifier needs it, and an inline feature carrying one is
+    /// refused by the portability check rather than silently skipped here.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors vanilla modifier stream state"
+    )]
+    fn place_placed_feature_data<H: VegetationBlockAccess>(
+        &self,
+        host: &mut H,
+        registry: &Registry,
+        random: &mut WorldgenRandom,
+        origin: BlockPos,
+        feature: &PlacedFeatureData,
+        key: Option<&Identifier>,
+        writes: &mut Vec<VegetationBlock>,
+        modifier_index: usize,
+    ) -> bool {
+        let Some(modifier) = feature.placement.get(modifier_index) else {
             return self.place_configured_feature(
                 host,
                 registry,
                 random,
                 origin,
-                &feature.data,
+                feature,
                 writes,
             );
         };
         match modifier {
             PlacementModifier::Biome => {
-                self.biome_allows_feature(host, registry, origin, &feature.key)
-                    && self.place_placed_feature(
+                key.is_some_and(|key| self.biome_allows_feature(host, registry, origin, key))
+                    && self.place_placed_feature_data(
                         host,
                         registry,
                         random,
                         origin,
                         feature,
+                        key,
                         writes,
                         modifier_index + 1,
                     )
             }
             PlacementModifier::BlockPredicateFilter { predicate } => {
                 self.test_block_predicate(host, registry, predicate, origin)
-                    && self.place_placed_feature(
+                    && self.place_placed_feature_data(
                         host,
                         registry,
                         random,
                         origin,
                         feature,
+                        key,
                         writes,
                         modifier_index + 1,
                     )
@@ -532,12 +567,13 @@ impl VegetationStage {
                 let mut placed = false;
                 if let Ok(count) = usize::try_from(count.sample(random)) {
                     for _ in 0..count {
-                        placed |= self.place_placed_feature(
+                        placed |= self.place_placed_feature_data(
                             host,
                             registry,
                             random,
                             origin,
                             feature,
+                            key,
                             writes,
                             modifier_index + 1,
                         );
@@ -548,12 +584,13 @@ impl VegetationStage {
             PlacementModifier::InSquare => {
                 let x = origin.x() + random.next_i32_bounded(16);
                 let z = origin.z() + random.next_i32_bounded(16);
-                self.place_placed_feature(
+                self.place_placed_feature_data(
                     host,
                     registry,
                     random,
                     BlockPos::new(x, origin.y(), z),
                     feature,
+                    key,
                     writes,
                     modifier_index + 1,
                 )
@@ -561,12 +598,13 @@ impl VegetationStage {
             PlacementModifier::Heightmap { heightmap } => {
                 let height = host.height_at(*heightmap, origin.x(), origin.z());
                 height > host.min_y()
-                    && self.place_placed_feature(
+                    && self.place_placed_feature_data(
                         host,
                         registry,
                         random,
                         BlockPos::new(origin.x(), height, origin.z()),
                         feature,
+                        key,
                         writes,
                         modifier_index + 1,
                     )
@@ -588,12 +626,13 @@ impl VegetationStage {
                 let mut placed = false;
                 if let Ok(count) = usize::try_from(count) {
                     for _ in 0..count {
-                        placed |= self.place_placed_feature(
+                        placed |= self.place_placed_feature_data(
                             host,
                             registry,
                             random,
                             origin,
                             feature,
+                            key,
                             writes,
                             modifier_index + 1,
                         );
@@ -608,12 +647,13 @@ impl VegetationStage {
                 let x = origin.x() + xz_spread.sample(random);
                 let y = origin.y() + y_spread.sample(random);
                 let z = origin.z() + xz_spread.sample(random);
-                self.place_placed_feature(
+                self.place_placed_feature_data(
                     host,
                     registry,
                     random,
                     BlockPos::new(x, y, z),
                     feature,
+                    key,
                     writes,
                     modifier_index + 1,
                 )
@@ -624,12 +664,13 @@ impl VegetationStage {
                     "rarity filter chance must be positive, got {chance}"
                 );
                 random.next_f32() < 1.0 / (*chance as f32)
-                    && self.place_placed_feature(
+                    && self.place_placed_feature_data(
                         host,
                         registry,
                         random,
                         origin,
                         feature,
+                        key,
                         writes,
                         modifier_index + 1,
                     )
@@ -640,19 +681,20 @@ impl VegetationStage {
                 let surface =
                     host.height_at(FeatureHeightmap::WorldSurface, origin.x(), origin.z());
                 surface - ocean_floor <= *max_water_depth
-                    && self.place_placed_feature(
+                    && self.place_placed_feature_data(
                         host,
                         registry,
                         random,
                         origin,
                         feature,
+                        key,
                         writes,
                         modifier_index + 1,
                     )
             }
             unsupported => panic!(
-                "sparse vegetation feature {} uses unsupported modifier {unsupported:?}",
-                feature.key
+                "sparse vegetation feature {:?} uses unsupported modifier {unsupported:?}",
+                key
             ),
         }
     }
@@ -715,7 +757,52 @@ impl VegetationStage {
             ConfiguredFeatureKind::Disk(config) => {
                 self.place_disk(host, registry, random, config, origin, writes)
             }
+            // Vanilla `RandomFeature`: walk the weighted list in order and take
+            // the first entry whose roll succeeds, otherwise the default. Each
+            // entry is a placed feature, so the chosen one runs its own
+            // modifier chain from the start.
+            ConfiguredFeatureKind::RandomSelector(config) => {
+                for weighted in &config.features {
+                    if random.next_f32() < weighted.chance {
+                        return self.place_nested(host, registry, random, origin, &weighted.feature, writes);
+                    }
+                }
+                self.place_nested(host, registry, random, origin, &config.default, writes)
+            }
+            // Vanilla `SimpleRandomSelectorFeature`: one entry, chosen evenly.
+            ConfiguredFeatureKind::SimpleRandomSelector(config) => {
+                let Ok(count) = i32::try_from(config.features.len()) else {
+                    return false;
+                };
+                if count == 0 {
+                    return false;
+                }
+                let chosen = random.next_i32_bounded(count) as usize;
+                let Some(feature) = config.features.get(chosen) else {
+                    return false;
+                };
+                self.place_nested(host, registry, random, origin, feature, writes)
+            }
             _ => false,
+        }
+    }
+
+    /// Runs a placed feature named inside a selector, from its first modifier.
+    fn place_nested<H: VegetationBlockAccess>(
+        &self,
+        host: &mut H,
+        registry: &Registry,
+        random: &mut WorldgenRandom,
+        origin: BlockPos,
+        feature: &PlacedFeatureRef,
+        writes: &mut Vec<VegetationBlock>,
+    ) -> bool {
+        match feature {
+            PlacedFeatureRef::Reference(entry) => {
+                self.place_placed_feature(host, registry, random, origin, entry, writes, 0)
+            }
+            PlacedFeatureRef::Inline(data) => self
+                .place_placed_feature_data(host, registry, random, origin, data, None, writes, 0),
         }
     }
 
@@ -1038,27 +1125,175 @@ impl VegetationStage {
     }
 }
 
-/// Placed features the portable slice generates.
+/// Whether the portable slice can generate a placed feature completely.
 ///
-/// This is an allowlist rather than a capability check because the portable
-/// slice implements only part of the vanilla Features stage, and running a
-/// feature whose configured kind is unimplemented would silently drop blocks
-/// instead of failing loudly. Vanilla seeds each feature from its own index
-/// rather than sequentially, so skipping a feature does not disturb the
+/// This used to be a list of six feature names. A name list was safe but it was
+/// also the reason every forest outside a cherry grove was bare: a feature the
+/// slice could have run perfectly was skipped because nobody had added its
+/// name. The check is now derived from what the slice actually implements, so
+/// a feature runs exactly when every part of it is supported.
+///
+/// The check must stay conservative in one direction only. Answering yes for a
+/// feature the slice cannot fully run would place some of its blocks and drop
+/// the rest, which is worse than placing none, so every arm below refuses
+/// anything it does not recognise. Vanilla seeds each feature from its own
+/// index rather than sequentially, so refusing a feature does not disturb the
 /// randomness of the ones that do run.
-///
-/// Add a name here only once its configured feature kind, its placement
-/// modifiers, and its block predicates are all implemented above.
-fn is_portable_sparse_feature(feature: PlacedFeatureEntryRef) -> bool {
-    matches!(
-        feature.key.path.as_ref(),
-        "trees_cherry"
-            | "flower_cherry"
-            | "patch_tall_grass_2"
-            | "patch_grass_plain"
-            | "ice_spike"
-            | "ice_patch"
-    )
+fn is_portable_sparse_feature(registry: &Registry, feature: PlacedFeatureEntryRef) -> bool {
+    placed_feature_is_portable(registry, &feature.data, 0)
+}
+
+/// Recursion limit for selector features that nest placed features.
+const MAX_PORTABLE_FEATURE_DEPTH: usize = 4;
+
+fn placed_feature_is_portable(
+    registry: &Registry,
+    feature: &PlacedFeatureData,
+    depth: usize,
+) -> bool {
+    if depth > MAX_PORTABLE_FEATURE_DEPTH {
+        return false;
+    }
+    feature
+        .placement
+        .iter()
+        .all(|modifier| placement_modifier_is_portable(registry, modifier))
+        && configured_feature_is_portable(registry, &feature.feature, depth)
+}
+
+fn placement_modifier_is_portable(registry: &Registry, modifier: &PlacementModifier) -> bool {
+    match modifier {
+        PlacementModifier::Biome
+        | PlacementModifier::Count { .. }
+        | PlacementModifier::Heightmap { .. }
+        | PlacementModifier::InSquare
+        | PlacementModifier::NoiseThresholdCount { .. }
+        | PlacementModifier::RandomOffset { .. }
+        | PlacementModifier::RarityFilter { .. }
+        | PlacementModifier::SurfaceWaterDepthFilter { .. } => true,
+        PlacementModifier::BlockPredicateFilter { predicate } => {
+            block_predicate_is_portable(registry, predicate)
+        }
+        // Every remaining modifier needs world state the slice does not carry:
+        // a vertical height provider, a column scan, a per-layer count, or the
+        // noise fields that only the native chunk generator holds.
+        _ => false,
+    }
+}
+
+fn configured_feature_is_portable(
+    registry: &Registry,
+    feature: &ConfiguredFeatureRef,
+    depth: usize,
+) -> bool {
+    let kind = match feature {
+        ConfiguredFeatureRef::Reference(configured) => &configured.kind,
+        ConfiguredFeatureRef::Inline(configured) => configured,
+    };
+    match kind {
+        ConfiguredFeatureKind::SimpleBlock(config) => {
+            block_state_provider_is_portable(registry, &config.to_place)
+        }
+        ConfiguredFeatureKind::Spike(config) => {
+            block_predicate_is_portable(registry, &config.can_place_on)
+                && block_predicate_is_portable(registry, &config.can_replace)
+        }
+        ConfiguredFeatureKind::Disk(config) => {
+            block_predicate_is_portable(registry, &config.target)
+                && block_state_provider_is_portable(registry, &config.state_provider)
+        }
+        ConfiguredFeatureKind::RandomSelector(config) => {
+            config
+                .features
+                .iter()
+                .all(|weighted| placed_feature_ref_is_portable(registry, &weighted.feature, depth + 1))
+                && placed_feature_ref_is_portable(registry, &config.default, depth + 1)
+        }
+        ConfiguredFeatureKind::SimpleRandomSelector(config) => config
+            .features
+            .iter()
+            .all(|entry| placed_feature_ref_is_portable(registry, entry, depth + 1)),
+        // The tree feature is implemented for the cherry trunk and foliage
+        // placers only. Every other tree in the game still needs its placers
+        // ported, which is why forests outside a cherry grove have no canopy.
+        ConfiguredFeatureKind::Tree(config) => {
+            matches!(config.trunk_placer, TrunkPlacer::Cherry(_))
+                && matches!(config.foliage_placer, FoliagePlacer::Cherry(_))
+                && config.root_placer.is_none()
+                && config
+                    .decorators
+                    .iter()
+                    .all(|decorator| matches!(decorator, TreeDecorator::Beehive { .. }))
+        }
+        _ => false,
+    }
+}
+
+fn placed_feature_ref_is_portable(
+    registry: &Registry,
+    feature: &PlacedFeatureRef,
+    depth: usize,
+) -> bool {
+    match feature {
+        PlacedFeatureRef::Reference(entry) => {
+            placed_feature_is_portable(registry, &entry.data, depth)
+        }
+        PlacedFeatureRef::Inline(data) => {
+            // An inline feature has no registry key, and the biome modifier
+            // decides membership by key. Refuse rather than treat it as absent.
+            !data
+                .placement
+                .iter()
+                .any(|modifier| matches!(modifier, PlacementModifier::Biome))
+                && placed_feature_is_portable(registry, data, depth)
+        }
+    }
+}
+
+fn block_predicate_is_portable(registry: &Registry, predicate: &BlockPredicate) -> bool {
+    match predicate {
+        BlockPredicate::True
+        | BlockPredicate::MatchingBlockTag { .. }
+        | BlockPredicate::MatchingBlocks { .. }
+        | BlockPredicate::Solid { .. }
+        | BlockPredicate::Replaceable { .. }
+        | BlockPredicate::InsideWorldBounds { .. } => true,
+        BlockPredicate::WouldSurvive { state, .. } => {
+            provider_state_is_portable(registry, state)
+        }
+        BlockPredicate::Not { predicate } => block_predicate_is_portable(registry, predicate),
+        BlockPredicate::AllOf { predicates } | BlockPredicate::AnyOf { predicates } => predicates
+            .iter()
+            .all(|predicate| block_predicate_is_portable(registry, predicate)),
+        _ => false,
+    }
+}
+
+fn block_state_provider_is_portable(registry: &Registry, provider: &BlockStateProvider) -> bool {
+    match provider {
+        BlockStateProvider::Simple { state } | BlockStateProvider::RotatedBlock { state } => {
+            provider_state_is_portable(registry, state)
+        }
+        BlockStateProvider::Weighted { entries } => entries
+            .iter()
+            .all(|entry| provider_state_is_portable(registry, &entry.data)),
+        BlockStateProvider::RuleBased { fallback, rules } => {
+            fallback
+                .as_deref()
+                .is_none_or(|fallback| block_state_provider_is_portable(registry, fallback))
+                && rules.iter().all(|rule| {
+                    block_predicate_is_portable(registry, &rule.if_true)
+                        && block_state_provider_is_portable(registry, &rule.then)
+                })
+        }
+        _ => false,
+    }
+}
+
+fn provider_state_is_portable(registry: &Registry, state: &BlockStateData) -> bool {
+    let state =
+        WorldgenStateResolver::feature_block_state_from_data(registry, state, "portability probe");
+    survival_rule(state).is_some()
 }
 
 fn write_block<H: VegetationBlockAccess>(
@@ -1071,19 +1306,88 @@ fn write_block<H: VegetationBlockAccess>(
     writes.push(VegetationBlock::at(pos, state));
 }
 
-fn can_survive<H: VegetationBlockAccess>(host: &H, state: BlockStateId, pos: BlockPos) -> bool {
+/// What a generated block needs underneath it to stay where it was placed.
+///
+/// Native placement asks the block's own behavior object, which lives in the
+/// server crate. The portable slice reproduces the rule for the block families
+/// it can judge and refuses the rest. Refusing is the safe direction: a block
+/// whose rule is unknown is never placed at all, which is why this is also the
+/// gate that decides whether a whole feature may run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SurvivalRule {
+    /// A full block that does not check what holds it up.
+    Unconditional,
+    /// Vanilla `VegetationBlock`: the block below must support vegetation.
+    SupportsVegetation,
+    /// Vanilla `DryVegetationBlock`: the block below must support dry vegetation.
+    SupportsDryVegetation,
+}
+
+/// Returns the survival rule for a generated state, or `None` when the portable
+/// slice cannot reproduce it.
+///
+/// Deliberately absent, each for a reason worth stating rather than a rule
+/// nobody got round to writing:
+///
+/// - Mushrooms need the light level at the placement position. The slice has no
+///   lighting stage, and guessing would carpet daylit meadows in mushrooms.
+/// - Blocks that must attach sideways or hang, such as vines and glow lichen,
+///   need a face-sturdiness query the slice does not implement.
+/// - Blocks that grow in a column, such as sugar cane, cactus, and kelp, need
+///   the column feature kinds rather than a per-block rule.
+fn survival_rule(state: BlockStateId) -> Option<SurvivalRule> {
     let block = state.get_block();
-    if block == &vanilla_blocks::CHERRY_SAPLING
-        || block == &vanilla_blocks::SHORT_GRASS
-        || block == &vanilla_blocks::TALL_GRASS
-        || block == &vanilla_blocks::PINK_PETALS
-    {
-        return host
-            .block_state(pos.below())
-            .get_block()
-            .has_tag(&BlockTag::SUPPORTS_VEGETATION);
+    if block == &vanilla_blocks::PUMPKIN || block == &vanilla_blocks::PACKED_ICE {
+        return Some(SurvivalRule::Unconditional);
     }
-    false
+    if block.has_tag(&BlockTag::SAPLINGS)
+        || block.has_tag(&BlockTag::SMALL_FLOWERS)
+        || SUPPORTS_VEGETATION_PLANTS.contains(&block)
+    {
+        return Some(SurvivalRule::SupportsVegetation);
+    }
+    if DRY_VEGETATION_PLANTS.contains(&block) {
+        return Some(SurvivalRule::SupportsDryVegetation);
+    }
+    None
+}
+
+/// Plants that stand on anything tagged as supporting vegetation.
+///
+/// Saplings and small flowers come from their tags. These are the remaining
+/// vanilla `VegetationBlock` and `BushBlock` subclasses the slice places.
+static SUPPORTS_VEGETATION_PLANTS: &[&Block] = &[
+    &vanilla_blocks::SHORT_GRASS,
+    &vanilla_blocks::TALL_GRASS,
+    &vanilla_blocks::FERN,
+    &vanilla_blocks::LARGE_FERN,
+    &vanilla_blocks::BUSH,
+    &vanilla_blocks::FIREFLY_BUSH,
+    &vanilla_blocks::SWEET_BERRY_BUSH,
+    &vanilla_blocks::PINK_PETALS,
+    &vanilla_blocks::SUNFLOWER,
+    &vanilla_blocks::LILAC,
+    &vanilla_blocks::ROSE_BUSH,
+    &vanilla_blocks::PEONY,
+];
+
+/// Plants that stand on anything tagged as supporting dry vegetation.
+static DRY_VEGETATION_PLANTS: &[&Block] = &[
+    &vanilla_blocks::DEAD_BUSH,
+    &vanilla_blocks::SHORT_DRY_GRASS,
+    &vanilla_blocks::TALL_DRY_GRASS,
+];
+
+fn can_survive<H: VegetationBlockAccess>(host: &H, state: BlockStateId, pos: BlockPos) -> bool {
+    let below = || host.block_state(pos.below()).get_block();
+    match survival_rule(state) {
+        Some(SurvivalRule::Unconditional) => true,
+        Some(SurvivalRule::SupportsVegetation) => below().has_tag(&BlockTag::SUPPORTS_VEGETATION),
+        Some(SurvivalRule::SupportsDryVegetation) => {
+            below().has_tag(&BlockTag::SUPPORTS_DRY_VEGETATION)
+        }
+        None => false,
+    }
 }
 
 fn sample_provider<H: VegetationBlockAccess>(
@@ -1093,7 +1397,6 @@ fn sample_provider<H: VegetationBlockAccess>(
     provider: &steel_registry::feature::BlockStateProvider,
     pos: BlockPos,
 ) -> Option<BlockStateId> {
-    use steel_registry::feature::BlockStateProvider;
     match provider {
         BlockStateProvider::Simple { state } | BlockStateProvider::RotatedBlock { state } => {
             Some(WorldgenStateResolver::feature_block_state_from_data(
@@ -2075,4 +2378,93 @@ static BIOME_INFO_NOISE: LazyLock<PerlinSimplexNoise> = LazyLock::new(|| {
 
 fn biome_info_noise_value(x: f64, z: f64) -> f64 {
     BIOME_INFO_NOISE.get_value(x, z)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use steel_registry::{REGISTRY, init_vanilla_registry};
+
+    fn portable(key: &'static str) -> bool {
+        init_vanilla_registry();
+        let identifier = steel_utils::Identifier::new("minecraft", key);
+        let id = REGISTRY
+            .placed_features
+            .id_from_key(&identifier)
+            .unwrap_or_else(|| panic!("vanilla placed feature {key} must be registered"));
+        let feature = REGISTRY
+            .placed_features
+            .by_id(id)
+            .unwrap_or_else(|| panic!("placed feature {key} must resolve"));
+        is_portable_sparse_feature(&REGISTRY, feature)
+    }
+
+    /// Guards the set the portable slice claims it can generate.
+    ///
+    /// The list used to be six names, which is why every forest outside a
+    /// cherry grove was bare. It is now derived from what the slice implements,
+    /// so this test states the answer rather than restating the list.
+    #[test]
+    fn ground_vegetation_features_are_portable() {
+        for key in [
+            "patch_grass_plain",
+            "patch_grass_forest",
+            "patch_grass_normal",
+            "patch_grass_jungle",
+            "patch_grass_badlands",
+            "patch_taiga_grass",
+            "patch_tall_grass_2",
+            "patch_large_fern",
+            "patch_bush",
+            "patch_berry_common",
+            "patch_pumpkin",
+            "flower_default",
+            "flower_warm",
+            "flower_cherry",
+            "forest_flowers",
+            "trees_cherry",
+            "ice_spike",
+            "ice_patch",
+        ] {
+            assert!(portable(key), "{key} should be portable");
+        }
+    }
+
+    /// Features the slice must keep refusing, each for a stated reason.
+    #[test]
+    fn features_needing_absent_machinery_are_refused() {
+        for (key, reason) in [
+            ("brown_mushroom_normal", "mushroom survival needs a light level"),
+            ("red_mushroom_normal", "mushroom survival needs a light level"),
+            ("patch_sugar_cane", "block columns are a separate feature kind"),
+            ("vines", "vines need a height range and a sturdy-face query"),
+            ("glow_lichen", "multiface growth needs a sturdy-face query"),
+            ("trees_plains", "only the cherry trunk and foliage placers are ported"),
+            ("trees_birch", "only the cherry trunk and foliage placers are ported"),
+            ("spruce_on_snow", "only the cherry trunk and foliage placers are ported"),
+        ] {
+            assert!(!portable(key), "{key} should be refused: {reason}");
+        }
+    }
+
+    /// Prints the portable set. Not an assertion, a record for review.
+    #[test]
+    fn report_portable_feature_set() {
+        init_vanilla_registry();
+        let mut portable_keys = Vec::new();
+        let mut index = 0usize;
+        while let Some(feature) = REGISTRY.placed_features.by_id(index) {
+            if is_portable_sparse_feature(&REGISTRY, feature) {
+                portable_keys.push(feature.key.to_string());
+            }
+            index += 1;
+        }
+        portable_keys.sort();
+        println!(
+            "PORTABLE_FEATURES {} of {}: {}",
+            portable_keys.len(),
+            index,
+            portable_keys.join(" ")
+        );
+    }
 }
