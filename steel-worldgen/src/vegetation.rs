@@ -1,10 +1,20 @@
-//! Portable, sparse vegetation placement.
+//! Portable, sparse placement for the vanilla Features stage.
 //!
 //! This module intentionally owns the small subset of the vanilla Features
 //! stage needed by static terrain consumers.  It keeps the real registry
 //! placed-feature order and modifier stream, but delegates mutable world state
 //! to [`VegetationBlockAccess`].  Native chunk generation can therefore keep
 //! its richer chunk/status host while WASM uses an in-memory terrain halo.
+//!
+//! The output is deliberately a general list of placed block states rather than
+//! anything vegetation-shaped.  Trees and grass were the first features it
+//! carried, and ice spikes are the first that are not vegetation at all, so a
+//! consumer must classify an entry by its block and never by an assumption
+//! about which feature produced it.
+//!
+//! Which features run is governed by [`is_portable_sparse_feature`].  A feature
+//! belongs there once its configured kind, its placement modifiers, and its
+//! block predicates are all implemented here.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,8 +28,9 @@ use steel_registry::blocks::{
 };
 use steel_registry::feature::{
     BlockPredicate, CherryFoliagePlacer, CherryTrunkPlacer, ConfiguredFeatureKind,
-    ConfiguredFeatureRef, FeatureHeightmap, FeatureSize, FoliagePlacer, PlacedFeatureData,
-    PlacedFeatureEntryRef, PlacementModifier, TreeConfiguration, TreeDecorator, TrunkPlacer,
+    ConfiguredFeatureRef, DiskConfiguration, FeatureHeightmap, FeatureSize, FoliagePlacer,
+    PlacedFeatureData, PlacedFeatureEntryRef, PlacementModifier, SpikeConfiguration,
+    TreeConfiguration, TreeDecorator, TrunkPlacer,
 };
 use steel_registry::vanilla_block_tags::BlockTag;
 use steel_registry::{Registry, RegistryEntry as _, RegistryExt as _, vanilla_blocks};
@@ -409,7 +420,7 @@ impl VegetationStage {
                         "vegetation step {step} references missing feature index {feature_index}"
                     );
                 };
-                if !is_sparse_vegetation_feature(feature) {
+                if !is_portable_sparse_feature(feature) {
                     continue;
                 }
                 random.set_feature_seed(decoration_seed, feature_index as i32, step as i32);
@@ -698,8 +709,262 @@ impl VegetationStage {
             ConfiguredFeatureKind::Tree(config) => {
                 place_cherry_tree(host, registry, random, config, origin, writes)
             }
+            ConfiguredFeatureKind::Spike(config) => {
+                self.place_spike(host, registry, random, config, origin, writes)
+            }
+            ConfiguredFeatureKind::Disk(config) => {
+                self.place_disk(host, registry, random, config, origin, writes)
+            }
             _ => false,
         }
+    }
+
+    /// Vanilla `IceSpikeFeature`, ported for the portable Features slice.
+    ///
+    /// Writes a tapering packed-ice spire and the pillar that anchors it to the
+    /// terrain below. The blocks are ordinary sparse writes, so they reach the
+    /// caller through the same generated-block list as every other feature.
+    fn place_spike<H: VegetationBlockAccess>(
+        &self,
+        host: &mut H,
+        registry: &Registry,
+        random: &mut WorldgenRandom,
+        config: &SpikeConfiguration,
+        origin: BlockPos,
+        writes: &mut Vec<VegetationBlock>,
+    ) -> bool {
+        let mut origin = origin;
+        while host.block_state(origin).is_air() && origin.y() > host.min_y() + 2 {
+            origin = origin.below();
+        }
+
+        if !self.test_block_predicate(host, registry, &config.can_place_on, origin) {
+            return false;
+        }
+
+        origin = origin.above_n(random.next_i32_bounded(4));
+        let height = random.next_i32_bounded(4) + 7;
+        let width = height / 4 + random.next_i32_bounded(2);
+        if width > 1 && random.next_i32_bounded(60) == 0 {
+            origin = origin.above_n(10 + random.next_i32_bounded(30));
+        }
+
+        let spike_state =
+            WorldgenStateResolver::feature_block_state_from_data(registry, &config.state, "spike");
+        self.place_spike_body(
+            host,
+            registry,
+            random,
+            config,
+            origin,
+            height,
+            width,
+            spike_state,
+            writes,
+        );
+        self.place_spike_base(
+            host,
+            registry,
+            random,
+            config,
+            origin,
+            width,
+            spike_state,
+            writes,
+        );
+
+        true
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors vanilla ice spike body placement state"
+    )]
+    fn place_spike_body<H: VegetationBlockAccess>(
+        &self,
+        host: &mut H,
+        registry: &Registry,
+        random: &mut WorldgenRandom,
+        config: &SpikeConfiguration,
+        origin: BlockPos,
+        height: i32,
+        width: i32,
+        spike_state: BlockStateId,
+        writes: &mut Vec<VegetationBlock>,
+    ) {
+        for y_offset in 0..height {
+            let scale = (1.0 - y_offset as f32 / height as f32) * width as f32;
+            let new_width = scale.ceil() as i32;
+
+            for x_offset in -new_width..=new_width {
+                let dx = x_offset.abs() as f32 - 0.25;
+                for z_offset in -new_width..=new_width {
+                    let dz = z_offset.abs() as f32 - 0.25;
+                    let inside_radius =
+                        (x_offset == 0 && z_offset == 0) || dx * dx + dz * dz <= scale * scale;
+                    let on_edge = x_offset == -new_width
+                        || x_offset == new_width
+                        || z_offset == -new_width
+                        || z_offset == new_width;
+                    if !inside_radius || (on_edge && random.next_f32() > 0.75) {
+                        continue;
+                    }
+
+                    let positive_offset = origin.offset(x_offset, y_offset, z_offset);
+                    self.place_spike_block_if_replaceable(
+                        host,
+                        registry,
+                        config,
+                        positive_offset,
+                        spike_state,
+                        writes,
+                    );
+
+                    if y_offset != 0 && new_width > 1 {
+                        let negative_offset = origin.offset(x_offset, -y_offset, z_offset);
+                        self.place_spike_block_if_replaceable(
+                            host,
+                            registry,
+                            config,
+                            negative_offset,
+                            spike_state,
+                            writes,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors vanilla ice spike base placement state"
+    )]
+    fn place_spike_base<H: VegetationBlockAccess>(
+        &self,
+        host: &mut H,
+        registry: &Registry,
+        random: &mut WorldgenRandom,
+        config: &SpikeConfiguration,
+        origin: BlockPos,
+        width: i32,
+        spike_state: BlockStateId,
+        writes: &mut Vec<VegetationBlock>,
+    ) {
+        let pillar_width = (width - 1).clamp(0, 1);
+        for x_offset in -pillar_width..=pillar_width {
+            for z_offset in -pillar_width..=pillar_width {
+                let mut cursor = origin.offset(x_offset, -1, z_offset);
+                let mut run_length = 50;
+                if x_offset.abs() == 1 && z_offset.abs() == 1 {
+                    run_length = random.next_i32_bounded(5);
+                }
+
+                while cursor.y() > 50 {
+                    let state = host.block_state(cursor);
+                    if !state.is_air()
+                        && !self.test_block_predicate(host, registry, &config.can_replace, cursor)
+                        && state != spike_state
+                    {
+                        break;
+                    }
+
+                    write_block(host, writes, cursor, spike_state);
+                    cursor = cursor.below();
+                    run_length -= 1;
+                    if run_length <= 0 {
+                        cursor = cursor.below_n(random.next_i32_bounded(5) + 1);
+                        run_length = random.next_i32_bounded(5);
+                    }
+                }
+            }
+        }
+    }
+
+    fn place_spike_block_if_replaceable<H: VegetationBlockAccess>(
+        &self,
+        host: &mut H,
+        registry: &Registry,
+        config: &SpikeConfiguration,
+        pos: BlockPos,
+        spike_state: BlockStateId,
+        writes: &mut Vec<VegetationBlock>,
+    ) {
+        let state = host.block_state(pos);
+        if state.is_air() || self.test_block_predicate(host, registry, &config.can_replace, pos) {
+            write_block(host, writes, pos, spike_state);
+        }
+    }
+
+    /// Vanilla `DiskFeature`, ported for the portable Features slice.
+    fn place_disk<H: VegetationBlockAccess>(
+        &self,
+        host: &mut H,
+        registry: &Registry,
+        random: &mut WorldgenRandom,
+        config: &DiskConfiguration,
+        origin: BlockPos,
+        writes: &mut Vec<VegetationBlock>,
+    ) -> bool {
+        let top = origin.y() + config.half_height;
+        let bottom = origin.y() - config.half_height - 1;
+        let radius = config.radius.sample(random);
+        let mut placed_any = false;
+
+        // Vanilla iterates the closed column box in X, then Y, then Z order.
+        // The Y extent is one here, so the order reduces to X inside Z.
+        for z in origin.z() - radius..=origin.z() + radius {
+            for x in origin.x() - radius..=origin.x() + radius {
+                let dx = x - origin.x();
+                let dz = z - origin.z();
+                if dx * dx + dz * dz > radius * radius {
+                    continue;
+                }
+                placed_any |= self.place_disk_column(
+                    host,
+                    registry,
+                    random,
+                    config,
+                    top,
+                    bottom,
+                    BlockPos::new(x, origin.y(), z),
+                    writes,
+                );
+            }
+        }
+
+        placed_any
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors vanilla disk column placement state"
+    )]
+    fn place_disk_column<H: VegetationBlockAccess>(
+        &self,
+        host: &mut H,
+        registry: &Registry,
+        random: &mut WorldgenRandom,
+        config: &DiskConfiguration,
+        top: i32,
+        bottom: i32,
+        column_pos: BlockPos,
+        writes: &mut Vec<VegetationBlock>,
+    ) -> bool {
+        let mut placed_any = false;
+
+        for y in (bottom + 1..=top).rev() {
+            let pos = BlockPos::new(column_pos.x(), y, column_pos.z());
+            if self.test_block_predicate(host, registry, &config.target, pos)
+                && let Some(state) =
+                    sample_provider(host, registry, random, &config.state_provider, pos)
+            {
+                write_block(host, writes, pos, state);
+                placed_any = true;
+            }
+        }
+
+        placed_any
     }
 
     fn biome_allows_feature<H: VegetationBlockAccess>(
@@ -744,6 +1009,13 @@ impl VegetationStage {
                 .block_state(BlockPos(origin.0 + *offset))
                 .get_block()
                 .has_tag(tag),
+            BlockPredicate::MatchingBlocks { blocks, offset } => {
+                let block = host.block_state(BlockPos(origin.0 + *offset)).get_block();
+                blocks.0.contains(&block)
+            }
+            BlockPredicate::Solid { offset } => host
+                .block_state(BlockPos(origin.0 + *offset))
+                .is_solid_render(),
             BlockPredicate::WouldSurvive { state, offset } => {
                 let state = WorldgenStateResolver::feature_block_state_from_data(
                     registry,
@@ -766,11 +1038,27 @@ impl VegetationStage {
     }
 }
 
-fn is_sparse_vegetation_feature(feature: PlacedFeatureEntryRef) -> bool {
-    feature.key.path == "trees_cherry"
-        || feature.key.path == "flower_cherry"
-        || feature.key.path == "patch_tall_grass_2"
-        || feature.key.path == "patch_grass_plain"
+/// Placed features the portable slice generates.
+///
+/// This is an allowlist rather than a capability check because the portable
+/// slice implements only part of the vanilla Features stage, and running a
+/// feature whose configured kind is unimplemented would silently drop blocks
+/// instead of failing loudly. Vanilla seeds each feature from its own index
+/// rather than sequentially, so skipping a feature does not disturb the
+/// randomness of the ones that do run.
+///
+/// Add a name here only once its configured feature kind, its placement
+/// modifiers, and its block predicates are all implemented above.
+fn is_portable_sparse_feature(feature: PlacedFeatureEntryRef) -> bool {
+    matches!(
+        feature.key.path.as_ref(),
+        "trees_cherry"
+            | "flower_cherry"
+            | "patch_tall_grass_2"
+            | "patch_grass_plain"
+            | "ice_spike"
+            | "ice_patch"
+    )
 }
 
 fn write_block<H: VegetationBlockAccess>(

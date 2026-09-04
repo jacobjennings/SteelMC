@@ -47,10 +47,47 @@ for `wasm32-unknown-unknown` through the pinned 32-bit-capable `simdnbt` fork.
 The `steel-worldgen-wasm` leaf crate exposes a reusable seeded sampler for the
 Overworld, Nether, and End. It runs the real Steel density functions and biome
 source and is integrated into the viewer through Web Workers. Its tile DTO is a
-surface height/color grid with canonical final `surfaceBlocks` IDs plus sparse
-portable vegetation placements. It does not expose vertical cave and overhang
-geometry, structures, or the complete native Features union. The generated web
-package is about 7 MiB before HTTP compression.
+surface height/color grid with canonical final `surfaceBlocks` IDs plus a sparse
+`generatedBlocks` list from the portable Features slice. It does not expose
+vertical cave and overhang geometry, structures, or the complete native Features
+union. The generated web package is about 7 MiB before HTTP compression.
+
+Structure blocks are the largest remaining gap and the reason for it is a crate
+boundary, not a missing algorithm. Structure starts and piece layout live in
+`steel-worldgen` and already reach the browser, which is how `structure_markers`
+reports exact village, portal, and stronghold positions. Every structure piece
+block placer lives in `steel-core`, which depends on Tokio, the filesystem, and
+the entity system and does not build for `wasm32-unknown-unknown`. Moving those
+placers behind a host trait, the way the Features slice already is, is what a
+browser village would take.
+
+### Generated-block payload
+
+`terrain_tile` returns `generatedBlocks`, a sparse list of the block states the
+Features stage placed after the surface stage. Every entry carries an absolute
+world X, Y and Z, a canonical block identifier, and a canonical state string.
+An entry may be `minecraft:air` where a generated feature clears terrain the
+surface stage had filled.
+
+The field is deliberately general. It carries no marker saying which feature or
+structure produced an entry, because the set of generatable producers grows
+over time and a consumer that branches on the producer would need changing
+every time it does. Classify an entry by its block. Packed ice from an ice
+spike is a solid cube and cherry leaves are foliage, and only the block
+identifier says which.
+
+The field was named `vegetationBlocks` while trees and grass were the only
+things it carried. It was renamed when ice spikes joined them, because a
+consumer that assumed vegetation would have drawn a packed ice spire as a
+crossed foliage sprite.
+
+Which features run in the browser is an explicit allowlist in
+`steel-worldgen::vegetation::is_portable_sparse_feature`, not a capability
+probe. The portable slice implements part of the vanilla Features stage, and
+running a feature whose configured kind is unimplemented would drop its blocks
+silently. Vanilla seeds each feature from its own index rather than
+sequentially, so a skipped feature does not disturb the randomness of the ones
+that run.
 
 ### Final-surface and foliage boundary
 

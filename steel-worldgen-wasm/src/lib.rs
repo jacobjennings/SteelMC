@@ -602,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn terrain_tile_serializes_canonical_cherry_vegetation_states() {
+    fn terrain_tile_serializes_canonical_cherry_generated_states() {
         let generator = SteelWorldgen::new("1", "overworld", None).unwrap_or_else(|error| {
             panic!("cherry fixture generator should initialize: {error:?}")
         });
@@ -612,25 +612,25 @@ mod tests {
                 .unwrap_or_else(|error| panic!("cherry fixture should serialize: {error:?}")),
         )
         .unwrap_or_else(|error| panic!("cherry fixture response must be JSON: {error}"));
-        let vegetation = value["vegetationBlocks"]
+        let generated = value["generatedBlocks"]
             .as_array()
-            .unwrap_or_else(|| panic!("cherry fixture must include vegetationBlocks"));
+            .unwrap_or_else(|| panic!("cherry fixture must include generatedBlocks"));
         assert!(
-            vegetation
+            generated
                 .iter()
                 .any(|block| block["block"] == "minecraft:cherry_log")
         );
         assert!(
-            vegetation
+            generated
                 .iter()
                 .any(|block| block["block"] == "minecraft:cherry_leaves")
         );
         assert!(
-            vegetation
+            generated
                 .iter()
                 .any(|block| block["block"] == "minecraft:pink_petals")
         );
-        assert!(vegetation.iter().all(|block| {
+        assert!(generated.iter().all(|block| {
             block["x"].is_i64()
                 && block["y"].is_i64()
                 && block["z"].is_i64()
@@ -638,6 +638,55 @@ mod tests {
                     .as_str()
                     .is_some_and(|state| state.starts_with("minecraft:"))
         }));
+    }
+
+    /// The generated-block field must carry more than vegetation.
+    ///
+    /// This fixture is an ice spikes biome, where the vanilla `ice_spike` and
+    /// `ice_patch` placed features build packed ice spires. Before the portable
+    /// Features slice implemented them the payload here was empty, and the
+    /// viewer drew flat snow where Minecraft draws spires.
+    #[test]
+    fn terrain_tile_serializes_packed_ice_spikes() {
+        let generator = SteelWorldgen::new("12345", "overworld", None)
+            .unwrap_or_else(|error| panic!("ice spike generator should initialize: {error:?}"));
+        let mut packed_ice = 0usize;
+        let mut min_y = i64::MAX;
+        let mut max_y = i64::MIN;
+        for chunk_z in -58..-54 {
+            for chunk_x in 48..52 {
+                let value: serde_json::Value = serde_json::from_str(
+                    &generator
+                        .terrain_tile(chunk_x * 16, chunk_z * 16, 16, 1, None)
+                        .unwrap_or_else(|error| {
+                            panic!("ice spike fixture should serialize: {error:?}")
+                        }),
+                )
+                .unwrap_or_else(|error| panic!("ice spike response must be JSON: {error}"));
+                let generated = value["generatedBlocks"]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("ice spike fixture must include generatedBlocks"));
+                for block in generated {
+                    if block["block"] != "minecraft:packed_ice" {
+                        continue;
+                    }
+                    packed_ice += 1;
+                    let y = block["y"]
+                        .as_i64()
+                        .unwrap_or_else(|| panic!("generated block must have a y coordinate"));
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        assert!(
+            packed_ice > 0,
+            "ice spikes biome must generate packed ice blocks"
+        );
+        assert!(
+            max_y - min_y >= 4,
+            "packed ice must span a vertical range, got {min_y} to {max_y}"
+        );
     }
 }
 
@@ -662,7 +711,14 @@ struct TerrainResponse<'a> {
     surface_blocks: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     surface_block_indices: Option<Vec<u16>>,
-    vegetation_blocks: Vec<TerrainVegetationBlock>,
+    /// Sparse generated blocks from every stage that runs after the surface.
+    ///
+    /// This is deliberately general and carries no per-feature or per-structure
+    /// discrimination. Consumers classify by block, not by which producer wrote
+    /// it, so a stage that becomes generatable later flows through unchanged.
+    /// An entry may be `minecraft:air` where a generated feature or structure
+    /// clears terrain that the surface stage had filled.
+    generated_blocks: Vec<TerrainGeneratedBlock>,
     min_height: i16,
     max_height: i16,
     min_y: i16,
@@ -670,9 +726,10 @@ struct TerrainResponse<'a> {
     decorations: [u8; 0],
 }
 
+/// One sparse generated block placed after the surface stage.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TerrainVegetationBlock {
+struct TerrainGeneratedBlock {
     x: i32,
     y: i32,
     z: i32,
@@ -778,10 +835,10 @@ impl<'a> TerrainResponse<'a> {
             biome_indices: tile.biome_indices,
             surface_blocks,
             surface_block_indices,
-            vegetation_blocks: tile
+            generated_blocks: tile
                 .vegetation_blocks
                 .into_iter()
-                .map(|block| TerrainVegetationBlock {
+                .map(|block| TerrainGeneratedBlock {
                     x: block.x,
                     y: block.y,
                     z: block.z,
