@@ -59,7 +59,15 @@ pub(super) fn place_igloo_piece<H: StructureBlockAccess>(
         Ok(template) => template,
         Err(_) => return false,
     };
-    if template.contains_jigsaw(registry) || template.entity_count() > 0 {
+    // Entities are not blocks. The igloo basement carries a villager and a
+    // zombie villager, and refusing the piece over them threw away the whole
+    // laboratory: 155 blocks the native placer wrote and the portable one did
+    // not. A terrain view simply draws no entities.
+    //
+    // A jigsaw block is different, because leaving one standing would be a
+    // block state vanilla does not produce. No piece this module accepts can
+    // contain one, so this is a guard against a future family, not a live case.
+    if template.contains_jigsaw(registry) {
         return false;
     }
 

@@ -24,9 +24,16 @@
 //! - waterlogging and liquid settling, so `apply_waterlogging` is refused,
 //! - entities, block entities, and loot tables, which change no block state,
 //! - the neighbour shape update pass, which needs the server's per-block
-//!   behaviour table. [`TemplatePlacement::shape_sensitive_blocks`] reports
+//!   behaviour table. [`StructureTemplate::shape_sensitive_blocks`] reports
 //!   whether a template contains a block whose vanilla shape update could
 //!   change its own state, so a caller can refuse instead of guessing.
+//!
+//! That last omission has been measured rather than assumed. An igloo top is
+//! identical to the native placer at every block. An igloo basement disagrees
+//! on three iron bars out of 404, along the edge where a template block meets
+//! ground the template did not place, because vanilla connects them to it and
+//! this slice cannot. The reproduction is
+//! `portable_igloo_basement_needs_the_block_shape_update_pass` in `steel-core`.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;

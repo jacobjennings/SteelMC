@@ -1,4 +1,12 @@
-//! Temporary locator: find seeds and chunks that contain a given structure.
+//! Finds seeds and chunks that contain a named structure.
+//!
+//! A parity fixture that asserts against a chunk with no structure in it passes
+//! for the wrong reason. This is how the fixture's sample was chosen, kept so
+//! the next family can choose its own instead of guessing at coordinates.
+//!
+//! Run it with, for example,
+//! `LOCATE=igloo LOCATE_RADIUS=64 LOCATE_SEEDS=4,8,10 cargo test --release
+//! -p steel-worldgen --test structure_locator -- --ignored --nocapture`.
 
 use steel_worldgen::surface_sampler::{SurfaceDimension, SurfaceSampler};
 

@@ -63,6 +63,52 @@ fn portable_structure_pieces_match_native() {
     );
 }
 
+/// The smallest template-backed structure, on real ground.
+///
+/// An igloo is twelve kilobytes of saved blocks placed as one template with a
+/// rotation, which is the whole template engine in miniature: load it, choose a
+/// palette, turn the block positions and the block states about a pivot, and
+/// write what lands inside the chunk. It needs no jigsaw assembly and no
+/// processors, so it isolates the placement core from everything built on it.
+#[test]
+fn portable_igloo_template_matches_native() {
+    let mut compared = 0usize;
+    for (seed, chunk_x, chunk_z, label) in [
+        (12345_u64, 36_i32, 41_i32, "igloo, top only"),
+        (2026, -21, -28, "igloo, top only"),
+    ] {
+        compared += assert_portable_structures_match_native(seed, chunk_x, chunk_z, label);
+    }
+    println!("PORTABLE_IGLOO_PARITY compared={compared}");
+    assert!(compared > 0, "the sample compared no igloo blocks at all");
+}
+
+/// The one measured case where the portable template slice disagrees, kept as
+/// an exact reproduction rather than deleted.
+///
+/// An igloo with a basement is eleven template pieces stacked into a ladder
+/// shaft. Both sides now write the same 404 blocks in this chunk, and three of
+/// them disagree: iron bars along the chunk's northern edge, where the portable
+/// side keeps the template's saved `north=false` and the native side has
+/// `north=true`.
+///
+/// The cause is named and it is not a template bug. After placing a template
+/// vanilla re-evaluates the shape of every placed block against its neighbours,
+/// through `steel-core`'s per-block behaviour table. Iron bars connect to the
+/// solid ground north of them, which the template did not place. The portable
+/// slice has no behaviour table, so it cannot run that pass.
+///
+/// This is the whole of the shape-update gap, measured on the smallest template
+/// structure that shows it: three blocks out of 404, all of them where a
+/// template block meets ground the template did not place. Fixing it means
+/// porting the subset of block behaviours whose `update_shape` does something,
+/// which is a separate piece of work and needs its own estimate.
+#[test]
+#[ignore = "known divergence, kept as a reproduction until block shape updates are ported"]
+fn portable_igloo_basement_needs_the_block_shape_update_pass() {
+    assert_portable_structures_match_native(4, -21, -17, "igloo with a basement, eleven pieces");
+}
+
 /// A chunk with no structure in it must produce nothing on either side.
 ///
 /// Without this, a portable placer that silently refused every piece would pass
