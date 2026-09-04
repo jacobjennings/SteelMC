@@ -73,6 +73,8 @@ pub struct TemplateBlock {
     /// A structure block's `metadata` string, the instruction a family placer
     /// reads off a data marker.
     pub metadata: Option<String>,
+    /// A jigsaw block's replacement state after pool-element placement.
+    pub final_state: Option<BlockStateId>,
 }
 
 /// A loaded vanilla structure template.
@@ -117,11 +119,7 @@ impl StructureTemplate {
     ///
     /// # Errors
     /// Returns a message describing the first field that did not parse.
-    pub fn load_gzip_nbt(
-        registry: &Registry,
-        bytes: &[u8],
-        context: &str,
-    ) -> Result<Self, String> {
+    pub fn load_gzip_nbt(registry: &Registry, bytes: &[u8], context: &str) -> Result<Self, String> {
         let mut decoder = GzDecoder::new(bytes);
         let mut data = Vec::new();
         decoder
@@ -238,12 +236,8 @@ impl StructureTemplate {
             if !placement.clip.contains_blockpos(world_pos) {
                 continue;
             }
-            let final_state = transform_state(
-                registry,
-                block.state,
-                placement.mirror,
-                placement.rotation,
-            );
+            let final_state =
+                transform_state(registry, block.state, placement.mirror, placement.rotation);
             region.set_block_state(world_pos, final_state);
         }
         true
@@ -273,10 +267,7 @@ impl StructureTemplate {
             }
             let world_pos = self.transformed_position(position, block.pos, placement);
             if placement.clip.contains_blockpos(world_pos) {
-                markers.push((
-                    world_pos,
-                    block.metadata.clone().unwrap_or_default(),
-                ));
+                markers.push((world_pos, block.metadata.clone().unwrap_or_default()));
             }
         }
         markers
@@ -405,9 +396,9 @@ fn read_palettes(
 
     let mut result = Vec::with_capacity(palettes.len());
     for palette in palettes {
-        let entries = palette
-            .compounds()
-            .ok_or_else(|| format!("structure template {context} has non-compound palette entry"))?;
+        let entries = palette.compounds().ok_or_else(|| {
+            format!("structure template {context} has non-compound palette entry")
+        })?;
         result.push(read_palette(registry, &entries, context)?);
     }
     Ok(result)
@@ -482,6 +473,15 @@ fn read_blocks(
                 .as_ref()
                 .and_then(|nbt| nbt.string("metadata"))
                 .map(|value| value.to_str().into_owned()),
+            final_state: nbt
+                .as_ref()
+                .and_then(|nbt| nbt.string("final_state"))
+                .and_then(|value| {
+                    WorldgenStateResolver::block_state_from_string(
+                        registry,
+                        value.to_str().as_ref(),
+                    )
+                }),
         };
 
         if info.has_nbt {
