@@ -283,6 +283,16 @@ impl<N: DimensionNoises> VanillaGenerator<N> {
 
 impl<N: VanillaPostNoiseStateType> VanillaGenerator<N> {
     #[cfg(test)]
+    pub(crate) fn apply_structure_decorations_for_test(&self, region: &mut WorldGenRegion<'_>) {
+        self.feature_runner.decorate_structures_only_for_test(
+            region,
+            &REGISTRY,
+            self.seed,
+            self.biome_zoom_seed,
+        );
+    }
+
+    #[cfg(test)]
     pub(crate) fn apply_selected_biome_decorations_for_test(
         &self,
         region: &mut WorldGenRegion<'_>,

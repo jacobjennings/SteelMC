@@ -17,8 +17,12 @@ use crate::carver::{CarverBlockAccess, CarverStage};
 use crate::density::{ColumnCache, DimensionNoises, NoiseSettings};
 use crate::density_functions::{end::EndNoises, nether::NetherNoises, overworld::OverworldNoises};
 use crate::noise::NoiseChunk;
-use crate::noise::{Aquifer, AquiferResult, OreVeinifier, preliminary_surface_level};
+use crate::noise::{
+    Aquifer, AquiferResult, LazyAquifer, OreVeinifier, preliminary_surface_level,
+};
 use crate::noise_parameters::get_noise_parameters;
+use crate::structure::{GenerationContext, StructureGenerator, StructureStart};
+use crate::structure_stage::{RecordingRegion, place_structure_pieces, writable_box};
 use crate::surface::{
     PreliminarySurfaceCorners, SurfaceBiomeAccess, SurfaceBlockAccess, SurfaceExtensions,
     SurfaceStage, SurfaceSystem,
@@ -459,6 +463,49 @@ impl SurfaceSampler {
             Self::Overworld(sampler) => sampler.carved_chunk_snapshot(chunk_x, chunk_z),
             Self::Nether(sampler) => sampler.carved_chunk_snapshot(chunk_x, chunk_z),
             Self::End(sampler) => sampler.carved_chunk_snapshot(chunk_x, chunk_z),
+        }
+    }
+
+    /// Returns every structure start anchored in a rectangle of chunks.
+    ///
+    /// This is how a fixture finds a seed that actually contains the structure
+    /// it means to test, instead of asserting against an empty chunk.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn structure_starts_in_chunk_range(
+        &self,
+        min_chunk_x: i32,
+        min_chunk_z: i32,
+        max_chunk_x: i32,
+        max_chunk_z: i32,
+    ) -> Vec<(i32, i32, StructureStart)> {
+        match self {
+            Self::Overworld(sampler) => sampler
+                .structure_starts_in_chunk_range(min_chunk_x, min_chunk_z, max_chunk_x, max_chunk_z),
+            Self::Nether(sampler) => sampler
+                .structure_starts_in_chunk_range(min_chunk_x, min_chunk_z, max_chunk_x, max_chunk_z),
+            Self::End(sampler) => sampler
+                .structure_starts_in_chunk_range(min_chunk_x, min_chunk_z, max_chunk_x, max_chunk_z),
+        }
+    }
+
+    /// Returns the sparse blocks the portable structure-piece pass writes into
+    /// one chunk, after Surface and Carvers and before any placed feature.
+    ///
+    /// This exists for native/portable transaction-parity tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn structure_piece_transaction_snapshot(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+    ) -> Vec<SurfaceVegetationBlock> {
+        match self {
+            Self::Overworld(sampler) => {
+                sampler.structure_piece_transaction_snapshot(chunk_x, chunk_z)
+            }
+            Self::Nether(sampler) => sampler.structure_piece_transaction_snapshot(chunk_x, chunk_z),
+            Self::End(sampler) => sampler.structure_piece_transaction_snapshot(chunk_x, chunk_z),
         }
     }
 
@@ -1047,6 +1094,121 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             .collect::<Vec<_>>();
         blocks.sort_by_key(|block| (block.x, block.y, block.z));
         blocks
+    }
+
+    fn structure_starts_for_chunk(
+        &self,
+        generator: &StructureGenerator,
+        chunk_x: i32,
+        chunk_z: i32,
+    ) -> Vec<StructureStart> {
+        let mut biome_sampler = self.biome_source.chunk_sampler();
+        let mut height_cache = N::ColumnCache::default();
+        let mut aquifer = LazyAquifer::new(chunk_x * 16, chunk_z * 16, &self.splitter, &*self.noises);
+        let mut surface_y_cache = None;
+        let mut height_cache_grid_ready = false;
+        let mut context = GenerationContext::new(
+            self.vegetation_stage.seed(),
+            chunk_x,
+            chunk_z,
+            N::Settings::SEA_LEVEL,
+            &*self.noises,
+            &self.splitter,
+            generator.template_pools(),
+            generator.templates(),
+            &mut biome_sampler,
+            &mut height_cache,
+            &mut aquifer,
+            &mut surface_y_cache,
+            &mut height_cache_grid_ready,
+        );
+        generator.generate_starts_for_chunk(&mut context, |_| false)
+    }
+
+    fn structure_starts_in_chunk_range(
+        &self,
+        min_chunk_x: i32,
+        min_chunk_z: i32,
+        max_chunk_x: i32,
+        max_chunk_z: i32,
+    ) -> Vec<(i32, i32, StructureStart)> {
+        let generator = StructureGenerator::vanilla_single_threaded(
+            self.vegetation_stage.seed(),
+            &self.biome_source,
+        );
+        let mut found = Vec::new();
+        for chunk_z in min_chunk_z..=max_chunk_z {
+            for chunk_x in min_chunk_x..=max_chunk_x {
+                for start in self.structure_starts_for_chunk(&generator, chunk_x, chunk_z) {
+                    found.push((chunk_x, chunk_z, start));
+                }
+            }
+        }
+        found
+    }
+
+    fn structure_piece_transaction_snapshot(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+    ) -> Vec<SurfaceVegetationBlock> {
+        let generator = StructureGenerator::vanilla_single_threaded(
+            self.vegetation_stage.seed(),
+            &self.biome_source,
+        );
+        // One chunk of source ring. Every portable piece family fits inside a
+        // box smaller than two chunks, so a start anchored further away cannot
+        // reach this chunk. A larger family needs vanilla's radius-8 scan.
+        let mut starts = Vec::new();
+        for source_z in chunk_z - 1..=chunk_z + 1 {
+            for source_x in chunk_x - 1..=chunk_x + 1 {
+                starts.extend(self.structure_starts_for_chunk(&generator, source_x, source_z));
+            }
+        }
+        starts.sort_by(|left, right| {
+            left.structure.cmp(&right.structure).then_with(|| {
+                (left.chunk_pos.0.x, left.chunk_pos.0.y)
+                    .cmp(&(right.chunk_pos.0.x, right.chunk_pos.0.y))
+            })
+        });
+
+        let mut chunks = HashMap::new();
+        for source_z in chunk_z - 1..=chunk_z + 1 {
+            for source_x in chunk_x - 1..=chunk_x + 1 {
+                let mut chunk = self.sample_surface_chunk_data(source_x, source_z);
+                self.apply_carvers_to_chunk(&mut chunk);
+                chunks.insert((source_x, source_z), VegetationChunk::Flat(chunk));
+            }
+        }
+        let mut region = InMemoryVegetationRegion::new(
+            &mut chunks,
+            &self.biome_source,
+            N::Settings::MIN_Y,
+            N::Settings::HEIGHT,
+        );
+        let mut recording = RecordingRegion::new(&mut region);
+        let clip = writable_box(
+            chunk_x,
+            chunk_z,
+            N::Settings::MIN_Y,
+            N::Settings::MIN_Y + N::Settings::HEIGHT,
+        );
+        place_structure_pieces(&mut recording, &REGISTRY, &mut starts, clip);
+
+        recording
+            .written_positions()
+            .into_iter()
+            .map(|(x, y, z)| {
+                let state = recording.block_state(BlockPos::new(x, y, z));
+                SurfaceVegetationBlock {
+                    x,
+                    y,
+                    z,
+                    block: canonical_block_key(state),
+                    state: canonical_block_state_key(state),
+                }
+            })
+            .collect()
     }
 
     fn noise_volume_chunk(

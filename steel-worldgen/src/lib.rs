@@ -20,6 +20,8 @@ pub mod noise;
 pub mod state_resolver;
 /// structure
 pub mod structure;
+/// Portable structure-piece pass over a post-Carvers terrain halo.
+pub mod structure_stage;
 /// Surface rule context types for generated code.
 pub mod surface;
 /// Browser-safe sampling of the deterministic terrain density surface.

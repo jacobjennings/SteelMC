@@ -24,14 +24,20 @@ pub mod nether_fossil;
 pub mod ocean_monument;
 pub mod ocean_ruin;
 mod piece;
+/// Portable structure piece block placement.
+pub mod piece_placer;
 pub mod placement;
 pub mod ruined_portal;
 pub mod shipwreck;
 pub mod single_piece;
 /// Structure starts and references.
 pub mod start;
+/// Portable block-state mirror and rotation.
+pub mod state_transform;
 pub mod stronghold;
 pub mod swamp_hut;
+/// Portable structure template loading and placement.
+pub mod template;
 /// Miscellaneous structure utility functions.
 pub mod utils;
 

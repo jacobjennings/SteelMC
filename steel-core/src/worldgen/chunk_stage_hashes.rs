@@ -135,7 +135,7 @@ fn load_expected_hashes() -> ChunkStageHashesJson {
     serde_json::from_str(json_str).expect("Failed to parse chunk_stage_hashes.json")
 }
 
-fn sorted_positions(positions: &FxHashSet<(i32, i32)>) -> Vec<(i32, i32)> {
+pub(super) fn sorted_positions(positions: &FxHashSet<(i32, i32)>) -> Vec<(i32, i32)> {
     let mut positions = positions.iter().copied().collect::<Vec<_>>();
     positions.sort_unstable();
     positions
@@ -203,7 +203,7 @@ fn debug_stage_filter() -> Option<String> {
         .filter(|stage| !stage.is_empty())
 }
 
-fn empty_proto_chunk(pos: (i32, i32), section_count: usize, min_y: i32, height: i32) -> Chunk {
+pub(super) fn empty_proto_chunk(pos: (i32, i32), section_count: usize, min_y: i32, height: i32) -> Chunk {
     let sections: Box<[ChunkSection]> = (0..section_count)
         .map(|_| ChunkSection::new_empty())
         .collect::<Vec<_>>()
@@ -217,14 +217,14 @@ fn empty_proto_chunk(pos: (i32, i32), section_count: usize, min_y: i32, height: 
     )
 }
 
-fn chunk_or_panic(chunks: &FxHashMap<(i32, i32), Chunk>, pos: (i32, i32)) -> &Chunk {
+pub(super) fn chunk_or_panic(chunks: &FxHashMap<(i32, i32), Chunk>, pos: (i32, i32)) -> &Chunk {
     match chunks.get(&pos) {
         Some(chunk) => chunk,
         None => panic!("Missing test chunk ({}, {})", pos.0, pos.1),
     }
 }
 
-fn create_test_world(
+pub(super) fn create_test_world(
     dim_key: &str,
     dim_type: DimensionTypeRef,
     seed: u64,
@@ -272,7 +272,7 @@ fn create_test_world(
         .expect("failed to create chunk-stage hash test world")
 }
 
-fn build_feature_holders(
+pub(super) fn build_feature_holders(
     chunks: FxHashMap<(i32, i32), Chunk>,
     carver_positions: &FxHashSet<(i32, i32)>,
     min_y: i32,
@@ -340,7 +340,7 @@ fn compute_block_hash(sections: &Sections) -> String {
     format!("{:x}", ctx.finalize())
 }
 
-fn recalculate_section_counts(chunk: &Chunk) {
+pub(super) fn recalculate_section_counts(chunk: &Chunk) {
     for section in &chunk.sections.sections {
         section.write().recalculate_counts();
     }

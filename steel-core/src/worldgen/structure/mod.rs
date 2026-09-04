@@ -1,5 +1,7 @@
 //! Core chunk adapter for the worldgen structure engine.
 
+#[cfg(test)]
+mod parity;
 pub(crate) mod piece_placer;
 
 use crate::chunk::Chunk;

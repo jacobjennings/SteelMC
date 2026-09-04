@@ -19,6 +19,10 @@ tracing.workspace = true
 glam.workspace = true
 wincode.workspace = true
 
+# Structure template payloads (gzipped NBT bundled in steel-registry)
+simdnbt.workspace = true
+flate2.workspace = true
+
 rayon.workspace = true
 
 [build-dependencies]

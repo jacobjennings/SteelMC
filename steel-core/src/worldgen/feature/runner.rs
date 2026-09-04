@@ -187,6 +187,81 @@ impl FeatureDecorationRunner {
         }
     }
 
+    /// Runs only the structure-piece half of decoration, in vanilla's step
+    /// order, and no placed features at all.
+    ///
+    /// This is the native side of the portable structure-piece parity fixture.
+    /// Structure pieces write before any feature in every step, so isolating
+    /// them changes no structure block, and it keeps a feature's writes from
+    /// being blamed on a piece.
+    #[cfg(test)]
+    pub(crate) fn decorate_structures_only_for_test(
+        &self,
+        region: &mut WorldGenRegion<'_>,
+        registry: &Registry,
+        seed: i64,
+        biome_zoom_seed: i64,
+    ) {
+        let center = region.center();
+        let origin = BlockPos::new(center.0.x * 16, region.min_y(), center.0.y * 16);
+
+        let writable_box = Self::center_chunk_writable_box(region);
+        let mut random = WorldgenRandom::from_seed(0);
+        let decoration_seed = random.set_decoration_seed(seed, origin.x(), origin.z());
+        let step_count = DECORATION_STEP_COUNT.max(self.sorter.step_count());
+
+        for step in 0..step_count {
+            for (structure_index, structure) in Self::structures_for_decoration_step(registry, step)
+                .into_iter()
+                .enumerate()
+            {
+                Self::set_structure_seed(&mut random, decoration_seed, structure_index, step);
+
+                let source_positions =
+                    Self::structure_source_positions_in_region(region, &structure.key);
+                for source_pos in source_positions {
+                    let Some(source_chunk) = region.try_chunk(
+                        source_pos.0.x,
+                        source_pos.0.y,
+                        crate::chunk::status::ChunkStatus::StructureStarts,
+                    ) else {
+                        continue;
+                    };
+                    let mut source_starts = source_chunk.structure_starts_mut();
+                    let Some(start) = source_starts.get_mut(&structure.key) else {
+                        continue;
+                    };
+                    if start.chunk_pos != source_pos || start.pieces.is_empty() {
+                        continue;
+                    }
+                    let Some(reference_pos) = start.placement_reference_pos() else {
+                        continue;
+                    };
+                    for piece in &mut start.pieces {
+                        // The selection is the portable placer's own answer, so
+                        // the two sides cannot drift into comparing different
+                        // pieces. A family the browser cannot draw is skipped
+                        // here too, rather than showing up as a difference.
+                        if !steel_worldgen::structure::piece_placer::is_portable_piece(piece) {
+                            continue;
+                        }
+                        if piece.bounding_box.intersects(writable_box) {
+                            StructurePiecePlacer::place_piece(
+                                region,
+                                registry,
+                                piece,
+                                reference_pos,
+                                writable_box,
+                                &mut random,
+                                biome_zoom_seed,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Runs only an explicitly selected set of placed features for an
     /// isolated transaction-parity fixture.
     ///
