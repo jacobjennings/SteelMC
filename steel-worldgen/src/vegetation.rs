@@ -19,6 +19,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use steel_registry::biome::BiomeRef;
@@ -28,7 +29,8 @@ use steel_registry::blocks::{
 };
 use steel_registry::blocks::Block;
 use steel_registry::feature::{
-    BlockPredicate, BlockStateData, BlockStateProvider, CherryFoliagePlacer, CherryTrunkPlacer,
+    AttachedToLogsDecorator, BlockPredicate, BlockStateData, BlockStateProvider,
+    CherryFoliagePlacer, CherryTrunkPlacer, FallenTreeConfiguration,
     ConfiguredFeatureKind, ConfiguredFeatureRef, DiskConfiguration, FeatureHeightmap, FeatureSize,
     FoliagePlacer, PlacedFeatureData, PlacedFeatureEntryRef, PlacedFeatureRef, PlacementModifier,
     SpikeConfiguration, TreeConfiguration, TreeDecorator, TrunkPlacer,
@@ -782,6 +784,9 @@ impl VegetationStage {
             ConfiguredFeatureKind::Tree(config) => {
                 place_tree(host, registry, random, config, origin, writes)
             }
+            ConfiguredFeatureKind::FallenTree(config) => {
+                place_fallen_tree(host, registry, random, config, origin, writes)
+            }
             ConfiguredFeatureKind::Spike(config) => {
                 self.place_spike(host, registry, random, config, origin, writes)
             }
@@ -1224,7 +1229,54 @@ impl VegetationStage {
 /// index rather than sequentially, so refusing a feature does not disturb the
 /// randomness of the ones that do run.
 pub fn is_portable_sparse_feature(registry: &Registry, feature: PlacedFeatureEntryRef) -> bool {
-    placed_feature_is_portable(registry, &feature.data, 0)
+    let group = PARITY_FEATURE_GROUP.load(AtomicOrdering::Relaxed);
+    (group == PARITY_GROUP_ALL || group == feature_group(feature))
+        && placed_feature_is_portable(registry, &feature.data, 0)
+}
+
+/// Optional parity-testing restriction on which feature family runs.
+///
+/// Restricting both sides of the native parity comparison to one family is how
+/// a bug in one family is kept from convicting another. A ground vegetation
+/// difference once got the fallen tree feature refused, and that difference
+/// later reproduced with every tree placer switched off. Off in normal use,
+/// where this costs one relaxed atomic load.
+static PARITY_FEATURE_GROUP: AtomicU8 = AtomicU8::new(PARITY_GROUP_ALL);
+
+const PARITY_GROUP_ALL: u8 = 0;
+const PARITY_GROUP_TREES: u8 = 1;
+const PARITY_GROUP_GROUND: u8 = 2;
+
+/// Restricts generation to one feature family, or to all of them.
+///
+/// This exists for the native parity fixture and must be left at `None` in
+/// normal generation, where a partial feature set would silently drop blocks.
+pub fn set_parity_feature_group(group: Option<&str>) {
+    let value = match group {
+        None => PARITY_GROUP_ALL,
+        Some("trees") => PARITY_GROUP_TREES,
+        Some("ground") => PARITY_GROUP_GROUND,
+        Some(other) => panic!("unknown parity feature group {other}"),
+    };
+    PARITY_FEATURE_GROUP.store(value, AtomicOrdering::Relaxed);
+}
+
+/// Coarse family used only by the parity restriction above.
+fn feature_group(feature: PlacedFeatureEntryRef) -> u8 {
+    let path = feature.key.path.as_ref();
+    if path.starts_with("trees_")
+        || path.starts_with("oak")
+        || path.starts_with("birch")
+        || path.starts_with("spruce")
+        || path.starts_with("pine")
+        || path.starts_with("cherry")
+        || path.starts_with("fallen_")
+        || path.starts_with("super_birch")
+    {
+        PARITY_GROUP_TREES
+    } else {
+        PARITY_GROUP_GROUND
+    }
 }
 
 /// Recursion limit for selector features that nest placed features.
@@ -1298,6 +1350,16 @@ fn configured_feature_is_portable(
             block_predicate_is_portable(registry, &config.target)
                 && block_state_provider_is_portable(registry, &config.state_provider)
         }
+        ConfiguredFeatureKind::FallenTree(config) => config
+            .stump_decorators
+            .iter()
+            .chain(&config.log_decorators)
+            .all(|decorator| {
+                matches!(
+                    decorator,
+                    TreeDecorator::Beehive { .. } | TreeDecorator::AttachedToLogs(_)
+                )
+            }),
         ConfiguredFeatureKind::RandomSelector(config) => {
             config
                 .features
@@ -2276,10 +2338,199 @@ fn place_tree_decorators<H: VegetationBlockAccess>(
             TreeDecorator::Beehive { probability } => {
                 place_beehive_decorator(host, registry, random, *probability, writes, placement);
             }
+            TreeDecorator::AttachedToLogs(decorator) => {
+                place_attached_to_logs_decorator(
+                    host, registry, random, decorator, writes, placement,
+                );
+            }
             unsupported => {
                 panic!("portable tree placement does not yet support decorator {unsupported:?}")
             }
         }
+    }
+}
+
+/// Vanilla `FallenTreeFeature`: an upright stump and a log lying beside it.
+fn place_fallen_tree<H: VegetationBlockAccess>(
+    host: &mut H,
+    registry: &Registry,
+    random: &mut WorldgenRandom,
+    config: &FallenTreeConfiguration,
+    origin: BlockPos,
+    writes: &mut Vec<VegetationBlock>,
+) -> bool {
+    place_fallen_tree_stump(host, registry, random, config, origin, writes);
+
+    let direction = Direction::HORIZONTAL[random.next_i32_bounded(4) as usize];
+    let log_length = config.log_length.sample(random) - 2;
+    let mut log_start_pos = origin.relative_n(direction, 2 + random.next_i32_bounded(2));
+    set_ground_height_for_fallen_log_start_pos(host, &mut log_start_pos);
+    if can_place_entire_fallen_log(host, log_length, &mut log_start_pos, direction) {
+        let mut placement = TreePlacement::default();
+        let mut pos = log_start_pos;
+        for _ in 0..log_length {
+            place_fallen_log_block(
+                host,
+                registry,
+                random,
+                config,
+                pos,
+                Some(direction.get_axis()),
+                writes,
+                &mut placement,
+            );
+            pos = pos.relative(direction);
+        }
+        place_tree_decorators(
+            host,
+            registry,
+            random,
+            &config.log_decorators,
+            writes,
+            &mut placement,
+        );
+    }
+
+    true
+}
+
+fn place_fallen_tree_stump<H: VegetationBlockAccess>(
+    host: &mut H,
+    registry: &Registry,
+    random: &mut WorldgenRandom,
+    config: &FallenTreeConfiguration,
+    origin: BlockPos,
+    writes: &mut Vec<VegetationBlock>,
+) {
+    let mut placement = TreePlacement::default();
+    place_fallen_log_block(
+        host,
+        registry,
+        random,
+        config,
+        origin,
+        None,
+        writes,
+        &mut placement,
+    );
+    place_tree_decorators(
+        host,
+        registry,
+        random,
+        &config.stump_decorators,
+        writes,
+        &mut placement,
+    );
+}
+
+fn set_ground_height_for_fallen_log_start_pos<H: VegetationBlockAccess>(
+    host: &H,
+    log_start_pos: &mut BlockPos,
+) {
+    *log_start_pos = log_start_pos.above();
+    for _ in 0..6 {
+        if tree_valid_pos(host, *log_start_pos)
+            && is_over_solid_ground_for_fallen_log(host, *log_start_pos)
+        {
+            return;
+        }
+        *log_start_pos = log_start_pos.below();
+    }
+}
+
+fn can_place_entire_fallen_log<H: VegetationBlockAccess>(
+    host: &H,
+    log_length: i32,
+    log_start_pos: &mut BlockPos,
+    direction: Direction,
+) -> bool {
+    let mut gap_in_ground = 0;
+    for _ in 0..log_length {
+        if !tree_valid_pos(host, *log_start_pos) {
+            return false;
+        }
+        if is_over_solid_ground_for_fallen_log(host, *log_start_pos) {
+            gap_in_ground = 0;
+        } else {
+            gap_in_ground += 1;
+            if gap_in_ground > 2 {
+                return false;
+            }
+        }
+        *log_start_pos = log_start_pos.relative(direction);
+    }
+    *log_start_pos = log_start_pos.relative_n(direction.opposite(), log_length);
+    true
+}
+
+fn tree_valid_pos<H: VegetationBlockAccess>(host: &H, pos: BlockPos) -> bool {
+    let state = host.block_state(pos);
+    state.is_air() || state.get_block().has_tag(&BlockTag::REPLACEABLE_BY_TREES)
+}
+
+fn is_over_solid_ground_for_fallen_log<H: VegetationBlockAccess>(host: &H, pos: BlockPos) -> bool {
+    let below = pos.below();
+    host.block_state(below)
+        .is_face_sturdy_at(below, Direction::Up)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors vanilla fallen log block placement"
+)]
+fn place_fallen_log_block<H: VegetationBlockAccess>(
+    host: &mut H,
+    registry: &Registry,
+    random: &mut WorldgenRandom,
+    config: &FallenTreeConfiguration,
+    pos: BlockPos,
+    axis: Option<Axis>,
+    writes: &mut Vec<VegetationBlock>,
+    placement: &mut TreePlacement,
+) {
+    let Some(mut state) = sample_provider(host, registry, random, &config.trunk_provider, pos)
+    else {
+        return;
+    };
+    if let Some(axis) = axis
+        && state.try_get_value(&BlockStateProperties::AXIS).is_some()
+    {
+        state = state.set_value(&BlockStateProperties::AXIS, axis);
+    }
+    placement.set_trunk(host, writes, pos, state);
+}
+
+/// Vanilla `AttachedToLogsDecorator`: mushrooms and the like on a fallen log.
+fn place_attached_to_logs_decorator<H: VegetationBlockAccess>(
+    host: &mut H,
+    registry: &Registry,
+    random: &mut WorldgenRandom,
+    decorator: &AttachedToLogsDecorator,
+    writes: &mut Vec<VegetationBlock>,
+    placement: &mut TreePlacement,
+) {
+    assert!(
+        !decorator.directions.is_empty(),
+        "attached tree decorator direction list must not be empty"
+    );
+    let mut logs = placement.trunks.y_sorted();
+    for index in (1..logs.len()).rev() {
+        let swap = random.next_i32_bounded((index + 1) as i32) as usize;
+        logs.swap(index, swap);
+    }
+    for log in logs {
+        let choice = random.next_i32_bounded(decorator.directions.len() as i32) as usize;
+        let direction = decorator.directions[choice];
+        let place_pos = log.relative(direction);
+        if random.next_f32() > decorator.probability || !host.block_state(place_pos).is_air() {
+            continue;
+        }
+        let Some(state) =
+            sample_provider(host, registry, random, &decorator.block_provider, place_pos)
+        else {
+            continue;
+        };
+        placement.set_decoration(host, writes, place_pos, state);
     }
 }
 
@@ -2918,6 +3169,11 @@ mod tests {
             "forest_flowers",
             "trees_cherry",
             "trees_grove",
+            "trees_taiga",
+            "trees_snowy",
+            "trees_birch",
+            "fallen_spruce_tree",
+            "fallen_birch_tree",
             "spruce_on_snow",
             "pine_on_snow",
             "oak_checked",
@@ -2941,11 +3197,10 @@ mod tests {
             ("vines", "vines need a height range and a sturdy-face query"),
             ("glow_lichen", "multiface growth needs a sturdy-face query"),
             ("trees_plains", "the fancy oak trunk and foliage placers are not ported"),
-            ("trees_birch", "the fallen tree feature is not verified against the native runner"),
-            ("trees_taiga", "the fallen tree feature is not verified against the native runner"),
             ("fancy_oak_checked", "the fancy oak trunk and foliage placers are not ported"),
-            ("fallen_spruce_tree", "the fallen tree feature is not verified against the native runner"),
             ("dark_oak_checked", "the dark oak trunk and foliage placers are not ported"),
+            ("trees_flower_forest", "it can pick a fancy oak"),
+            ("trees_windswept_hills", "it can pick a fancy oak"),
         ] {
             assert!(!portable(key), "{key} should be refused: {reason}");
         }

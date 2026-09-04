@@ -102,40 +102,33 @@ randomness of the ones that run.
 Thirty-nine of the two hundred and sixty-two vanilla placed features qualify.
 What is still refused, and why:
 
-- **Most trees.** The straight trunk placer and the blob, pine and spruce
-  foliage placers are ported and verified, which covers oak, birch, spruce and
-  pine. Seven trunk placers (forking, giant, fancy, dark oak, mega jungle,
-  bending, upwards branching) and six foliage placers (acacia, bush, fancy,
-  jungle, mega pine, random spread) are not.
+- **Some trees.** The straight trunk placer, the blob, pine and spruce foliage
+  placers, and the fallen tree feature are ported and verified, which covers
+  oak, birch, spruce and pine. Seven trunk placers (forking, giant, fancy, dark
+  oak, mega jungle, bending, upwards branching) and six foliage placers
+  (acacia, bush, fancy, jungle, mega pine, random spread) are not.
 
   Biomes do not name a tree directly. They name a selector such as
   `trees_taiga`, which picks between several trees, and the selector runs only
-  when every branch of it does. That is why porting four placers unlocked one
-  biome rather than nine: `trees_grove` is the only selector whose branches are
-  all supported. `trees_plains`, `trees_water`, `trees_meadow`,
-  `trees_flower_forest`, `trees_windswept_hills` and the forest selector each
-  reach a fancy oak, so the fancy trunk and foliage placers are the single
-  highest-value thing left to port.
-- **The fallen tree feature**, which blocks `trees_taiga`, `trees_snowy` and
-  `trees_birch`. It was written and refused after a taiga fixture disagreed
-  with the native runner on five ground plants. That verdict now looks wrong.
-  Widening the parity sample found the same class of disagreement on a meadow
-  chunk with every tree placer refused, and it isolates to a single ground
-  vegetation feature running alone. So the fallen tree was probably innocent
-  and deserves a second attempt, verified with the sample restricted to the
-  tree features so a known ground vegetation bug cannot be mistaken for a tree
-  bug again.
-- **The fancy trunk and foliage placers**, the large oak. They were written and
-  refused for a different reason: no fixture grows one. Among the selectors the
-  slice supports, only meadow and ocean can produce a large oak and both do so
-  rarely, and a scan of forty-nine chunks around a meadow found none. Untested
-  is not verified, so the code was removed rather than shipped unexercised.
+  when every branch of it does. `trees_cherry`, `trees_grove`, `trees_taiga`,
+  `trees_snowy` and `trees_birch` are supported. The rest each reach a fancy
+  oak.
+- **The fancy trunk and foliage placers**, the large oak, which block
+  `trees_plains`, `trees_water`, `trees_meadow`, `trees_flower_forest`,
+  `trees_windswept_hills` and the forest selector. They were written once and
+  removed, not because they disagreed with anything but because **no fixture
+  grows one to compare**. Among the selectors the slice supports only meadow
+  and ocean can produce a large oak, both rarely, and a scan of forty-nine
+  chunks around a meadow found none. Untested is not verified.
 
-  This also corrects an earlier claim. The large oak was called the highest
-  value remaining tree work because it appears in the forest, plains, meadow,
-  flower forest, windswept hills and ocean selectors. It is not, because every
-  one of those except meadow and ocean is *also* blocked by the fallen tree.
-  The fallen tree is the real unlock for a forest or a plains canopy.
+  A fixture has to come first, and there are two ways to get one. A seed scan
+  at scale: run `SurfaceSampler::selected_vegetation_transaction_snapshot` over
+  a few thousand meadow and ocean chunks and keep the first that contains an
+  oak log, which is minutes of compute rather than the seconds a small scan
+  gets. Or a forced-placement test mode: call the tree feature directly at a
+  chosen position on both sides, skipping the selector and its rarity roll
+  entirely, which is faster and also the only way to reach a placer no biome
+  can produce at all.
 
   Tree placers consume random numbers in a fixed order and a mistake produces
   forests that look entirely reasonable and are not the seed's forests. Any
@@ -149,20 +142,38 @@ What is still refused, and why:
   eight chunks across three seeds and reports how many trunk and leaf blocks it
   actually compared, so it cannot pass by comparing nothing.
 
-  Widening that sample found two disagreements that predate the tree work and
-  reproduce with every tree placer refused. Both are kept as exact
-  reproductions in `known_portable_feature_divergences`, which is ignored by
-  default:
+  The fixture compares each feature family on its own, trees and ground
+  vegetation, because a bug in one family must not be able to convict another.
+  A ground vegetation difference once got the fallen tree feature refused, and
+  it later reproduced with every tree placer switched off. Both families now
+  match the native runner across all eleven chunks.
 
+  They disagree when run together, and that is kept as a reproduction in
+  `known_portable_feature_divergences`, which is ignored by default:
+
+  - Seed 1, chunk (-124, -128), a taiga. Five ground plants out of two hundred
+    and ninety differ once trees also run.
   - Seed 7, chunk (50, -98), a meadow. Five short grass placements out of
-    twenty disagree. It isolates to `patch_grass_meadow` running on its own,
-    the pre-feature terrain is identical, and the native survival rule is the
-    same block tag check the portable slice makes, so the cause is somewhere in
-    how the placement modifier chain is walked.
-  - Seed 12345, chunk (-26, -20), an ocean. The terrain disagrees before any
-    feature runs, at two blocks deep underground where the native carvers cut a
-    cave and the portable carvers do not. That is a carver difference, and the
-    only carver parity fixture until now covered a single chunk.
+    twenty differ with no trees involved at all, isolating to
+    `patch_grass_meadow` running alone.
+
+  What is ruled out for both, by assertions the fixture makes before it
+  compares anything: the pre-feature terrain is identical block for block, and
+  so is the pre-feature `WORLD_SURFACE_WG` heightmap. The native survival rule
+  is the same block tag check the portable slice makes. What is left is that
+  the two sides read a different surface height *during* the stage, after a
+  feature has already placed something in that column. The diverging candidates
+  sit on the same columns, exactly one block higher on the portable side.
+  Vanilla's proto chunk updates that heightmap on every block write, which is
+  what the portable slice does by rescanning the column, so the native
+  heightmap maintenance during the feature stage is the suspect rather than the
+  portable one. Fixing it therefore means changing the server generator, which
+  needs its own check against the recorded Minecraft chunk hashes.
+
+  - Seed 12345, chunk (-26, -20), an ocean. Unrelated and underground: the
+    terrain disagrees before any feature runs, at two blocks where the native
+    carvers cut a cave and the portable carvers do not. The only carver parity
+    fixture until now covered a single chunk.
 - **Mushrooms.** Survival depends on the light level at the placement position
   and there is no lighting stage. Guessing would carpet daylit meadows.
 - **Column plants** such as sugar cane, cactus, kelp and bamboo. These are

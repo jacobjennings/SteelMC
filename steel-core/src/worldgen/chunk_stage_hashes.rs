@@ -1006,15 +1006,12 @@ fn portable_carvers_match_native_cherry_grove_fixture() {
 /// which can change later placement eligibility through shared writes.
 #[test]
 fn portable_features_match_native() {
-    // A stated sample rather than one lucky chunk. Cherry grove covers the
-    // cherry placers, grove covers the straight trunk with spruce and pine
-    // foliage, and taiga and forest cover chunks whose biomes list features the
-    // portable slice must refuse, which is where a wrong refusal would show.
-    let mut compared = 0usize;
-    let mut logs = 0usize;
-    let mut leaves = 0usize;
-    for (seed, chunk_x, chunk_z, label) in [
-        (1_u64, -108_i32, -36_i32, "cherry grove"),
+    // Eleven chunks across three seeds. Cherry grove, grove, taiga and birch
+    // forest chunks exercise the tree placers; meadow, forest and ocean chunks
+    // carry biomes whose features the slice must partly refuse, which is where
+    // a wrong refusal would show.
+    const FIXTURES: &[(u64, i32, i32, &str)] = &[
+        (1, -108, -36, "cherry grove"),
         (1, -128, -128, "grove"),
         (1, -124, -128, "taiga"),
         (1, 124, -128, "forest"),
@@ -1025,19 +1022,33 @@ fn portable_features_match_native() {
         (1, -100, -58, "meadow"),
         (12345, 18, -98, "meadow"),
         (1, 72, -96, "ocean"),
-    ] {
-        let counts = assert_portable_features_match_native(seed, chunk_x, chunk_z, label);
-        compared += counts.compared;
-        logs += counts.logs;
-        leaves += counts.leaves;
+    ];
+
+    // Each feature family is compared on its own. A bug in one family must not
+    // be able to convict another: a ground vegetation difference once got the
+    // fallen tree feature refused, and it later reproduced with every tree
+    // placer switched off. The two families still disagree when run together,
+    // which is recorded in `known_portable_feature_divergences` below.
+    for group in ["trees", "ground"] {
+        steel_worldgen::vegetation::set_parity_feature_group(Some(group));
+        let mut compared = 0usize;
+        let mut logs = 0usize;
+        let mut leaves = 0usize;
+        for &(seed, chunk_x, chunk_z, label) in FIXTURES {
+            let counts = assert_portable_features_match_native(seed, chunk_x, chunk_z, label);
+            compared += counts.compared;
+            logs += counts.logs;
+            leaves += counts.leaves;
+        }
+        println!("PORTABLE_PARITY group={group} compared={compared} logs={logs} leaves={leaves}");
+        // A comparison that compares nothing passes for the wrong reason.
+        assert!(compared > 0, "the {group} sample compared no generated blocks");
+        if group == "trees" {
+            assert!(logs > 0, "the tree sample compared no trunk blocks");
+            assert!(leaves > 0, "the tree sample compared no leaf blocks");
+        }
     }
-    // A comparison that compares nothing passes for the wrong reason. The
-    // sample must actually exercise trunks and canopies, which is the whole
-    // point of porting the trunk and foliage placers.
-    println!("PORTABLE_PARITY compared={compared} logs={logs} leaves={leaves}");
-    assert!(compared > 0, "the sample compared no generated blocks");
-    assert!(logs > 0, "the sample compared no tree trunk blocks");
-    assert!(leaves > 0, "the sample compared no tree leaf blocks");
+    steel_worldgen::vegetation::set_parity_feature_group(None);
 }
 
 /// Two chunks where the portable slice is known to disagree with the native
@@ -1058,8 +1069,10 @@ fn portable_features_match_native() {
 #[test]
 #[ignore = "known divergences, kept as reproductions until they are fixed"]
 fn known_portable_feature_divergences() {
-    assert_portable_features_match_native(7, 50, -98, "meadow");
-    assert_portable_features_match_native(12345, -26, -20, "ocean");
+    steel_worldgen::vegetation::set_parity_feature_group(None);
+    assert_portable_features_match_native(1, -124, -128, "taiga, trees and ground together");
+    assert_portable_features_match_native(7, 50, -98, "meadow ground vegetation");
+    assert_portable_features_match_native(12345, -26, -20, "ocean carvers");
 }
 
 /// What one fixture actually put in front of the comparison.
@@ -1084,6 +1097,7 @@ fn assert_portable_features_match_native(
 ) -> ParityCounts {
     use crate::bootstrap::init_globals_once;
     use crate::worldgen::OverworldGenerator;
+    use crate::chunk::heightmap::HeightmapType;
     use std::collections::BTreeMap;
     use steel_registry::REGISTRY;
     use steel_utils::{BlockPos, BlockStateId};
@@ -1193,13 +1207,9 @@ fn assert_portable_features_match_native(
     // The selection is the portable slice's own answer, not a copy of it, so
     // the two sides cannot drift into comparing different feature sets.
     let mut selected = FxHashSet::default();
-    let only = std::env::var("PARITY_ONLY_FEATURE").ok();
+    // The restriction lives in the portable slice itself, so both sides of the
+    // comparison honour it and cannot end up comparing different feature sets.
     for (_, feature) in REGISTRY.placed_features.iter() {
-        if let Some(only) = &only
-            && feature.key.path.as_ref() != only.as_str()
-        {
-            continue;
-        }
         if steel_worldgen::vegetation::is_portable_sparse_feature(&REGISTRY, feature) {
             selected.insert(feature.key.clone());
         }
@@ -1276,6 +1286,35 @@ fn assert_portable_features_match_native(
             "{label} at seed {SEED} chunk ({CHUNK_X}, {CHUNK_Z}): pre-feature terrain differs at {} positions, first={:?}",
             mismatches.len(),
             &mismatches[..mismatches.len().min(6)]
+        );
+
+        // The surface heightmap steers where ground vegetation lands, so it has
+        // to agree too, and a block-for-block equal chunk does not guarantee it.
+        let native_chunk = holders
+            .get(&(CHUNK_X, CHUNK_Z))
+            .expect("native central chunk holder must exist")
+            .try_chunk(ChunkStatus::Carvers)
+            .expect("native central chunk must exist before Features");
+        native_chunk.prime_final_heightmaps();
+        let mut height_mismatches = Vec::new();
+        for local_z in 0..16 {
+            for local_x in 0..16 {
+                let x = CHUNK_X * 16 + local_x;
+                let z = CHUNK_Z * 16 + local_z;
+                let native_height =
+                    native_chunk.generation_height_at(HeightmapType::WorldSurfaceWg, local_x as usize, local_z as usize);
+                let portable_height =
+                    portable_terrain.world_surface_wg[(local_z * 16 + local_x) as usize];
+                if native_height != portable_height {
+                    height_mismatches.push((x, z, native_height, portable_height));
+                }
+            }
+        }
+        assert!(
+            height_mismatches.is_empty(),
+            "{label} at seed {SEED} chunk ({CHUNK_X}, {CHUNK_Z}): pre-feature WORLD_SURFACE_WG differs at {} columns (x, z, native, portable), first={:?}",
+            height_mismatches.len(),
+            &height_mismatches[..height_mismatches.len().min(8)]
         );
     }
 
