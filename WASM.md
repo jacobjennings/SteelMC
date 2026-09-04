@@ -81,13 +81,49 @@ things it carried. It was renamed when ice spikes joined them, because a
 consumer that assumed vegetation would have drawn a packed ice spire as a
 crossed foliage sprite.
 
-Which features run in the browser is an explicit allowlist in
-`steel-worldgen::vegetation::is_portable_sparse_feature`, not a capability
-probe. The portable slice implements part of the vanilla Features stage, and
-running a feature whose configured kind is unimplemented would drop its blocks
-silently. Vanilla seeds each feature from its own index rather than
-sequentially, so a skipped feature does not disturb the randomness of the ones
-that run.
+The list is a palette. `generatedBlockPalette` holds each distinct state once,
+`generatedBlockPositions` holds a flat `x, y, z` triple per placement, and
+`generatedBlockIndices` holds one palette index per placement. A tile in an ice
+spikes biome carries tens of thousands of placements drawn from two distinct
+states, and repeating the identifier strings on each one cost more than every
+other field in the response combined. Measured on one such tile set, the
+palette took the response from 5,588,691 bytes to 1,556,501.
+
+Which features run in the browser is decided by
+`steel-worldgen::vegetation::is_portable_sparse_feature`, which walks a
+feature's placement modifiers, its configured kind, its providers, its block
+predicates, and the blocks it would place, and answers yes only when every part
+is supported. It must stay conservative in one direction: answering yes for a
+feature the slice cannot finish would place some of its blocks and drop the
+rest, which is worse than placing none. Vanilla seeds each feature from its own
+index rather than sequentially, so refusing a feature does not disturb the
+randomness of the ones that run.
+
+Thirty-nine of the two hundred and sixty-two vanilla placed features qualify.
+What is still refused, and why:
+
+- **Trees other than cherry.** The tree feature is implemented for the cherry
+  trunk and foliage placers only. Nine other trunk placers (straight, forking,
+  giant, fancy, dark oak, mega jungle, bending, upwards branching) and nine
+  other foliage placers (blob, spruce, pine, acacia, bush, fancy, jungle, mega
+  pine, random spread) have to be ported before an oak or a birch can grow.
+  The scaffolding around them is already generic and shared with the cherry
+  path: height clipping, foliage attachments, the trunk and foliage block sets,
+  the leaf distance pass, and the decorators. Straight plus blob alone would
+  unlock oak, birch and jungle, which is most of the missing canopy.
+  These placers consume random numbers in a fixed order, so the port has to be
+  checked against the native runner rather than reviewed by eye.
+  `SurfaceSampler::selected_vegetation_transaction_snapshot` exists for exactly
+  that comparison.
+- **Mushrooms.** Survival depends on the light level at the placement position
+  and there is no lighting stage. Guessing would carpet daylit meadows.
+- **Column plants** such as sugar cane, cactus, kelp and bamboo. These are
+  separate configured feature kinds, not a per-block survival rule.
+- **Attached and hanging blocks** such as vines and glow lichen. They need a
+  face-sturdiness query the slice does not implement.
+- **Anything using a height range, an environment scan, a per-layer count, or a
+  noise-based count.** These modifiers need world state the slice does not
+  carry, which is most of the ore and underground decoration set.
 
 ### Final-surface and foliage boundary
 
