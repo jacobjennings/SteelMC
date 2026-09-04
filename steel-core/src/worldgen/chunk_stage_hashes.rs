@@ -1005,19 +1005,73 @@ fn portable_carvers_match_native_cherry_grove_fixture() {
 /// not claim full Features-stage parity: native also runs co-resident features
 /// which can change later placement eligibility through shared writes.
 #[test]
-fn portable_selected_features_match_native_cherry_grove_fixture() {
-    use std::collections::BTreeMap;
+fn portable_features_match_native() {
+    // A stated sample rather than one lucky chunk. Cherry grove covers the
+    // cherry placers, grove covers the straight trunk with spruce and pine
+    // foliage, and taiga and forest cover chunks whose biomes list features the
+    // portable slice must refuse, which is where a wrong refusal would show.
+    let mut compared = 0usize;
+    let mut logs = 0usize;
+    let mut leaves = 0usize;
+    for (seed, chunk_x, chunk_z, label) in [
+        (1_u64, -108_i32, -36_i32, "cherry grove"),
+        (1, -128, -128, "grove"),
+        (1, -124, -128, "taiga"),
+        (1, 124, -128, "forest"),
+        (12345, 4, -104, "grove"),
+        (12345, -120, -128, "birch forest"),
+        (7, 100, 20, "grove"),
+        (7, 76, -92, "taiga"),
+    ] {
+        let counts = assert_portable_features_match_native(seed, chunk_x, chunk_z, label);
+        compared += counts.compared;
+        logs += counts.logs;
+        leaves += counts.leaves;
+    }
+    // A comparison that compares nothing passes for the wrong reason. The
+    // sample must actually exercise trunks and canopies, which is the whole
+    // point of porting the trunk and foliage placers.
+    println!("PORTABLE_PARITY compared={compared} logs={logs} leaves={leaves}");
+    assert!(compared > 0, "the sample compared no generated blocks");
+    assert!(logs > 0, "the sample compared no tree trunk blocks");
+    assert!(leaves > 0, "the sample compared no tree leaf blocks");
+}
 
+/// What one fixture actually put in front of the comparison.
+struct ParityCounts {
+    compared: usize,
+    logs: usize,
+    leaves: usize,
+}
+
+/// Compares every feature the portable slice claims against the native runner.
+///
+/// Zero tolerance: the two sides must agree on the block state at every
+/// position, in both directions. The selected feature set comes from the
+/// portable slice itself so the two sides cannot compare different work, and
+/// the portable output is additionally required to stay inside the block list
+/// the comparison covers, so a block outside it cannot slip through unchecked.
+fn assert_portable_features_match_native(
+    seed: u64,
+    chunk_x: i32,
+    chunk_z: i32,
+    label: &str,
+) -> ParityCounts {
     use crate::bootstrap::init_globals_once;
     use crate::worldgen::OverworldGenerator;
+    use std::collections::BTreeMap;
     use steel_registry::REGISTRY;
     use steel_utils::{BlockPos, BlockStateId};
     use steel_worldgen::biomes::BiomeSourceKind;
     use steel_worldgen::surface_sampler::{SurfaceDimension, SurfaceSampler};
 
-    const SEED: u64 = 1;
-    const CHUNK_X: i32 = -108;
-    const CHUNK_Z: i32 = -36;
+    let seed_value = seed;
+    #[expect(non_snake_case, reason = "keeps the fixture body's original names")]
+    let SEED = seed_value;
+    #[expect(non_snake_case, reason = "keeps the fixture body's original names")]
+    let CHUNK_X = chunk_x;
+    #[expect(non_snake_case, reason = "keeps the fixture body's original names")]
+    let CHUNK_Z = chunk_z;
 
     init_globals_once();
     let thread_pool = Arc::new(
@@ -1111,14 +1165,41 @@ fn portable_selected_features_match_native_cherry_grove_fixture() {
         height,
     ));
     let source_positions = vec![(CHUNK_X, CHUNK_Z)];
-    let selected = [
-        Identifier::vanilla_static("trees_cherry"),
-        Identifier::vanilla_static("flower_cherry"),
-        Identifier::vanilla_static("patch_tall_grass_2"),
-        Identifier::vanilla_static("patch_grass_plain"),
-    ]
-    .into_iter()
-    .collect::<FxHashSet<_>>();
+    // The selection is the portable slice's own answer, not a copy of it, so
+    // the two sides cannot drift into comparing different feature sets.
+    let mut selected = FxHashSet::default();
+    for (_, feature) in REGISTRY.placed_features.iter() {
+        if steel_worldgen::vegetation::is_portable_sparse_feature(&REGISTRY, feature) {
+            selected.insert(feature.key.clone());
+        }
+    }
+    assert!(
+        !selected.is_empty(),
+        "the portable slice must claim at least one feature"
+    );
+    // Read the centre chunk before any feature runs. Comparing final chunk
+    // contents instead would sweep in every block the surface stage placed,
+    // which is how the dirt under a tree trunk gets confused with the dirt the
+    // whole hillside is made of.
+    let mut native_before = BTreeMap::new();
+    {
+        let chunk = holders
+            .get(&(CHUNK_X, CHUNK_Z))
+            .expect("native central chunk holder must exist")
+            .try_chunk(ChunkStatus::Carvers)
+            .expect("native central chunk must exist before Features");
+        for local_y in 0..height {
+            for local_z in 0..16 {
+                for local_x in 0..16 {
+                    let position = (CHUNK_X * 16 + local_x, min_y + local_y, CHUNK_Z * 16 + local_z);
+                    let state =
+                        chunk.get_block_state(BlockPos::new(position.0, position.1, position.2));
+                    native_before.insert(position, state);
+                }
+            }
+        }
+    }
+
     let mut generated_positions = FxHashSet::default();
     generate_selected_features_for_positions(
         &source_positions,
@@ -1134,19 +1215,6 @@ fn portable_selected_features_match_native_cherry_grove_fixture() {
         },
     );
 
-    let is_portable_vegetation = |state: BlockStateId| {
-        REGISTRY.blocks.by_state_id(state).is_some_and(|block| {
-            matches!(
-                block.key.to_string().as_str(),
-                "minecraft:cherry_log"
-                    | "minecraft:cherry_leaves"
-                    | "minecraft:bee_nest"
-                    | "minecraft:pink_petals"
-                    | "minecraft:short_grass"
-                    | "minecraft:tall_grass"
-            )
-        })
-    };
     let canonical_state = |state: BlockStateId| {
         let block = REGISTRY
             .blocks
@@ -1167,48 +1235,36 @@ fn portable_selected_features_match_native_cherry_grove_fixture() {
             )
         }
     };
+    // Everything the selected features changed in the centre chunk, and nothing
+    // else. No block allowlist, so nothing can escape the comparison.
     let mut native = BTreeMap::new();
     let native_chunk = holders
         .get(&(CHUNK_X, CHUNK_Z))
         .expect("native central chunk holder must exist")
         .try_chunk(ChunkStatus::Carvers)
         .expect("native central chunk must remain available after Features");
-    for local_y in 0..height {
-        for local_z in 0..16 {
-            for local_x in 0..16 {
-                let x = CHUNK_X * 16 + local_x;
-                let y = min_y + local_y;
-                let z = CHUNK_Z * 16 + local_z;
-                let state = native_chunk.get_block_state(BlockPos::new(x, y, z));
-                if is_portable_vegetation(state) {
-                    native.insert((x, y, z), canonical_state(state));
-                }
-            }
+    for (&position, &before) in &native_before {
+        let after = native_chunk.get_block_state(BlockPos::new(position.0, position.1, position.2));
+        if after != before {
+            native.insert(position, canonical_state(after));
         }
     }
+    // The portable side reports the positions it wrote. A write that stored the
+    // state already there is not a change, so drop those to match the native
+    // diff. The two sides share a pre-feature terrain, which the carver parity
+    // fixture asserts separately.
     let portable = SurfaceSampler::new(SEED, SurfaceDimension::Overworld)
         .selected_vegetation_transaction_snapshot(CHUNK_X, CHUNK_Z)
         .into_iter()
-        .filter(|block| {
-            block.x >= CHUNK_X * 16
-                && block.x < (CHUNK_X + 1) * 16
-                && block.z >= CHUNK_Z * 16
-                && block.z < (CHUNK_Z + 1) * 16
-                && matches!(
-                    block.block.as_str(),
-                    "minecraft:cherry_log"
-                        | "minecraft:cherry_leaves"
-                        | "minecraft:bee_nest"
-                        | "minecraft:pink_petals"
-                        | "minecraft:short_grass"
-                        | "minecraft:tall_grass"
-                )
+        .filter_map(|block| {
+            let position = (block.x, block.y, block.z);
+            let before = native_before.get(&position)?;
+            (canonical_state(*before) != block.state).then_some((position, block.state))
         })
-        .map(|block| ((block.x, block.y, block.z), block.state))
         .collect::<BTreeMap<_, _>>();
     assert!(
-        !native.is_empty(),
-        "native selected fixture emitted no vegetation states"
+        !native.is_empty() || portable.is_empty(),
+        "{label} at seed {SEED}: portable emitted states where native emitted none"
     );
     if portable != native {
         let portable_only = portable
@@ -1222,10 +1278,19 @@ fn portable_selected_features_match_native_cherry_grove_fixture() {
             .take(12)
             .collect::<Vec<_>>();
         panic!(
-            "portable selected vegetation differs from native selected Features: portable={} native={} portable-first={portable_only:?} native-first={native_only:?}",
+            "{label} at seed {SEED} chunk ({CHUNK_X}, {CHUNK_Z}): portable features differ from native: portable={} native={} portable-first={portable_only:?} native-first={native_only:?}",
             portable.len(),
             native.len(),
         );
+    }
+
+    ParityCounts {
+        compared: native.len(),
+        logs: native.values().filter(|state| state.ends_with("_log") || state.contains("_log[")).count(),
+        leaves: native
+            .values()
+            .filter(|state| state.ends_with("_leaves") || state.contains("_leaves["))
+            .count(),
     }
 }
 

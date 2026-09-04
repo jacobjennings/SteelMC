@@ -658,6 +658,37 @@ impl VegetationStage {
                     modifier_index + 1,
                 )
             }
+            // Vanilla `EnvironmentScanPlacement`: step from the origin until the
+            // target condition holds, then place there. Grove spruces use it to
+            // climb out of powder snow onto the surface above.
+            PlacementModifier::EnvironmentScan {
+                direction_of_search,
+                target_condition,
+                allowed_search_condition,
+                max_steps,
+            } => {
+                let Some(position) = self.environment_scan_position(
+                    host,
+                    registry,
+                    origin,
+                    *direction_of_search,
+                    target_condition,
+                    allowed_search_condition.as_ref(),
+                    *max_steps,
+                ) else {
+                    return false;
+                };
+                self.place_placed_feature_data(
+                    host,
+                    registry,
+                    random,
+                    position,
+                    feature,
+                    key,
+                    writes,
+                    modifier_index + 1,
+                )
+            }
             PlacementModifier::RarityFilter { chance } => {
                 assert!(
                     *chance > 0,
@@ -749,7 +780,7 @@ impl VegetationStage {
                 true
             }
             ConfiguredFeatureKind::Tree(config) => {
-                place_cherry_tree(host, registry, random, config, origin, writes)
+                place_tree(host, registry, random, config, origin, writes)
             }
             ConfiguredFeatureKind::Spike(config) => {
                 self.place_spike(host, registry, random, config, origin, writes)
@@ -1074,6 +1105,56 @@ impl VegetationStage {
             .any(|key| key == feature_key)
     }
 
+    /// Vanilla `EnvironmentScanPlacement.getPositions`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors vanilla environment scan state"
+    )]
+    fn environment_scan_position<H: VegetationBlockAccess>(
+        &self,
+        host: &mut H,
+        registry: &Registry,
+        origin: BlockPos,
+        direction_of_search: Direction,
+        target_condition: &BlockPredicate,
+        allowed_search_condition: Option<&BlockPredicate>,
+        max_steps: i32,
+    ) -> Option<BlockPos> {
+        assert!(
+            max_steps > 0,
+            "environment scan max_steps must be positive, got {max_steps}"
+        );
+        let mut position = origin;
+        if !self.test_optional_block_predicate(host, registry, allowed_search_condition, position) {
+            return None;
+        }
+        for _ in 0..max_steps {
+            if self.test_block_predicate(host, registry, target_condition, position) {
+                return Some(position);
+            }
+            position = position.relative(direction_of_search);
+            if position.y() < host.min_y() || position.y() >= host.max_y_exclusive() {
+                return None;
+            }
+            if !self.test_optional_block_predicate(host, registry, allowed_search_condition, position)
+            {
+                break;
+            }
+        }
+        self.test_block_predicate(host, registry, target_condition, position)
+            .then_some(position)
+    }
+
+    fn test_optional_block_predicate<H: VegetationBlockAccess>(
+        &self,
+        host: &mut H,
+        registry: &Registry,
+        predicate: Option<&BlockPredicate>,
+        origin: BlockPos,
+    ) -> bool {
+        predicate.is_none_or(|predicate| self.test_block_predicate(host, registry, predicate, origin))
+    }
+
     fn test_block_predicate<H: VegetationBlockAccess>(
         &self,
         host: &mut H,
@@ -1127,6 +1208,9 @@ impl VegetationStage {
 
 /// Whether the portable slice can generate a placed feature completely.
 ///
+/// Public so the native parity test can select exactly the same features. The
+/// two sides comparing different sets would make the comparison meaningless.
+///
 /// This used to be a list of six feature names. A name list was safe but it was
 /// also the reason every forest outside a cherry grove was bare: a feature the
 /// slice could have run perfectly was skipped because nobody had added its
@@ -1139,7 +1223,7 @@ impl VegetationStage {
 /// anything it does not recognise. Vanilla seeds each feature from its own
 /// index rather than sequentially, so refusing a feature does not disturb the
 /// randomness of the ones that do run.
-fn is_portable_sparse_feature(registry: &Registry, feature: PlacedFeatureEntryRef) -> bool {
+pub fn is_portable_sparse_feature(registry: &Registry, feature: PlacedFeatureEntryRef) -> bool {
     placed_feature_is_portable(registry, &feature.data, 0)
 }
 
@@ -1173,6 +1257,18 @@ fn placement_modifier_is_portable(registry: &Registry, modifier: &PlacementModif
         | PlacementModifier::SurfaceWaterDepthFilter { .. } => true,
         PlacementModifier::BlockPredicateFilter { predicate } => {
             block_predicate_is_portable(registry, predicate)
+        }
+        PlacementModifier::EnvironmentScan {
+            target_condition,
+            allowed_search_condition,
+            max_steps,
+            ..
+        } => {
+            *max_steps > 0
+                && block_predicate_is_portable(registry, target_condition)
+                && allowed_search_condition
+                    .as_ref()
+                    .is_none_or(|predicate| block_predicate_is_portable(registry, predicate))
         }
         // Every remaining modifier needs world state the slice does not carry:
         // a vertical height provider, a column scan, a per-layer count, or the
@@ -1213,13 +1309,20 @@ fn configured_feature_is_portable(
             .features
             .iter()
             .all(|entry| placed_feature_ref_is_portable(registry, entry, depth + 1)),
-        // The tree feature is implemented for the cherry trunk and foliage
-        // placers only. Every other tree in the game still needs its placers
-        // ported, which is why forests outside a cherry grove have no canopy.
+        // A tree runs only when its trunk placer, its foliage placer and every
+        // decorator are ported. The unported placers are listed in WASM.md with
+        // the reason each is still missing.
         ConfiguredFeatureKind::Tree(config) => {
-            matches!(config.trunk_placer, TrunkPlacer::Cherry(_))
-                && matches!(config.foliage_placer, FoliagePlacer::Cherry(_))
-                && config.root_placer.is_none()
+            matches!(
+                config.trunk_placer,
+                TrunkPlacer::Cherry(_) | TrunkPlacer::Straight(_)
+            ) && matches!(
+                config.foliage_placer,
+                FoliagePlacer::Cherry(_)
+                    | FoliagePlacer::Blob(_)
+                    | FoliagePlacer::Pine(_)
+                    | FoliagePlacer::Spruce(_)
+            ) && config.root_placer.is_none()
                 && config
                     .decorators
                     .iter()
@@ -1482,6 +1585,8 @@ fn test_provider_predicate<H: VegetationBlockAccess>(
 struct FoliageAttachment {
     pos: BlockPos,
     radius_offset: i32,
+    /// Vanilla's two-by-two trunk flag. Only the giant placers set it.
+    double_trunk: bool,
 }
 
 #[derive(Default)]
@@ -1608,7 +1713,16 @@ impl TreePlacement {
     }
 }
 
-fn place_cherry_tree<H: VegetationBlockAccess>(
+/// Vanilla `TreeFeature`, for the trunk and foliage placers the slice supports.
+///
+/// The random number order here is the whole point of the function. Vanilla
+/// draws the tree height, then the foliage height, then the foliage radius,
+/// then whatever the trunk placer needs, then whatever the foliage placer needs
+/// for each attachment. Reordering any of it produces trees that look entirely
+/// reasonable and are not the trees the seed makes, so this mirrors
+/// `TreeFeature.doPlace` step for step and is checked against the native runner
+/// rather than by eye.
+fn place_tree<H: VegetationBlockAccess>(
     host: &mut H,
     registry: &Registry,
     random: &mut WorldgenRandom,
@@ -1616,26 +1730,31 @@ fn place_cherry_tree<H: VegetationBlockAccess>(
     origin: BlockPos,
     writes: &mut Vec<VegetationBlock>,
 ) -> bool {
-    let (TrunkPlacer::Cherry(trunk_placer), FoliagePlacer::Cherry(foliage_placer)) =
-        (&config.trunk_placer, &config.foliage_placer)
-    else {
-        return false;
-    };
     if config.root_placer.is_some() {
         return false;
     }
+    let Some((base_height, height_rand_a, height_rand_b)) = trunk_placer_base(&config.trunk_placer)
+    else {
+        return false;
+    };
 
-    let tree_height = trunk_placer.base_height
-        + random.next_i32_bounded(trunk_placer.height_rand_a + 1)
-        + random.next_i32_bounded(trunk_placer.height_rand_b + 1);
-    let foliage_height = foliage_placer.height.sample(random);
-    let leaf_radius = foliage_placer.radius.sample(random);
+    let tree_height = base_height
+        + random.next_i32_bounded(height_rand_a + 1)
+        + random.next_i32_bounded(height_rand_b + 1);
+    let Some(foliage_height) = tree_foliage_height(random, tree_height, &config.foliage_placer)
+    else {
+        return false;
+    };
+    let trunk_height = tree_height - foliage_height;
+    let Some(leaf_radius) = tree_foliage_radius(random, &config.foliage_placer, trunk_height) else {
+        return false;
+    };
     let max_y = origin.y() + tree_height + 1;
     if origin.y() < host.min_y() + 1 || max_y > host.max_y_exclusive() {
         return false;
     }
 
-    let clipped_height = max_free_cherry_tree_height(host, tree_height, origin, config);
+    let clipped_height = max_free_tree_height(host, tree_height, origin, config);
     let min_clipped_height = match &config.minimum_size {
         FeatureSize::TwoLayers(size) => size.min_clipped_height,
         FeatureSize::ThreeLayers(size) => size.min_clipped_height,
@@ -1647,24 +1766,36 @@ fn place_cherry_tree<H: VegetationBlockAccess>(
     }
 
     let mut placement = TreePlacement::default();
-    let attachments = place_cherry_tree_trunk(
-        host,
-        registry,
-        random,
-        clipped_height,
-        origin,
-        config,
-        trunk_placer,
-        writes,
-        &mut placement,
-    );
+    let attachments = match &config.trunk_placer {
+        TrunkPlacer::Cherry(placer) => place_cherry_tree_trunk(
+            host,
+            registry,
+            random,
+            clipped_height,
+            origin,
+            config,
+            placer,
+            writes,
+            &mut placement,
+        ),
+        TrunkPlacer::Straight(_) => place_straight_tree_trunk(
+            host,
+            registry,
+            random,
+            clipped_height,
+            origin,
+            config,
+            writes,
+            &mut placement,
+        ),
+        _ => return false,
+    };
     for attachment in attachments {
-        create_cherry_tree_foliage(
+        create_tree_foliage(
             host,
             registry,
             random,
             config,
-            foliage_placer,
             attachment,
             foliage_height,
             leaf_radius,
@@ -1675,23 +1806,16 @@ fn place_cherry_tree<H: VegetationBlockAccess>(
     if placement.trunks.entries.is_empty() && placement.foliage.entries.is_empty() {
         return false;
     }
-    for decorator in &config.decorators {
-        match decorator {
-            TreeDecorator::Beehive { probability } => place_beehive_decorator(
-                host,
-                registry,
-                random,
-                *probability,
-                writes,
-                &mut placement,
-            ),
-            unsupported => panic!(
-                "sparse cherry vegetation does not yet support tree decorator {unsupported:?}"
-            ),
-        }
-    }
+    place_tree_decorators(
+        host,
+        registry,
+        random,
+        &config.decorators,
+        writes,
+        &mut placement,
+    );
     if let Some(bounds) = TreeBounds::from_placement(&placement) {
-        update_cherry_leaf_distances(host, writes, bounds, &placement);
+        update_tree_leaf_distances(host, writes, bounds, &placement);
     }
     true
 }
@@ -1700,7 +1824,7 @@ fn place_cherry_tree<H: VegetationBlockAccess>(
 /// generated foliage volume.  Shape-edge notifications in native only schedule
 /// future ticks for this cherry configuration; the deterministic final state
 /// relevant to the sparse response is the distance propagation below.
-fn update_cherry_leaf_distances<H: VegetationBlockAccess>(
+fn update_tree_leaf_distances<H: VegetationBlockAccess>(
     host: &mut H,
     writes: &mut Vec<VegetationBlock>,
     bounds: TreeBounds,
@@ -1799,7 +1923,367 @@ fn tree_size_at_height(size: &FeatureSize, tree_height: i32, y: i32) -> i32 {
     }
 }
 
-fn max_free_cherry_tree_height<H: VegetationBlockAccess>(
+/// Base height fields shared by every non-bending trunk placer.
+///
+/// Returns `None` for the placers the slice has not ported, which is what keeps
+/// an unported tree from generating a half-formed trunk.
+const fn trunk_placer_base(placer: &TrunkPlacer) -> Option<(i32, i32, i32)> {
+    match placer {
+        TrunkPlacer::Straight(base) => {
+            Some((base.base_height, base.height_rand_a, base.height_rand_b))
+        }
+        TrunkPlacer::Cherry(cherry) => Some((
+            cherry.base_height,
+            cherry.height_rand_a,
+            cherry.height_rand_b,
+        )),
+        _ => None,
+    }
+}
+
+/// Vanilla `FoliagePlacer.foliageHeight`, for the ported placers.
+fn tree_foliage_height(
+    random: &mut WorldgenRandom,
+    tree_height: i32,
+    placer: &FoliagePlacer,
+) -> Option<i32> {
+    match placer {
+        FoliagePlacer::Blob(placer) => Some(placer.height.sample(random)),
+        FoliagePlacer::Pine(placer) => Some(placer.height.sample(random)),
+        FoliagePlacer::Spruce(placer) => {
+            Some((tree_height - placer.trunk_height.sample(random)).max(4))
+        }
+        FoliagePlacer::Cherry(placer) => Some(placer.height.sample(random)),
+        _ => None,
+    }
+}
+
+/// Vanilla `FoliagePlacer.foliageRadius`, for the ported placers.
+fn tree_foliage_radius(
+    random: &mut WorldgenRandom,
+    placer: &FoliagePlacer,
+    trunk_height: i32,
+) -> Option<i32> {
+    match placer {
+        FoliagePlacer::Blob(placer) => Some(placer.radius.sample(random)),
+        FoliagePlacer::Pine(placer) => {
+            Some(placer.radius.sample(random) + random.next_i32_bounded((trunk_height + 1).max(1)))
+        }
+        FoliagePlacer::Spruce(placer) => Some(placer.radius.sample(random)),
+        FoliagePlacer::Cherry(placer) => Some(placer.radius.sample(random)),
+        _ => None,
+    }
+}
+
+/// Vanilla `FoliagePlacer.offset`, for the ported placers.
+fn tree_foliage_offset(random: &mut WorldgenRandom, placer: &FoliagePlacer) -> i32 {
+    match placer {
+        FoliagePlacer::Blob(placer) => placer.offset.sample(random),
+        FoliagePlacer::Pine(placer) => placer.offset.sample(random),
+        FoliagePlacer::Spruce(placer) => placer.offset.sample(random),
+        FoliagePlacer::Cherry(placer) => placer.offset.sample(random),
+        _ => 0,
+    }
+}
+
+/// Vanilla `StraightTrunkPlacer`: one column of logs, one attachment on top.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors vanilla straight trunk placement"
+)]
+fn place_straight_tree_trunk<H: VegetationBlockAccess>(
+    host: &mut H,
+    registry: &Registry,
+    random: &mut WorldgenRandom,
+    tree_height: i32,
+    origin: BlockPos,
+    config: &TreeConfiguration,
+    writes: &mut Vec<VegetationBlock>,
+    placement: &mut TreePlacement,
+) -> Vec<FoliageAttachment> {
+    place_below_trunk_block(
+        host,
+        registry,
+        random,
+        origin.below(),
+        config,
+        writes,
+        placement,
+    );
+    for y in 0..tree_height {
+        let _ = place_tree_log(
+            host,
+            registry,
+            random,
+            origin.above_n(y),
+            config,
+            writes,
+            placement,
+        );
+    }
+    vec![FoliageAttachment {
+        pos: origin.above_n(tree_height),
+        radius_offset: 0,
+        double_trunk: false,
+    }]
+}
+
+/// Dispatches one foliage attachment to its placer.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors vanilla foliage placement state"
+)]
+fn create_tree_foliage<H: VegetationBlockAccess>(
+    host: &mut H,
+    registry: &Registry,
+    random: &mut WorldgenRandom,
+    config: &TreeConfiguration,
+    attachment: FoliageAttachment,
+    foliage_height: i32,
+    leaf_radius: i32,
+    writes: &mut Vec<VegetationBlock>,
+    placement: &mut TreePlacement,
+) {
+    match &config.foliage_placer {
+        FoliagePlacer::Cherry(placer) => create_cherry_tree_foliage(
+            host, registry, random, config, placer, attachment, foliage_height, leaf_radius,
+            writes, placement,
+        ),
+        FoliagePlacer::Blob(_) => create_blob_tree_foliage(
+            host, registry, random, config, attachment, foliage_height, leaf_radius, writes,
+            placement,
+        ),
+        FoliagePlacer::Pine(_) => create_pine_tree_foliage(
+            host, registry, random, config, attachment, foliage_height, leaf_radius, writes,
+            placement,
+        ),
+        FoliagePlacer::Spruce(_) => create_spruce_tree_foliage(
+            host, registry, random, config, attachment, foliage_height, leaf_radius, writes,
+            placement,
+        ),
+        unsupported => {
+            panic!("portable tree placement does not yet support foliage {unsupported:?}")
+        }
+    }
+}
+
+/// Vanilla `BlobFoliagePlacer`: rows that narrow as they rise.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors vanilla blob foliage placement"
+)]
+fn create_blob_tree_foliage<H: VegetationBlockAccess>(
+    host: &mut H,
+    registry: &Registry,
+    random: &mut WorldgenRandom,
+    config: &TreeConfiguration,
+    attachment: FoliageAttachment,
+    foliage_height: i32,
+    leaf_radius: i32,
+    writes: &mut Vec<VegetationBlock>,
+    placement: &mut TreePlacement,
+) {
+    let offset = tree_foliage_offset(random, &config.foliage_placer);
+    for y in (offset - foliage_height..=offset).rev() {
+        let current_radius = (leaf_radius + attachment.radius_offset - 1 - y / 2).max(0);
+        place_tree_leaves_row(
+            host,
+            registry,
+            random,
+            config,
+            attachment.pos,
+            current_radius,
+            y,
+            attachment.double_trunk,
+            writes,
+            placement,
+        );
+    }
+}
+
+/// Vanilla `PineFoliagePlacer`: a cone that widens then closes at the base.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors vanilla pine foliage placement"
+)]
+fn create_pine_tree_foliage<H: VegetationBlockAccess>(
+    host: &mut H,
+    registry: &Registry,
+    random: &mut WorldgenRandom,
+    config: &TreeConfiguration,
+    attachment: FoliageAttachment,
+    foliage_height: i32,
+    leaf_radius: i32,
+    writes: &mut Vec<VegetationBlock>,
+    placement: &mut TreePlacement,
+) {
+    let offset = tree_foliage_offset(random, &config.foliage_placer);
+    let mut current_radius = 0;
+    for y in (offset - foliage_height..=offset).rev() {
+        place_tree_leaves_row(
+            host,
+            registry,
+            random,
+            config,
+            attachment.pos,
+            current_radius,
+            y,
+            attachment.double_trunk,
+            writes,
+            placement,
+        );
+        if current_radius >= 1 && y == offset - foliage_height + 1 {
+            current_radius -= 1;
+        } else if current_radius < leaf_radius + attachment.radius_offset {
+            current_radius += 1;
+        }
+    }
+}
+
+/// Vanilla `SpruceFoliagePlacer`: stacked skirts that grow toward the base.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors vanilla spruce foliage placement"
+)]
+fn create_spruce_tree_foliage<H: VegetationBlockAccess>(
+    host: &mut H,
+    registry: &Registry,
+    random: &mut WorldgenRandom,
+    config: &TreeConfiguration,
+    attachment: FoliageAttachment,
+    foliage_height: i32,
+    leaf_radius: i32,
+    writes: &mut Vec<VegetationBlock>,
+    placement: &mut TreePlacement,
+) {
+    let offset = tree_foliage_offset(random, &config.foliage_placer);
+    let mut current_radius = random.next_i32_bounded(2);
+    let mut max_radius = 1;
+    let mut min_radius = 0;
+    for y in (-foliage_height..=offset).rev() {
+        place_tree_leaves_row(
+            host,
+            registry,
+            random,
+            config,
+            attachment.pos,
+            current_radius,
+            y,
+            attachment.double_trunk,
+            writes,
+            placement,
+        );
+        if current_radius >= max_radius {
+            current_radius = min_radius;
+            min_radius = 1;
+            max_radius = (max_radius + 1).min(leaf_radius + attachment.radius_offset);
+        } else {
+            current_radius += 1;
+        }
+    }
+}
+
+/// Vanilla `FoliagePlacer.placeLeavesRow`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors vanilla foliage row placement"
+)]
+fn place_tree_leaves_row<H: VegetationBlockAccess>(
+    host: &mut H,
+    registry: &Registry,
+    random: &mut WorldgenRandom,
+    config: &TreeConfiguration,
+    origin: BlockPos,
+    current_radius: i32,
+    y: i32,
+    double_trunk: bool,
+    writes: &mut Vec<VegetationBlock>,
+    placement: &mut TreePlacement,
+) {
+    let offset = i32::from(double_trunk);
+    for dx in -current_radius..=current_radius + offset {
+        for dz in -current_radius..=current_radius + offset {
+            if tree_foliage_should_skip_location(
+                random,
+                &config.foliage_placer,
+                dx,
+                y,
+                dz,
+                current_radius,
+                double_trunk,
+            ) {
+                continue;
+            }
+            let _ = try_place_tree_leaf(
+                host,
+                registry,
+                random,
+                config,
+                origin.offset(dx, y, dz),
+                writes,
+                placement,
+            );
+        }
+    }
+}
+
+/// Vanilla `FoliagePlacer.shouldSkipLocationSigned` plus each placer's rule.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors vanilla foliage skip dispatch"
+)]
+fn tree_foliage_should_skip_location(
+    random: &mut WorldgenRandom,
+    placer: &FoliagePlacer,
+    dx: i32,
+    y: i32,
+    dz: i32,
+    current_radius: i32,
+    double_trunk: bool,
+) -> bool {
+    let (dx, dz) = if double_trunk {
+        (dx.abs().min((dx - 1).abs()), dz.abs().min((dz - 1).abs()))
+    } else {
+        (dx.abs(), dz.abs())
+    };
+    match placer {
+        FoliagePlacer::Blob(_) => {
+            dx == current_radius
+                && dz == current_radius
+                && (random.next_i32_bounded(2) == 0 || y == 0)
+        }
+        FoliagePlacer::Pine(_) | FoliagePlacer::Spruce(_) => {
+            dx == current_radius && dz == current_radius && current_radius > 0
+        }
+        FoliagePlacer::Cherry(placer) => {
+            cherry_foliage_should_skip_location(random, placer, dx, y, dz, current_radius)
+        }
+        unsupported => panic!("portable tree placement does not skip foliage {unsupported:?}"),
+    }
+}
+
+/// Runs a tree's decorator list, for the decorators the slice supports.
+fn place_tree_decorators<H: VegetationBlockAccess>(
+    host: &mut H,
+    registry: &Registry,
+    random: &mut WorldgenRandom,
+    decorators: &[TreeDecorator],
+    writes: &mut Vec<VegetationBlock>,
+    placement: &mut TreePlacement,
+) {
+    for decorator in decorators {
+        match decorator {
+            TreeDecorator::Beehive { probability } => {
+                place_beehive_decorator(host, registry, random, *probability, writes, placement);
+            }
+            unsupported => {
+                panic!("portable tree placement does not yet support decorator {unsupported:?}")
+            }
+        }
+    }
+}
+
+fn max_free_tree_height<H: VegetationBlockAccess>(
     host: &H,
     tree_height: i32,
     origin: BlockPos,
@@ -1810,10 +2294,11 @@ fn max_free_cherry_tree_height<H: VegetationBlockAccess>(
         for x in -radius..=radius {
             for z in -radius..=radius {
                 let state = host.block_state(origin.offset(x, y, z));
+                let block = state.get_block();
                 let free = state.is_air()
-                    || state.get_block().has_tag(&BlockTag::REPLACEABLE_BY_TREES)
-                    || state.get_block().has_tag(&BlockTag::LOGS);
-                if !free {
+                    || block.has_tag(&BlockTag::REPLACEABLE_BY_TREES)
+                    || block.has_tag(&BlockTag::LOGS);
+                if !free || (!config.ignore_vines && block == &vanilla_blocks::VINE) {
                     return y - 2;
                 }
             }
@@ -1881,6 +2366,7 @@ fn place_cherry_tree_trunk<H: VegetationBlockAccess>(
         attachments.push(FoliageAttachment {
             pos: origin.above_n(trunk_height),
             radius_offset: 0,
+            double_trunk: false,
         });
     }
     let tree_direction = Direction::HORIZONTAL[random.next_i32_bounded(4) as usize];
@@ -1970,6 +2456,7 @@ fn generate_cherry_tree_branch<H: VegetationBlockAccess>(
         let distance = manhattan_distance(log_pos, branch_end_pos);
         if distance == 0 {
             return FoliageAttachment {
+                double_trunk: false,
                 pos: branch_end_pos.above(),
                 radius_offset: 0,
             };
@@ -2162,7 +2649,15 @@ fn place_cherry_leaves_row<H: VegetationBlockAccess>(
 ) {
     for dx in -current_radius..=current_radius {
         for dz in -current_radius..=current_radius {
-            if cherry_foliage_should_skip_location(random, placer, dx, y, dz, current_radius) {
+            if tree_foliage_should_skip_location(
+                random,
+                &FoliagePlacer::Cherry(placer.clone()),
+                dx,
+                y,
+                dz,
+                current_radius,
+                false,
+            ) {
                 continue;
             }
             let _ = try_place_tree_leaf(
@@ -2268,6 +2763,7 @@ fn try_place_hanging_leaf<H: VegetationBlockAccess>(
     try_place_tree_leaf(host, registry, random, config, pos, writes, placement)
 }
 
+/// Distances arrive already made positive by the shared skip dispatcher.
 fn cherry_foliage_should_skip_location(
     random: &mut WorldgenRandom,
     placer: &CherryFoliagePlacer,
@@ -2276,8 +2772,6 @@ fn cherry_foliage_should_skip_location(
     dz: i32,
     current_radius: i32,
 ) -> bool {
-    let dx = dx.abs();
-    let dz = dz.abs();
     if y == -1
         && (dx == current_radius || dz == current_radius)
         && random.next_f32() < placer.wide_bottom_layer_hole_chance
@@ -2423,6 +2917,13 @@ mod tests {
             "flower_cherry",
             "forest_flowers",
             "trees_cherry",
+            "trees_grove",
+            "spruce_on_snow",
+            "pine_on_snow",
+            "oak_checked",
+            "birch_checked",
+            "spruce_checked",
+            "pine_checked",
             "ice_spike",
             "ice_patch",
         ] {
@@ -2439,9 +2940,12 @@ mod tests {
             ("patch_sugar_cane", "block columns are a separate feature kind"),
             ("vines", "vines need a height range and a sturdy-face query"),
             ("glow_lichen", "multiface growth needs a sturdy-face query"),
-            ("trees_plains", "only the cherry trunk and foliage placers are ported"),
-            ("trees_birch", "only the cherry trunk and foliage placers are ported"),
-            ("spruce_on_snow", "only the cherry trunk and foliage placers are ported"),
+            ("trees_plains", "the fancy oak trunk and foliage placers are not ported"),
+            ("trees_birch", "the fallen tree feature is not verified against the native runner"),
+            ("trees_taiga", "the fallen tree feature is not verified against the native runner"),
+            ("fancy_oak_checked", "the fancy oak trunk and foliage placers are not ported"),
+            ("fallen_spruce_tree", "the fallen tree feature is not verified against the native runner"),
+            ("dark_oak_checked", "the dark oak trunk and foliage placers are not ported"),
         ] {
             assert!(!portable(key), "{key} should be refused: {reason}");
         }

@@ -102,19 +102,39 @@ randomness of the ones that run.
 Thirty-nine of the two hundred and sixty-two vanilla placed features qualify.
 What is still refused, and why:
 
-- **Trees other than cherry.** The tree feature is implemented for the cherry
-  trunk and foliage placers only. Nine other trunk placers (straight, forking,
-  giant, fancy, dark oak, mega jungle, bending, upwards branching) and nine
-  other foliage placers (blob, spruce, pine, acacia, bush, fancy, jungle, mega
-  pine, random spread) have to be ported before an oak or a birch can grow.
-  The scaffolding around them is already generic and shared with the cherry
-  path: height clipping, foliage attachments, the trunk and foliage block sets,
-  the leaf distance pass, and the decorators. Straight plus blob alone would
-  unlock oak, birch and jungle, which is most of the missing canopy.
-  These placers consume random numbers in a fixed order, so the port has to be
-  checked against the native runner rather than reviewed by eye.
-  `SurfaceSampler::selected_vegetation_transaction_snapshot` exists for exactly
-  that comparison.
+- **Most trees.** The straight trunk placer and the blob, pine and spruce
+  foliage placers are ported and verified, which covers oak, birch, spruce and
+  pine. Seven trunk placers (forking, giant, fancy, dark oak, mega jungle,
+  bending, upwards branching) and six foliage placers (acacia, bush, fancy,
+  jungle, mega pine, random spread) are not.
+
+  Biomes do not name a tree directly. They name a selector such as
+  `trees_taiga`, which picks between several trees, and the selector runs only
+  when every branch of it does. That is why porting four placers unlocked one
+  biome rather than nine: `trees_grove` is the only selector whose branches are
+  all supported. `trees_plains`, `trees_water`, `trees_meadow`,
+  `trees_flower_forest`, `trees_windswept_hills` and the forest selector each
+  reach a fancy oak, so the fancy trunk and foliage placers are the single
+  highest-value thing left to port.
+- **The fallen tree feature**, which blocks `trees_taiga`, `trees_snowy` and
+  `trees_birch`. It was written and then refused, because the parity fixture
+  for a taiga chunk disagreed with the native runner on five ground plants out
+  of two hundred and ninety compared blocks. Every trunk and leaf matched, and
+  the terrain under the five positions was identical grass block on both sides
+  and unchanged by any feature, so the cause is a difference in the random
+  number stream that has not been explained yet. Placing trees that are nearly
+  right is worse than placing none, so it stays refused until that is
+  understood.
+
+  Tree placers consume random numbers in a fixed order and a mistake produces
+  forests that look entirely reasonable and are not the seed's forests. Any
+  port is therefore checked against the native runner rather than reviewed by
+  eye. The fixture is `portable_features_match_native` in
+  `steel-core::worldgen::chunk_stage_hashes`. It selects exactly the features
+  the portable slice claims, compares the full set of blocks each side changed
+  with no allowlist to hide behind, and requires the two to be equal. It runs
+  eight chunks across three seeds and reports how many trunk and leaf blocks it
+  actually compared, so it cannot pass by comparing nothing.
 - **Mushrooms.** Survival depends on the light level at the placement position
   and there is no lighting stage. Guessing would carpet daylit meadows.
 - **Column plants** such as sugar cane, cactus, kelp and bamboo. These are
