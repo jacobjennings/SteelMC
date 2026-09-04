@@ -1022,6 +1022,9 @@ fn portable_features_match_native() {
         (12345, -120, -128, "birch forest"),
         (7, 100, 20, "grove"),
         (7, 76, -92, "taiga"),
+        (1, -100, -58, "meadow"),
+        (12345, 18, -98, "meadow"),
+        (1, 72, -96, "ocean"),
     ] {
         let counts = assert_portable_features_match_native(seed, chunk_x, chunk_z, label);
         compared += counts.compared;
@@ -1035,6 +1038,28 @@ fn portable_features_match_native() {
     assert!(compared > 0, "the sample compared no generated blocks");
     assert!(logs > 0, "the sample compared no tree trunk blocks");
     assert!(leaves > 0, "the sample compared no tree leaf blocks");
+}
+
+/// Two chunks where the portable slice is known to disagree with the native
+/// runner, kept as exact reproductions rather than deleted.
+///
+/// Neither is caused by a tree placer. Both were found by widening the sample
+/// above and both reproduce with every tree refused, so they are older than the
+/// tree work and were simply never sampled before.
+///
+/// - The meadow chunk disagrees on five short grass placements out of twenty.
+///   It isolates to `patch_grass_meadow` on its own, the pre-feature terrain is
+///   identical, and the native survival rule is the same `SUPPORTS_VEGETATION`
+///   check the portable slice makes, so the cause is somewhere in how the
+///   placement modifier chain is walked.
+/// - The ocean chunk disagrees on the terrain itself, before any feature runs:
+///   two blocks deep underground where the native carvers cut a cave and the
+///   portable carvers do not. That is a carver difference, not a feature one.
+#[test]
+#[ignore = "known divergences, kept as reproductions until they are fixed"]
+fn known_portable_feature_divergences() {
+    assert_portable_features_match_native(7, 50, -98, "meadow");
+    assert_portable_features_match_native(12345, -26, -20, "ocean");
 }
 
 /// What one fixture actually put in front of the comparison.
@@ -1168,7 +1193,13 @@ fn assert_portable_features_match_native(
     // The selection is the portable slice's own answer, not a copy of it, so
     // the two sides cannot drift into comparing different feature sets.
     let mut selected = FxHashSet::default();
+    let only = std::env::var("PARITY_ONLY_FEATURE").ok();
     for (_, feature) in REGISTRY.placed_features.iter() {
+        if let Some(only) = &only
+            && feature.key.path.as_ref() != only.as_str()
+        {
+            continue;
+        }
         if steel_worldgen::vegetation::is_portable_sparse_feature(&REGISTRY, feature) {
             selected.insert(feature.key.clone());
         }
@@ -1200,21 +1231,6 @@ fn assert_portable_features_match_native(
         }
     }
 
-    let mut generated_positions = FxHashSet::default();
-    generate_selected_features_for_positions(
-        &source_positions,
-        &mut generated_positions,
-        &selected,
-        FeatureGenerationInputs {
-            holders: &holders,
-            context: &context,
-            generator: &generator,
-            feature_step,
-            feature_cache_radius,
-            seed: SEED,
-        },
-    );
-
     let canonical_state = |state: BlockStateId| {
         let block = REGISTRY
             .blocks
@@ -1235,6 +1251,49 @@ fn assert_portable_features_match_native(
             )
         }
     };
+    // Feature parity means nothing if the two sides start from different
+    // ground. Establish that first, so a terrain difference is reported as a
+    // terrain difference instead of being blamed on a feature.
+    {
+        let portable_terrain = SurfaceSampler::new(SEED, SurfaceDimension::Overworld)
+            .carved_chunk_snapshot(CHUNK_X, CHUNK_Z);
+        let mut mismatches = Vec::new();
+        for (&position, &native_state) in &native_before {
+            let local_x = (position.0 - CHUNK_X * 16) as usize;
+            let local_y = (position.1 - min_y) as usize;
+            let local_z = (position.2 - CHUNK_Z * 16) as usize;
+            let portable_state = portable_terrain.states[local_y * 256 + local_z * 16 + local_x];
+            if portable_state != native_state {
+                mismatches.push((
+                    position,
+                    canonical_state(native_state),
+                    canonical_state(portable_state),
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "{label} at seed {SEED} chunk ({CHUNK_X}, {CHUNK_Z}): pre-feature terrain differs at {} positions, first={:?}",
+            mismatches.len(),
+            &mismatches[..mismatches.len().min(6)]
+        );
+    }
+
+    let mut generated_positions = FxHashSet::default();
+    generate_selected_features_for_positions(
+        &source_positions,
+        &mut generated_positions,
+        &selected,
+        FeatureGenerationInputs {
+            holders: &holders,
+            context: &context,
+            generator: &generator,
+            feature_step,
+            feature_cache_radius,
+            seed: SEED,
+        },
+    );
+
     // Everything the selected features changed in the centre chunk, and nothing
     // else. No block allowlist, so nothing can escape the comparison.
     let mut native = BTreeMap::new();

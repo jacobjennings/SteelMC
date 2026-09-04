@@ -117,24 +117,52 @@ What is still refused, and why:
   reach a fancy oak, so the fancy trunk and foliage placers are the single
   highest-value thing left to port.
 - **The fallen tree feature**, which blocks `trees_taiga`, `trees_snowy` and
-  `trees_birch`. It was written and then refused, because the parity fixture
-  for a taiga chunk disagreed with the native runner on five ground plants out
-  of two hundred and ninety compared blocks. Every trunk and leaf matched, and
-  the terrain under the five positions was identical grass block on both sides
-  and unchanged by any feature, so the cause is a difference in the random
-  number stream that has not been explained yet. Placing trees that are nearly
-  right is worse than placing none, so it stays refused until that is
-  understood.
+  `trees_birch`. It was written and refused after a taiga fixture disagreed
+  with the native runner on five ground plants. That verdict now looks wrong.
+  Widening the parity sample found the same class of disagreement on a meadow
+  chunk with every tree placer refused, and it isolates to a single ground
+  vegetation feature running alone. So the fallen tree was probably innocent
+  and deserves a second attempt, verified with the sample restricted to the
+  tree features so a known ground vegetation bug cannot be mistaken for a tree
+  bug again.
+- **The fancy trunk and foliage placers**, the large oak. They were written and
+  refused for a different reason: no fixture grows one. Among the selectors the
+  slice supports, only meadow and ocean can produce a large oak and both do so
+  rarely, and a scan of forty-nine chunks around a meadow found none. Untested
+  is not verified, so the code was removed rather than shipped unexercised.
+
+  This also corrects an earlier claim. The large oak was called the highest
+  value remaining tree work because it appears in the forest, plains, meadow,
+  flower forest, windswept hills and ocean selectors. It is not, because every
+  one of those except meadow and ocean is *also* blocked by the fallen tree.
+  The fallen tree is the real unlock for a forest or a plains canopy.
 
   Tree placers consume random numbers in a fixed order and a mistake produces
   forests that look entirely reasonable and are not the seed's forests. Any
   port is therefore checked against the native runner rather than reviewed by
   eye. The fixture is `portable_features_match_native` in
-  `steel-core::worldgen::chunk_stage_hashes`. It selects exactly the features
+  `steel-core::worldgen::chunk_stage_hashes`. It now asserts that both sides
+  start from identical pre-feature terrain before it compares any feature,
+  because feature parity measured on top of differing ground is meaningless. It selects exactly the features
   the portable slice claims, compares the full set of blocks each side changed
   with no allowlist to hide behind, and requires the two to be equal. It runs
   eight chunks across three seeds and reports how many trunk and leaf blocks it
   actually compared, so it cannot pass by comparing nothing.
+
+  Widening that sample found two disagreements that predate the tree work and
+  reproduce with every tree placer refused. Both are kept as exact
+  reproductions in `known_portable_feature_divergences`, which is ignored by
+  default:
+
+  - Seed 7, chunk (50, -98), a meadow. Five short grass placements out of
+    twenty disagree. It isolates to `patch_grass_meadow` running on its own,
+    the pre-feature terrain is identical, and the native survival rule is the
+    same block tag check the portable slice makes, so the cause is somewhere in
+    how the placement modifier chain is walked.
+  - Seed 12345, chunk (-26, -20), an ocean. The terrain disagrees before any
+    feature runs, at two blocks deep underground where the native carvers cut a
+    cave and the portable carvers do not. That is a carver difference, and the
+    only carver parity fixture until now covered a single chunk.
 - **Mushrooms.** Survival depends on the light level at the placement position
   and there is no lighting stage. Guessing would carpet daylit meadows.
 - **Column plants** such as sugar cane, cactus, kelp and bamboo. These are
