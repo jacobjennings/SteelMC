@@ -5,7 +5,7 @@
 //! `steel-registry` already bundles the vanilla template bytes, so a browser
 //! needs no new asset: it needs a reader, a rotation, and a write loop.
 //!
-//! This is the smallest honest slice of vanilla's `StructureTemplate`. What it
+//! This is the smallest workable slice of vanilla's `StructureTemplate`. What it
 //! carries:
 //!
 //! - loading one gzipped NBT template from the bundled bytes,
