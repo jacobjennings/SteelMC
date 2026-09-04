@@ -2878,6 +2878,7 @@ name = "steel-worldgen"
 version = "0.15.2+mc26.2"
 dependencies = [
  "criterion",
+ "flate2",
  "glam",
  "proc-macro2",
  "quote",
@@ -2886,6 +2887,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "simdnbt",
  "steel-math",
  "steel-registry",
  "steel-utils",

@@ -48,18 +48,20 @@ The `steel-worldgen-wasm` leaf crate exposes a reusable seeded sampler for the
 Overworld, Nether, and End. It runs the real Steel density functions and biome
 source and is integrated into the viewer through Web Workers. Its tile DTO is a
 surface height/color grid with canonical final `surfaceBlocks` IDs plus a sparse
-`generatedBlocks` list from the portable Features slice. It does not expose
-vertical cave and overhang geometry, structures, or the complete native Features
-union. The generated web package is about 7 MiB before HTTP compression.
+`generatedBlocks` list from the portable Features slice and the portable swamp
+hut and igloo piece placers. It does not expose vertical cave and overhang
+geometry, jigsaw or remaining structure families, or the complete native
+Features union. The generated web package is about 7 MiB before HTTP compression.
 
-Structure blocks are the largest remaining gap and the reason for it is a crate
-boundary, not a missing algorithm. Structure starts and piece layout live in
+Jigsaw villages and the remaining structure families are still a crate-boundary
+gap, not a missing algorithm. Structure starts and piece layout live in
 `steel-worldgen` and already reach the browser, which is how `structure_markers`
-reports exact village, portal, and stronghold positions. Every structure piece
-block placer lives in `steel-core`, which depends on Tokio, the filesystem, and
-the entity system and does not build for `wasm32-unknown-unknown`. Moving those
-placers behind a host trait, the way the Features slice already is, is what a
-browser village would take.
+reports exact village, portal, and stronghold positions. Full-detail tiles now
+place swamp hut and igloo piece blocks through a `steel-worldgen` host trait, the
+same way vegetation does. Every other structure piece placer still lives in
+`steel-core`, which depends on Tokio, the filesystem, and the entity system and
+does not build for `wasm32-unknown-unknown`. Moving those remaining placers
+behind the same host trait is what a browser village would take.
 
 ### Generated-block payload
 

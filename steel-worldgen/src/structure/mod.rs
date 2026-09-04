@@ -25,6 +25,8 @@ pub mod ocean_monument;
 pub mod ocean_ruin;
 mod piece;
 pub mod placement;
+/// Portable swamp-hut and igloo piece placement for static terrain hosts.
+pub mod portable;
 pub mod ruined_portal;
 pub mod shipwreck;
 pub mod single_piece;
@@ -46,6 +48,10 @@ pub use generator::{
     FixedStructureBiomeProvider, StructureBiomeProvider, StructureGenerator,
     StructureGeneratorAssets, StructureLocateCandidate, StructureLocatePlacement,
     StructureLocatePlan, squared_distance,
+};
+pub use portable::{
+    PORTABLE_STRUCTURE_IDS, is_portable_structure, place_portable_piece,
+    place_portable_starts_in_chunk, portable_structure_sets,
 };
 pub use start::{StructureReferenceMap, StructureReferenceSet, StructureStart, StructureStartMap};
 pub(crate) use utils::{make_oriented_piece_bounding_box, random_horizontal_direction};

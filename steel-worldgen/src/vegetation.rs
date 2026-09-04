@@ -23,16 +23,16 @@ use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use steel_registry::biome::BiomeRef;
+use steel_registry::blocks::Block;
 use steel_registry::blocks::{
     block_state_ext::BlockStateExt as _,
     properties::{BlockStateProperties, DoubleBlockHalf},
 };
-use steel_registry::blocks::Block;
 use steel_registry::feature::{
     AttachedToLogsDecorator, BlockPredicate, BlockStateData, BlockStateProvider,
-    CherryFoliagePlacer, CherryTrunkPlacer, FallenTreeConfiguration,
-    ConfiguredFeatureKind, ConfiguredFeatureRef, DiskConfiguration, FeatureHeightmap, FeatureSize,
-    FoliagePlacer, PlacedFeatureData, PlacedFeatureEntryRef, PlacedFeatureRef, PlacementModifier,
+    CherryFoliagePlacer, CherryTrunkPlacer, ConfiguredFeatureKind, ConfiguredFeatureRef,
+    DiskConfiguration, FallenTreeConfiguration, FeatureHeightmap, FeatureSize, FoliagePlacer,
+    PlacedFeatureData, PlacedFeatureEntryRef, PlacedFeatureRef, PlacementModifier,
     SpikeConfiguration, TreeConfiguration, TreeDecorator, TrunkPlacer,
 };
 use steel_registry::vanilla_block_tags::BlockTag;
@@ -529,14 +529,7 @@ impl VegetationStage {
         modifier_index: usize,
     ) -> bool {
         let Some(modifier) = feature.placement.get(modifier_index) else {
-            return self.place_configured_feature(
-                host,
-                registry,
-                random,
-                origin,
-                feature,
-                writes,
-            );
+            return self.place_configured_feature(host, registry, random, origin, feature, writes);
         };
         match modifier {
             PlacementModifier::Biome => {
@@ -800,7 +793,14 @@ impl VegetationStage {
             ConfiguredFeatureKind::RandomSelector(config) => {
                 for weighted in &config.features {
                     if random.next_f32() < weighted.chance {
-                        return self.place_nested(host, registry, random, origin, &weighted.feature, writes);
+                        return self.place_nested(
+                            host,
+                            registry,
+                            random,
+                            origin,
+                            &weighted.feature,
+                            writes,
+                        );
                     }
                 }
                 self.place_nested(host, registry, random, origin, &config.default, writes)
@@ -1141,8 +1141,12 @@ impl VegetationStage {
             if position.y() < host.min_y() || position.y() >= host.max_y_exclusive() {
                 return None;
             }
-            if !self.test_optional_block_predicate(host, registry, allowed_search_condition, position)
-            {
+            if !self.test_optional_block_predicate(
+                host,
+                registry,
+                allowed_search_condition,
+                position,
+            ) {
                 break;
             }
         }
@@ -1157,7 +1161,8 @@ impl VegetationStage {
         predicate: Option<&BlockPredicate>,
         origin: BlockPos,
     ) -> bool {
-        predicate.is_none_or(|predicate| self.test_block_predicate(host, registry, predicate, origin))
+        predicate
+            .is_none_or(|predicate| self.test_block_predicate(host, registry, predicate, origin))
     }
 
     fn test_block_predicate<H: VegetationBlockAccess>(
@@ -1361,11 +1366,9 @@ fn configured_feature_is_portable(
                 )
             }),
         ConfiguredFeatureKind::RandomSelector(config) => {
-            config
-                .features
-                .iter()
-                .all(|weighted| placed_feature_ref_is_portable(registry, &weighted.feature, depth + 1))
-                && placed_feature_ref_is_portable(registry, &config.default, depth + 1)
+            config.features.iter().all(|weighted| {
+                placed_feature_ref_is_portable(registry, &weighted.feature, depth + 1)
+            }) && placed_feature_ref_is_portable(registry, &config.default, depth + 1)
         }
         ConfiguredFeatureKind::SimpleRandomSelector(config) => config
             .features
@@ -1423,9 +1426,7 @@ fn block_predicate_is_portable(registry: &Registry, predicate: &BlockPredicate) 
         | BlockPredicate::Solid { .. }
         | BlockPredicate::Replaceable { .. }
         | BlockPredicate::InsideWorldBounds { .. } => true,
-        BlockPredicate::WouldSurvive { state, .. } => {
-            provider_state_is_portable(registry, state)
-        }
+        BlockPredicate::WouldSurvive { state, .. } => provider_state_is_portable(registry, state),
         BlockPredicate::Not { predicate } => block_predicate_is_portable(registry, predicate),
         BlockPredicate::AllOf { predicates } | BlockPredicate::AnyOf { predicates } => predicates
             .iter()
@@ -1808,7 +1809,8 @@ fn place_tree<H: VegetationBlockAccess>(
         return false;
     };
     let trunk_height = tree_height - foliage_height;
-    let Some(leaf_radius) = tree_foliage_radius(random, &config.foliage_placer, trunk_height) else {
+    let Some(leaf_radius) = tree_foliage_radius(random, &config.foliage_placer, trunk_height)
+    else {
         return false;
     };
     let max_y = origin.y() + tree_height + 1;
@@ -2108,19 +2110,48 @@ fn create_tree_foliage<H: VegetationBlockAccess>(
 ) {
     match &config.foliage_placer {
         FoliagePlacer::Cherry(placer) => create_cherry_tree_foliage(
-            host, registry, random, config, placer, attachment, foliage_height, leaf_radius,
-            writes, placement,
+            host,
+            registry,
+            random,
+            config,
+            placer,
+            attachment,
+            foliage_height,
+            leaf_radius,
+            writes,
+            placement,
         ),
         FoliagePlacer::Blob(_) => create_blob_tree_foliage(
-            host, registry, random, config, attachment, foliage_height, leaf_radius, writes,
+            host,
+            registry,
+            random,
+            config,
+            attachment,
+            foliage_height,
+            leaf_radius,
+            writes,
             placement,
         ),
         FoliagePlacer::Pine(_) => create_pine_tree_foliage(
-            host, registry, random, config, attachment, foliage_height, leaf_radius, writes,
+            host,
+            registry,
+            random,
+            config,
+            attachment,
+            foliage_height,
+            leaf_radius,
+            writes,
             placement,
         ),
         FoliagePlacer::Spruce(_) => create_spruce_tree_foliage(
-            host, registry, random, config, attachment, foliage_height, leaf_radius, writes,
+            host,
+            registry,
+            random,
+            config,
+            attachment,
+            foliage_height,
+            leaf_radius,
+            writes,
             placement,
         ),
         unsupported => {
@@ -3191,14 +3222,32 @@ mod tests {
     #[test]
     fn features_needing_absent_machinery_are_refused() {
         for (key, reason) in [
-            ("brown_mushroom_normal", "mushroom survival needs a light level"),
-            ("red_mushroom_normal", "mushroom survival needs a light level"),
-            ("patch_sugar_cane", "block columns are a separate feature kind"),
+            (
+                "brown_mushroom_normal",
+                "mushroom survival needs a light level",
+            ),
+            (
+                "red_mushroom_normal",
+                "mushroom survival needs a light level",
+            ),
+            (
+                "patch_sugar_cane",
+                "block columns are a separate feature kind",
+            ),
             ("vines", "vines need a height range and a sturdy-face query"),
             ("glow_lichen", "multiface growth needs a sturdy-face query"),
-            ("trees_plains", "the fancy oak trunk and foliage placers are not ported"),
-            ("fancy_oak_checked", "the fancy oak trunk and foliage placers are not ported"),
-            ("dark_oak_checked", "the dark oak trunk and foliage placers are not ported"),
+            (
+                "trees_plains",
+                "the fancy oak trunk and foliage placers are not ported",
+            ),
+            (
+                "fancy_oak_checked",
+                "the fancy oak trunk and foliage placers are not ported",
+            ),
+            (
+                "dark_oak_checked",
+                "the dark oak trunk and foliage placers are not ported",
+            ),
             ("trees_flower_forest", "it can pick a fancy oak"),
             ("trees_windswept_hills", "it can pick a fancy oak"),
         ] {

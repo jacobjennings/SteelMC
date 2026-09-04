@@ -702,12 +702,30 @@ impl StructureGenerator {
         seed: i64,
         biome_provider: &(impl StructureBiomeProvider + Sync),
     ) -> Self {
+        Self::vanilla_single_threaded_with_structure_sets(
+            seed,
+            biome_provider,
+            load_vanilla_structure_sets(),
+        )
+    }
+
+    /// Single-threaded vanilla generator over an explicit structure-set list.
+    ///
+    /// Use this when a host only needs a bounded family, such as the portable
+    /// swamp-hut and igloo piece slice. Concentric-ring sets are still computed
+    /// when present in `structure_sets`.
+    #[must_use]
+    pub fn vanilla_single_threaded_with_structure_sets(
+        seed: i64,
+        biome_provider: &(impl StructureBiomeProvider + Sync),
+        structure_sets: Vec<(Identifier, StructureSet)>,
+    ) -> Self {
         Self::with_assets_for_ring_seed(
             seed,
             seed,
             None,
             biome_provider,
-            load_vanilla_structure_sets(),
+            structure_sets,
             StructureGeneratorAssets::vanilla(),
             None,
         )

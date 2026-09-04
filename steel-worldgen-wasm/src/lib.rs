@@ -667,7 +667,9 @@ mod tests {
             "minecraft:pink_petals",
         ] {
             assert!(
-                generated.iter().any(|(_, _, _, block, _)| block == expected),
+                generated
+                    .iter()
+                    .any(|(_, _, _, block, _)| block == expected),
                 "cherry fixture must place {expected}"
             );
         }
@@ -718,6 +720,62 @@ mod tests {
         assert!(
             max_y - min_y >= 4,
             "packed ice must span a vertical range, got {min_y} to {max_y}"
+        );
+    }
+
+    /// Swamp huts already generate, but they never reached the tile payload.
+    ///
+    /// Seed 1 chunk (-1834, -76) is a swamp-hut start. The hut is the only
+    /// portable producer of a potted red mushroom, so that block proves the
+    /// structure piece stream joined the generated-block palette.
+    #[test]
+    fn terrain_tile_serializes_swamp_hut_blocks() {
+        let generator = SteelWorldgen::new("1", "overworld", None)
+            .unwrap_or_else(|error| panic!("swamp hut generator should initialize: {error:?}"));
+        let value: serde_json::Value = serde_json::from_str(
+            &generator
+                .terrain_tile(-1834 * 16, -76 * 16, 16, 1, None)
+                .unwrap_or_else(|error| panic!("swamp hut fixture should serialize: {error:?}")),
+        )
+        .unwrap_or_else(|error| panic!("swamp hut response must be JSON: {error}"));
+        let generated = generated_blocks(&value);
+        assert!(
+            generated
+                .iter()
+                .any(|(_, _, _, block, _)| block == "minecraft:potted_red_mushroom"),
+            "swamp hut tile must place a potted red mushroom, got {} generated blocks",
+            generated.len()
+        );
+        assert!(
+            generated
+                .iter()
+                .any(|(_, _, _, block, _)| block == "minecraft:cauldron"),
+            "swamp hut tile must place a cauldron"
+        );
+    }
+
+    /// Igloos already generate, but they never reached the tile payload.
+    ///
+    /// Seed 1 chunk (-2026, 268) is an igloo start. White carpet is not a
+    /// snowy-biome surface block, so its presence proves the template piece
+    /// stream joined the generated-block palette.
+    #[test]
+    fn terrain_tile_serializes_igloo_blocks() {
+        let generator = SteelWorldgen::new("1", "overworld", None)
+            .unwrap_or_else(|error| panic!("igloo generator should initialize: {error:?}"));
+        let value: serde_json::Value = serde_json::from_str(
+            &generator
+                .terrain_tile(-2026 * 16, 268 * 16, 16, 1, None)
+                .unwrap_or_else(|error| panic!("igloo fixture should serialize: {error:?}")),
+        )
+        .unwrap_or_else(|error| panic!("igloo response must be JSON: {error}"));
+        let generated = generated_blocks(&value);
+        assert!(
+            generated
+                .iter()
+                .any(|(_, _, _, block, _)| block == "minecraft:white_carpet"),
+            "igloo tile must place white carpet, got {} generated blocks",
+            generated.len()
         );
     }
 }
@@ -847,12 +905,17 @@ impl<'a> TerrainResponse<'a> {
             .fold((first, first), |(minimum, maximum), height| {
                 (minimum.min(height), maximum.max(height))
             });
+        let generated_count = tile.vegetation_blocks.len() + tile.structure_blocks.len();
         let mut generated_block_palette: Vec<TerrainGeneratedBlockState> = Vec::new();
         let mut palette_lookup: std::collections::HashMap<(String, String), u16> =
             std::collections::HashMap::new();
-        let mut generated_block_positions = Vec::with_capacity(tile.vegetation_blocks.len() * 3);
-        let mut generated_block_indices = Vec::with_capacity(tile.vegetation_blocks.len());
-        for block in tile.vegetation_blocks {
+        let mut generated_block_positions = Vec::with_capacity(generated_count * 3);
+        let mut generated_block_indices = Vec::with_capacity(generated_count);
+        for block in tile
+            .vegetation_blocks
+            .into_iter()
+            .chain(tile.structure_blocks)
+        {
             let key = (block.block, block.state);
             let index = match palette_lookup.get(&key) {
                 Some(&index) => index,

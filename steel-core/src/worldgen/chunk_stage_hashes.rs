@@ -1042,7 +1042,10 @@ fn portable_features_match_native() {
         }
         println!("PORTABLE_PARITY group={group} compared={compared} logs={logs} leaves={leaves}");
         // A comparison that compares nothing passes for the wrong reason.
-        assert!(compared > 0, "the {group} sample compared no generated blocks");
+        assert!(
+            compared > 0,
+            "the {group} sample compared no generated blocks"
+        );
         if group == "trees" {
             assert!(logs > 0, "the tree sample compared no trunk blocks");
             assert!(leaves > 0, "the tree sample compared no leaf blocks");
@@ -1096,8 +1099,8 @@ fn assert_portable_features_match_native(
     label: &str,
 ) -> ParityCounts {
     use crate::bootstrap::init_globals_once;
-    use crate::worldgen::OverworldGenerator;
     use crate::chunk::heightmap::HeightmapType;
+    use crate::worldgen::OverworldGenerator;
     use std::collections::BTreeMap;
     use steel_registry::REGISTRY;
     use steel_utils::{BlockPos, BlockStateId};
@@ -1232,7 +1235,11 @@ fn assert_portable_features_match_native(
         for local_y in 0..height {
             for local_z in 0..16 {
                 for local_x in 0..16 {
-                    let position = (CHUNK_X * 16 + local_x, min_y + local_y, CHUNK_Z * 16 + local_z);
+                    let position = (
+                        CHUNK_X * 16 + local_x,
+                        min_y + local_y,
+                        CHUNK_Z * 16 + local_z,
+                    );
                     let state =
                         chunk.get_block_state(BlockPos::new(position.0, position.1, position.2));
                     native_before.insert(position, state);
@@ -1301,8 +1308,11 @@ fn assert_portable_features_match_native(
             for local_x in 0..16 {
                 let x = CHUNK_X * 16 + local_x;
                 let z = CHUNK_Z * 16 + local_z;
-                let native_height =
-                    native_chunk.generation_height_at(HeightmapType::WorldSurfaceWg, local_x as usize, local_z as usize);
+                let native_height = native_chunk.generation_height_at(
+                    HeightmapType::WorldSurfaceWg,
+                    local_x as usize,
+                    local_z as usize,
+                );
                 let portable_height =
                     portable_terrain.world_surface_wg[(local_z * 16 + local_x) as usize];
                 if native_height != portable_height {
@@ -1384,7 +1394,10 @@ fn assert_portable_features_match_native(
 
     ParityCounts {
         compared: native.len(),
-        logs: native.values().filter(|state| state.ends_with("_log") || state.contains("_log[")).count(),
+        logs: native
+            .values()
+            .filter(|state| state.ends_with("_log") || state.contains("_log["))
+            .count(),
         leaves: native
             .values()
             .filter(|state| state.ends_with("_leaves") || state.contains("_leaves["))

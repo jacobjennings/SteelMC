@@ -17,8 +17,12 @@ use crate::carver::{CarverBlockAccess, CarverStage};
 use crate::density::{ColumnCache, DimensionNoises, NoiseSettings};
 use crate::density_functions::{end::EndNoises, nether::NetherNoises, overworld::OverworldNoises};
 use crate::noise::NoiseChunk;
-use crate::noise::{Aquifer, AquiferResult, OreVeinifier, preliminary_surface_level};
+use crate::noise::{Aquifer, AquiferResult, LazyAquifer, OreVeinifier, preliminary_surface_level};
 use crate::noise_parameters::get_noise_parameters;
+use crate::structure::{
+    GenerationContext, StructureGenerator, StructureStart, is_portable_structure,
+    place_portable_starts_in_chunk, portable_structure_sets,
+};
 use crate::surface::{
     PreliminarySurfaceCorners, SurfaceBiomeAccess, SurfaceBlockAccess, SurfaceExtensions,
     SurfaceStage, SurfaceSystem,
@@ -122,6 +126,14 @@ pub struct SurfaceTile {
     /// and contains only the final state at each coordinate after all source
     /// chunks in this tile have been processed.
     pub vegetation_blocks: Vec<SurfaceVegetationBlock>,
+    /// Sparse final states written by portable structure piece placement.
+    ///
+    /// This is a separate vector because structure starts are a different
+    /// generation stage from vegetation and have a different cost. Full-detail
+    /// tiles fill it. Coarse and biome tiles leave it empty. The WASM
+    /// serializer merges it with `vegetation_blocks` into one generated-block
+    /// palette because the viewer reads one stream.
+    pub structure_blocks: Vec<SurfaceVegetationBlock>,
     /// Dimension minimum build height.
     pub min_y: i16,
 }
@@ -484,6 +496,38 @@ impl SurfaceSampler {
             }
         }
     }
+
+    /// Returns one isolated sparse structure-piece transaction after Surface
+    /// and Carvers. Mirrors [`Self::selected_vegetation_transaction_snapshot`]
+    /// for the portable swamp-hut and igloo families.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn selected_structure_transaction_snapshot(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+    ) -> Vec<SurfaceVegetationBlock> {
+        match self {
+            Self::Overworld(sampler) => {
+                sampler.selected_structure_transaction_snapshot(chunk_x, chunk_z)
+            }
+            Self::Nether(sampler) => {
+                sampler.selected_structure_transaction_snapshot(chunk_x, chunk_z)
+            }
+            Self::End(sampler) => sampler.selected_structure_transaction_snapshot(chunk_x, chunk_z),
+        }
+    }
+
+    /// Structure ids whose portable pieces start in this chunk.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn portable_structure_start_ids(&self, chunk_x: i32, chunk_z: i32) -> Vec<String> {
+        match self {
+            Self::Overworld(sampler) => sampler.portable_structure_start_ids(chunk_x, chunk_z),
+            Self::Nether(sampler) => sampler.portable_structure_start_ids(chunk_x, chunk_z),
+            Self::End(sampler) => sampler.portable_structure_start_ids(chunk_x, chunk_z),
+        }
+    }
 }
 
 /// Generic dimension implementation kept public so native adapters can reuse it.
@@ -496,6 +540,7 @@ pub struct DimensionSurfaceSampler<N: DimensionNoises> {
     surface_extensions: SurfaceExtensions,
     biome_zoom_seed: i64,
     vegetation_stage: VegetationStage,
+    structure_generator: StructureGenerator,
     surface_view: SurfaceView,
     biome_height_mode: BiomeHeightMode,
 }
@@ -532,6 +577,11 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             &biome_source.possible_biome_refs(),
             &REGISTRY,
         );
+        let structure_generator = StructureGenerator::vanilla_single_threaded_with_structure_sets(
+            seed as i64,
+            &biome_source,
+            portable_structure_sets(),
+        );
         Self {
             noises: Box::new(N::create(seed, &splitter, &noise_parameters)),
             biome_source,
@@ -541,6 +591,7 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             surface_extensions,
             biome_zoom_seed,
             vegetation_stage,
+            structure_generator,
             surface_view,
             biome_height_mode,
         }
@@ -622,10 +673,10 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             }
         }
 
-        let vegetation_blocks = if include_vegetation {
-            self.vegetation_tile(origin_x, origin_z, size, cache)
+        let (vegetation_blocks, structure_blocks) = if include_vegetation {
+            self.generated_blocks_tile(origin_x, origin_z, size, cache)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
         SurfaceTile {
@@ -638,6 +689,7 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             surface_blocks,
             surface_block_indices,
             vegetation_blocks,
+            structure_blocks,
             min_y: N::Settings::MIN_Y as i16,
         }
     }
@@ -760,17 +812,18 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             surface_blocks: Vec::new(),
             surface_block_indices: Vec::new(),
             vegetation_blocks: Vec::new(),
+            structure_blocks: Vec::new(),
             min_y: N::Settings::MIN_Y as i16,
         }
     }
 
-    fn vegetation_tile(
+    fn generated_blocks_tile(
         &self,
         origin_x: i32,
         origin_z: i32,
         size: u32,
         cache: &mut SurfaceChunkCache,
-    ) -> Vec<SurfaceVegetationBlock> {
+    ) -> (Vec<SurfaceVegetationBlock>, Vec<SurfaceVegetationBlock>) {
         let min_chunk_x = origin_x.div_euclid(16);
         let min_chunk_z = origin_z.div_euclid(16);
         let max_x = origin_x + size as i32 - 1;
@@ -781,6 +834,8 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         // Features writes can cross one chunk boundary.  Sources in the first
         // surrounding ring may therefore contribute a tree crown or flower to
         // this tile; each such source itself requires a 3×3 read halo.
+        // Swamp huts and igloos are smaller than one chunk, so the same ring
+        // also covers structure pieces that spill into the tile.
         let source_min_chunk_x = min_chunk_x - 1;
         let source_min_chunk_z = min_chunk_z - 1;
         let source_max_chunk_x = max_chunk_x + 1;
@@ -808,10 +863,18 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             N::Settings::MIN_Y,
             N::Settings::HEIGHT,
         );
-        let mut changed_positions = std::collections::HashSet::<(i32, i32, i32)>::new();
+        let mut starts = Vec::new();
+        for chunk_z in source_min_chunk_z..=source_max_chunk_z {
+            for chunk_x in source_min_chunk_x..=source_max_chunk_x {
+                starts.extend(self.portable_starts_for_chunk(chunk_x, chunk_z));
+            }
+        }
+        let mut structure_positions = std::collections::HashSet::<(i32, i32, i32)>::new();
+        let mut vegetation_positions = std::collections::HashSet::<(i32, i32, i32)>::new();
         // Native feature tasks are submitted in canonical X/Z ascending
         // order. Preserve that write order for overlapping crowns from
-        // neighboring source chunks.
+        // neighboring source chunks. Surface structures run before vegetation
+        // in vanilla decoration-step order.
         for chunk_x in source_min_chunk_x..=source_max_chunk_x {
             for chunk_z in source_min_chunk_z..=source_max_chunk_z {
                 region.prepare_window(chunk_x, chunk_z);
@@ -819,6 +882,21 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
                     .stats
                     .peak_live_flat_chunk_bytes
                     .max(region.flat_payload_bytes());
+                for pos in place_portable_starts_in_chunk(
+                    &mut region,
+                    &REGISTRY,
+                    &mut starts,
+                    chunk_x,
+                    chunk_z,
+                ) {
+                    if pos.x() >= origin_x
+                        && pos.x() <= max_x
+                        && pos.z() >= origin_z
+                        && pos.z() <= max_z
+                    {
+                        structure_positions.insert((pos.x(), pos.y(), pos.z()));
+                    }
+                }
                 for block in
                     self.vegetation_stage
                         .decorate_chunk(&mut region, &REGISTRY, chunk_x, chunk_z)
@@ -828,12 +906,21 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
                         && block.z >= origin_z
                         && block.z <= max_z
                     {
-                        changed_positions.insert((block.x, block.y, block.z));
+                        vegetation_positions.insert((block.x, block.y, block.z));
                     }
                 }
             }
         }
-        let mut final_blocks = changed_positions
+        let vegetation_blocks = Self::final_sparse_blocks(&region, vegetation_positions);
+        let structure_blocks = Self::final_sparse_blocks(&region, structure_positions);
+        (vegetation_blocks, structure_blocks)
+    }
+
+    fn final_sparse_blocks(
+        region: &InMemoryVegetationRegion<'_>,
+        positions: std::collections::HashSet<(i32, i32, i32)>,
+    ) -> Vec<SurfaceVegetationBlock> {
+        let mut blocks = positions
             .into_iter()
             .map(|(x, y, z)| {
                 let state = region.block_state(BlockPos::new(x, y, z));
@@ -846,8 +933,45 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
                 }
             })
             .collect::<Vec<_>>();
-        final_blocks.sort_by_key(|block| (block.x, block.y, block.z));
-        final_blocks
+        blocks.sort_by_key(|block| (block.x, block.y, block.z));
+        blocks
+    }
+
+    fn portable_starts_for_chunk(&self, chunk_x: i32, chunk_z: i32) -> Vec<StructureStart> {
+        let mut biome_sampler = self.biome_source.chunk_sampler();
+        let mut height_cache = N::ColumnCache::default();
+        let mut aquifer =
+            LazyAquifer::new(chunk_x * 16, chunk_z * 16, &self.splitter, &*self.noises);
+        let mut surface_y_cache = None;
+        let mut height_cache_grid_ready = false;
+        let mut context = GenerationContext::new(
+            self.vegetation_stage.seed(),
+            chunk_x,
+            chunk_z,
+            N::Settings::SEA_LEVEL,
+            &*self.noises,
+            &self.splitter,
+            self.structure_generator.template_pools(),
+            self.structure_generator.templates(),
+            &mut biome_sampler,
+            &mut height_cache,
+            &mut aquifer,
+            &mut surface_y_cache,
+            &mut height_cache_grid_ready,
+        );
+        self.structure_generator
+            .generate_starts_for_chunk(&mut context, |_| false)
+            .into_iter()
+            .filter(|start| is_portable_structure(&start.structure))
+            .collect()
+    }
+
+    fn portable_structure_start_ids(&self, chunk_x: i32, chunk_z: i32) -> Vec<String> {
+        self.portable_starts_for_chunk(chunk_x, chunk_z)
+            .into_iter()
+            .filter(|start| !start.pieces.is_empty())
+            .map(|start| start.structure.to_string())
+            .collect()
     }
 
     fn ensure_cached_chunk(
@@ -1031,6 +1155,54 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             .decorate_chunk(&mut region, &REGISTRY, chunk_x, chunk_z)
         {
             changed_positions.insert((block.x, block.y, block.z));
+        }
+        let mut blocks = changed_positions
+            .into_iter()
+            .map(|(x, y, z)| {
+                let state = region.block_state(BlockPos::new(x, y, z));
+                SurfaceVegetationBlock {
+                    x,
+                    y,
+                    z,
+                    block: canonical_block_key(state),
+                    state: canonical_block_state_key(state),
+                }
+            })
+            .collect::<Vec<_>>();
+        blocks.sort_by_key(|block| (block.x, block.y, block.z));
+        blocks
+    }
+
+    fn selected_structure_transaction_snapshot(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+    ) -> Vec<SurfaceVegetationBlock> {
+        let mut chunks = HashMap::new();
+        for source_z in chunk_z - 1..=chunk_z + 1 {
+            for source_x in chunk_x - 1..=chunk_x + 1 {
+                let mut chunk = self.sample_surface_chunk_data(source_x, source_z);
+                self.apply_carvers_to_chunk(&mut chunk);
+                chunks.insert((source_x, source_z), VegetationChunk::Flat(chunk));
+            }
+        }
+        let mut region = InMemoryVegetationRegion::new(
+            &mut chunks,
+            &self.biome_source,
+            N::Settings::MIN_Y,
+            N::Settings::HEIGHT,
+        );
+        let mut starts = Vec::new();
+        for source_z in chunk_z - 1..=chunk_z + 1 {
+            for source_x in chunk_x - 1..=chunk_x + 1 {
+                starts.extend(self.portable_starts_for_chunk(source_x, source_z));
+            }
+        }
+        let mut changed_positions = std::collections::HashSet::new();
+        for pos in
+            place_portable_starts_in_chunk(&mut region, &REGISTRY, &mut starts, chunk_x, chunk_z)
+        {
+            changed_positions.insert((pos.x(), pos.y(), pos.z()));
         }
         let mut blocks = changed_positions
             .into_iter()
@@ -1840,6 +2012,7 @@ mod tests {
         assert_eq!(actual.surface_blocks, expected.surface_blocks);
         assert_eq!(actual.surface_block_indices, expected.surface_block_indices);
         assert_eq!(actual.vegetation_blocks, expected.vegetation_blocks);
+        assert_eq!(actual.structure_blocks, expected.structure_blocks);
         assert_eq!(actual.min_y, expected.min_y);
     }
 
@@ -1853,6 +2026,7 @@ mod tests {
         assert_eq!(coarse.surface_blocks, full.surface_blocks);
         assert_eq!(coarse.surface_block_indices, full.surface_block_indices);
         assert!(coarse.vegetation_blocks.is_empty());
+        assert!(coarse.structure_blocks.is_empty());
         assert_eq!(coarse.min_y, full.min_y);
     }
 
@@ -1914,6 +2088,7 @@ mod tests {
             assert!(biome.surface_blocks.is_empty());
             assert!(biome.surface_block_indices.is_empty());
             assert!(biome.vegetation_blocks.is_empty());
+            assert!(biome.structure_blocks.is_empty());
         }
     }
 
@@ -2303,6 +2478,54 @@ mod tests {
             tile.vegetation_blocks
                 .iter()
                 .any(|block| block.block == "minecraft:pink_petals")
+        );
+    }
+
+    #[test]
+    fn swamp_hut_fixture_emits_structure_blocks() {
+        let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+        let tile = sampler.tile(-1834 * 16, -76 * 16, 16, 1);
+        assert!(
+            tile.structure_blocks
+                .iter()
+                .any(|block| block.block == "minecraft:potted_red_mushroom"),
+            "swamp hut tile must place a potted red mushroom, {} structure blocks",
+            tile.structure_blocks.len()
+        );
+        assert!(
+            tile.structure_blocks
+                .iter()
+                .any(|block| block.block == "minecraft:cauldron"),
+            "swamp hut tile must place a cauldron"
+        );
+        assert!(
+            tile.structure_blocks.len() >= 100,
+            "swamp hut origin chunk should carry the hut body, got {}",
+            tile.structure_blocks.len()
+        );
+    }
+
+    #[test]
+    fn igloo_fixture_emits_structure_blocks() {
+        let sampler = SurfaceSampler::new(1, SurfaceDimension::Overworld);
+        let tile = sampler.tile(-2026 * 16, 268 * 16, 16, 1);
+        assert!(
+            tile.structure_blocks.iter().any(|block| {
+                block.block == "minecraft:white_carpet"
+                    || block.block == "minecraft:redstone_torch"
+                    || block.block == "minecraft:ice"
+            }),
+            "igloo tile must place template blocks, {} structure blocks {:?}",
+            tile.structure_blocks.len(),
+            tile.structure_blocks
+                .iter()
+                .map(|block| block.block.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert!(
+            tile.structure_blocks.len() >= 100,
+            "igloo origin chunk should carry the igloo body, got {}",
+            tile.structure_blocks.len()
         );
     }
 }
