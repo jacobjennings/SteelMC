@@ -1156,12 +1156,12 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             self.vegetation_stage.seed(),
             &self.biome_source,
         );
-        // One chunk of source ring. Every portable piece family fits inside a
-        // box smaller than two chunks, so a start anchored further away cannot
-        // reach this chunk. A larger family needs vanilla's radius-8 scan.
+        // Vanilla structure references search up to eight source chunks away.
+        // Village jigsaw assembly can put a small piece several chunks from its
+        // start, even though the piece itself spans only one or two chunks.
         let mut starts = Vec::new();
-        for source_z in chunk_z - 1..=chunk_z + 1 {
-            for source_x in chunk_x - 1..=chunk_x + 1 {
+        for source_z in chunk_z - 8..=chunk_z + 8 {
+            for source_x in chunk_x - 8..=chunk_x + 8 {
                 starts.extend(self.structure_starts_for_chunk(&generator, source_x, source_z));
             }
         }

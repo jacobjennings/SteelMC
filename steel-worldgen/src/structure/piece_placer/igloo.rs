@@ -81,6 +81,7 @@ pub(super) fn place_igloo_piece<H: StructureBlockAccess>(
         clip,
         block_ignore: data.block_ignore,
         late_block_ignore: data.late_block_ignore,
+        replace_jigsaws: false,
     };
     let position = adjusted_igloo_position(
         region,

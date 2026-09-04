@@ -100,6 +100,8 @@ pub struct TemplatePlacement {
     pub block_ignore: StructureBlockIgnore,
     /// Palette states this placement refuses after processing.
     pub late_block_ignore: StructureBlockIgnore,
+    /// Replace saved jigsaw blocks with their NBT `final_state`.
+    pub replace_jigsaws: bool,
 }
 
 impl StructureTemplate {
@@ -236,8 +238,22 @@ impl StructureTemplate {
             if !placement.clip.contains_blockpos(world_pos) {
                 continue;
             }
+            let state = if placement.replace_jigsaws
+                && registry.blocks.by_state_id(block.state) == Some(&vanilla_blocks::JIGSAW)
+            {
+                block
+                    .final_state
+                    .unwrap_or_else(|| vanilla_blocks::AIR.default_state())
+            } else {
+                block.state
+            };
+            if placement.replace_jigsaws
+                && registry.blocks.by_state_id(state) == Some(&vanilla_blocks::STRUCTURE_VOID)
+            {
+                continue;
+            }
             let final_state =
-                transform_state(registry, block.state, placement.mirror, placement.rotation);
+                transform_state(registry, state, placement.mirror, placement.rotation);
             region.set_block_state(world_pos, final_state);
         }
         true

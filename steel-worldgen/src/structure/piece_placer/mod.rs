@@ -14,6 +14,7 @@
 //! is what the parity fixture in `steel-core` compares.
 
 mod igloo;
+mod pool_element;
 mod scattered_feature;
 mod swamp_hut;
 
@@ -101,6 +102,9 @@ pub fn place_piece<H: StructureBlockAccess>(
         StructurePiecePayload::Template(data) if igloo::is_portable_template_piece(data) => {
             igloo::place_igloo_piece(region, registry, data, &mut bounding_box, clip)
         }
+        StructurePiecePayload::Jigsaw(data) if pool_element::is_calibration_piece(data) => {
+            pool_element::place_calibration_piece(region, registry, data, clip)
+        }
         _ => false,
     };
     piece.bounding_box = bounding_box;
@@ -116,6 +120,7 @@ pub fn is_portable_piece(piece: &StructurePiece) -> bool {
     match &piece.payload {
         StructurePiecePayload::Procedural(ProceduralPieceData::SwampHut(_)) => true,
         StructurePiecePayload::Template(data) => igloo::is_portable_template_piece(data),
+        StructurePiecePayload::Jigsaw(data) => pool_element::is_calibration_piece(data),
         _ => false,
     }
 }

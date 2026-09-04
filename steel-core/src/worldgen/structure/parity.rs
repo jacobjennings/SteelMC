@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use steel_registry::REGISTRY;
+use steel_utils::types::UpdateFlags;
 use steel_utils::{BlockPos, BlockStateId, ChunkPos};
 use steel_worldgen::biomes::BiomeSourceKind;
 use steel_worldgen::surface_sampler::{SurfaceDimension, SurfaceSampler};
@@ -81,6 +82,30 @@ fn portable_igloo_template_matches_native() {
     }
     println!("PORTABLE_IGLOO_PARITY compared={compared}");
     assert!(compared > 0, "the sample compared no igloo blocks at all");
+}
+
+/// The dense village piece used to measure neighbour-dependent shape updates.
+///
+/// This savanna weaponsmith has stairs, a fence, doors, panes, iron bars and
+/// slabs in only a 13x7x9 box. Its natural seed-7 placement crosses two chunks,
+/// so both halves are compared against the native pool-element placer.
+#[test]
+fn portable_village_weaponsmith_matches_native() {
+    assert!(
+        super::piece_placer::StructurePiecePlacer::JIGSAW_UPDATE_FLAGS
+            .contains(UpdateFlags::UPDATE_KNOWN_SHAPE),
+        "vanilla jigsaw flags changed: this fixture must be reinterpreted"
+    );
+    let compared =
+        assert_portable_structures_match_native(7, -35, -47, "savanna weaponsmith 2, west half")
+            + assert_portable_structures_match_native(
+                7,
+                -34,
+                -47,
+                "savanna weaponsmith 2, east half",
+            );
+    println!("PORTABLE_VILLAGE_WEAPONSMITH_PARITY compared={compared}");
+    assert_eq!(compared, 384, "the selected village piece changed size");
 }
 
 /// The one measured case where the portable template slice disagrees, kept as
@@ -184,8 +209,8 @@ fn assert_portable_structures_match_native(
         for target_z in chunk_z - 1..=chunk_z + 1 {
             let target_block_x = target_x * 16;
             let target_block_z = target_z * 16;
-            for source_x in target_x - 1..=target_x + 1 {
-                for source_z in target_z - 1..=target_z + 1 {
+            for source_x in target_x - 8..=target_x + 8 {
+                for source_z in target_z - 8..=target_z + 8 {
                     let Some(source_chunk) = chunks.get(&(source_x, source_z)) else {
                         continue;
                     };
