@@ -123,6 +123,8 @@ fn bounded_surface_signal_matches_generated_columns() {
         let mut state_mismatches = 0_u64;
         let mut skipped = 0_u64;
         let mut full = 0_u64;
+        let mut windowed_slots = 0_usize;
+        let mut full_slots = 0_usize;
         let mut worst: Option<(Category, i32, i32, i16, i16)> = None;
         for &(category, chunk_x, chunk_z) in &fixtures {
             let generated = sampler.generated_surface_columns(chunk_x, chunk_z);
@@ -131,6 +133,8 @@ fn bounded_surface_signal_matches_generated_columns() {
             assert_eq!(generated.len(), bounded.len());
             skipped += stats.skipped_density_evaluations();
             full += stats.full_density_evaluations;
+            windowed_slots += stats.windowed_block_slots;
+            full_slots += stats.full_block_slots;
             for (index, (expected, actual)) in generated.iter().zip(bounded.iter()).enumerate() {
                 columns += 1;
                 if expected.0 != actual.0 {
@@ -154,7 +158,8 @@ fn bounded_surface_signal_matches_generated_columns() {
             report,
             "lookahead {lookahead} headroom {headroom}: {columns} columns, \
              {height_mismatches} height mismatches, {state_mismatches} state mismatches, \
-             skipped {skipped} of {full} density evaluations"
+             skipped {skipped} of {full} density evaluations, \
+             {windowed_slots} of {full_slots} block slots kept"
         );
         if let Some((category, x, z, expected, actual)) = worst {
             let _ = writeln!(
