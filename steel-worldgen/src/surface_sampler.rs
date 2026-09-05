@@ -421,9 +421,7 @@ impl SurfaceSampler {
             Self::Nether(sampler) => {
                 sampler.surface_signal_chunk(chunk_x, chunk_z, lookahead, window)
             }
-            Self::End(sampler) => {
-                sampler.surface_signal_chunk(chunk_x, chunk_z, lookahead, window)
-            }
+            Self::End(sampler) => sampler.surface_signal_chunk(chunk_x, chunk_z, lookahead, window),
         };
         let flattened = columns
             .iter()

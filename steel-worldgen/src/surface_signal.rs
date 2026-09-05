@@ -92,12 +92,18 @@ impl ExtensionWindowDemand {
         // Both therefore need one slot above `top_block_y`, and the ceiling
         // is exclusive, so it sits two above.
         let ceiling = top_block_y + 2;
-        self.ceiling = Some(self.ceiling.map_or(ceiling, |current: i32| current.max(ceiling)));
+        self.ceiling = Some(
+            self.ceiling
+                .map_or(ceiling, |current: i32| current.max(ceiling)),
+        );
     }
 
     /// Records one column's required bottom block Y.
     fn require_floor(&mut self, floor_block_y: i32) {
-        self.floor = Some(self.floor.map_or(floor_block_y, |current: i32| current.min(floor_block_y)));
+        self.floor = Some(
+            self.floor
+                .map_or(floor_block_y, |current: i32| current.min(floor_block_y)),
+        );
     }
 }
 

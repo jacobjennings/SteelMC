@@ -273,10 +273,9 @@ impl<'a, N: DimensionNoises> SurfaceStage<'a, N> {
                 };
                 condition_noise_cache.reset();
 
-                let min_surface_level = preliminary_surface_corners
-                    .map_or(0, |corners| {
-                        corners.min_surface_level(local_x, local_z, surface_depth)
-                    });
+                let min_surface_level = preliminary_surface_corners.map_or(0, |corners| {
+                    corners.min_surface_level(local_x, local_z, surface_depth)
+                });
 
                 // Vanilla's steep predicate is asymmetric: south >= north + 4
                 // or west >= east + 4. Do not replace this with an absolute

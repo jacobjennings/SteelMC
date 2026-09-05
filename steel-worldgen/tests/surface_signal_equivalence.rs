@@ -287,8 +287,9 @@ fn bounded_surface_signal_matches_generated_columns() {
 /// The arms are interleaved within each repetition rather than run in blocks,
 /// so a drift in machine load moves both by about the same amount instead of
 /// landing entirely on whichever ran second. Cold builds a fresh sampler for
-/// every chunk, so it includes sampler construction and an empty cache. Warm
-/// repeats a chunk on the sampler that has just produced it.
+/// every chunk and starts the clock after construction, so it measures a first
+/// chunk against an empty cache rather than the cost of building a sampler.
+/// Warm repeats the same chunk on the sampler that has just produced it.
 #[test]
 fn bounded_surface_signal_cost() {
     const REPETITIONS: usize = 3;
@@ -345,7 +346,10 @@ fn bounded_surface_signal_cost() {
     }
 
     let samples = (REPETITIONS * measured.len()) as u32;
-    println!("cost over {samples} paired samples on {} chunks", measured.len());
+    println!(
+        "cost over {samples} paired samples on {} chunks",
+        measured.len()
+    );
     println!(
         "  cold: bounded {:?} per chunk, generated {:?} per chunk",
         bounded_cold / samples,
