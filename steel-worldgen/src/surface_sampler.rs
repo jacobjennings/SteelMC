@@ -541,6 +541,10 @@ impl SurfaceSampler {
             .collect()
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one dispatch for the grid, the vegetation switch and the surface source"
+    )]
     fn tile_with_cache_mode(
         &self,
         cache: &mut SurfaceChunkCache,
@@ -746,6 +750,10 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         }
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors the dispatch above so the two stay readable together"
+    )]
     fn tile_with_cache(
         &self,
         cache: &mut SurfaceChunkCache,
