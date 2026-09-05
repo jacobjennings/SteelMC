@@ -24,6 +24,9 @@ pub mod structure;
 pub mod surface;
 /// Browser-safe sampling of the deterministic terrain density surface.
 pub mod surface_sampler;
+
+/// Prototype bounded top-surface signal producer.
+pub mod surface_signal;
 /// Portable Surface-stage runner and host traits.
 pub mod surface_stage;
 /// Dependency-light Vanilla SurfaceSystem implementation.

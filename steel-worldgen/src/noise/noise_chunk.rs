@@ -17,6 +17,19 @@ use steel_worldgen::density::{ColumnCache, DimensionNoises, NoiseSettings};
 
 use crate::noise::Beardifier;
 
+/// Whether a column's remaining lower blocks still have to be visited.
+///
+/// `fill` walks each column downwards, so a consumer that only needs the top
+/// of a column can stop it. Vanilla always visits the whole column, so
+/// [`Self::Continue`] is the behaviour every existing caller keeps.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ColumnFlow {
+    /// Keep descending this column.
+    Continue,
+    /// Skip the rest of this column and move to the next one.
+    FinishColumn,
+}
+
 /// Maximum number of interpolation channels supported.
 /// Overworld uses 8 (1 terrain + 4 noodle caves + 3 vein channels), nether/end use 1.
 const MAX_INTERP: usize = 16;
@@ -256,7 +269,7 @@ impl<N: DimensionNoises> NoiseChunk<N> {
         beardifier: Option<&Beardifier>,
         mut place_block: F,
     ) where
-        F: FnMut(usize, i32, usize, f64, &[f64], &mut N::ColumnCache),
+        F: FnMut(usize, i32, usize, f64, &[f64], &mut N::ColumnCache) -> ColumnFlow,
     {
         let cell_width = N::Settings::CELL_WIDTH;
         let cell_height = N::Settings::CELL_HEIGHT;
@@ -310,7 +323,7 @@ impl<N: DimensionNoises> NoiseChunk<N> {
                         let z1_base = (cell_z_idx + 1) * corners_y;
 
                         // Process entire Y column at this (x, z)
-                        for cell_y_idx in (0..cell_count_y).rev() {
+                        'column: for cell_y_idx in (0..cell_count_y).rev() {
                             for y_in_cell in (0..cell_height).rev() {
                                 let factor_y = f64::from(y_in_cell) / f64::from(cell_height);
 
@@ -437,7 +450,7 @@ impl<N: DimensionNoises> NoiseChunk<N> {
                                     density += beard.compute(world_x, world_y, world_z);
                                 }
 
-                                place_block(
+                                let flow = place_block(
                                     local_x,
                                     world_y,
                                     local_z,
@@ -445,6 +458,9 @@ impl<N: DimensionNoises> NoiseChunk<N> {
                                     &interpolated[..interp_count],
                                     cache,
                                 );
+                                if flow == ColumnFlow::FinishColumn {
+                                    break 'column;
+                                }
                             }
                         }
                     }

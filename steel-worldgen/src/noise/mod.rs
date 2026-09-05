@@ -24,7 +24,7 @@ pub use beardifier::Beardifier;
 pub use blended_noise::BlendedNoise;
 pub use end_islands::EndIslands;
 pub use improved_noise::ImprovedNoise;
-pub use noise_chunk::NoiseChunk;
+pub use noise_chunk::{ColumnFlow, NoiseChunk};
 pub use normal_noise::NormalNoise;
 pub use ore_veinifier::OreVeinifier;
 pub use perlin_noise::PerlinNoise;

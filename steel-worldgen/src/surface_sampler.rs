@@ -16,8 +16,8 @@ use crate::biomes::{BiomeSourceKind, obfuscate_biome_seed};
 use crate::carver::{CarverBlockAccess, CarverStage};
 use crate::density::{ColumnCache, DimensionNoises, NoiseSettings};
 use crate::density_functions::{end::EndNoises, nether::NetherNoises, overworld::OverworldNoises};
-use crate::noise::NoiseChunk;
 use crate::noise::{Aquifer, AquiferResult, LazyAquifer, OreVeinifier, preliminary_surface_level};
+use crate::noise::{ColumnFlow, NoiseChunk};
 use crate::noise_parameters::get_noise_parameters;
 use crate::structure::{
     GenerationContext, StructureGenerator, StructureStart, is_portable_structure,
@@ -27,6 +27,7 @@ use crate::surface::{
     PreliminarySurfaceCorners, SurfaceBiomeAccess, SurfaceBlockAccess, SurfaceExtensions,
     SurfaceStage, SurfaceSystem,
 };
+use crate::surface_signal::{ColumnRecorder, SurfaceSignalStats};
 use crate::utils::find_solid_surface_below_ceiling;
 use crate::vegetation::{VegetationBlockAccess, VegetationStage};
 use steel_registry::feature::FeatureHeightmap;
@@ -394,6 +395,70 @@ impl SurfaceSampler {
             Self::Nether(sampler) => sampler.biome_tile(origin_x, origin_z, size, resolution),
             Self::End(sampler) => sampler.biome_tile(origin_x, origin_z, size, resolution),
         }
+    }
+
+    /// Prototype bounded top-surface signal for one chunk.
+    ///
+    /// Returns the same per-column height, block state and presence flag that
+    /// a tile consumes, produced without materializing the whole column. It is
+    /// here to be compared against the generated path and measured. Callers
+    /// that need terrain still use [`Self::tile_with_cache`].
+    #[must_use]
+    pub fn surface_signal_chunk(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+        lookahead: i32,
+        headroom: i32,
+    ) -> (Vec<(i16, BlockStateId, bool)>, SurfaceSignalStats) {
+        let (columns, stats) = match self {
+            Self::Overworld(sampler) => {
+                sampler.surface_signal_chunk(chunk_x, chunk_z, lookahead, headroom)
+            }
+            Self::Nether(sampler) => {
+                sampler.surface_signal_chunk(chunk_x, chunk_z, lookahead, headroom)
+            }
+            Self::End(sampler) => {
+                sampler.surface_signal_chunk(chunk_x, chunk_z, lookahead, headroom)
+            }
+        };
+        let flattened = columns
+            .iter()
+            .map(|column| (column.height, column.state, column.exists))
+            .collect();
+        (flattened, stats)
+    }
+
+    /// Generated per-column surface summary for one chunk, for comparison.
+    ///
+    /// This is the authoritative result the prototype is measured against.
+    ///
+    /// # Panics
+    /// Panics when the chunk it just generated is not in its own cache.
+    #[must_use]
+    pub fn generated_surface_columns(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+    ) -> Vec<(i16, BlockStateId, bool)> {
+        let mut cache = SurfaceChunkCache::new(4);
+        match self {
+            Self::Overworld(sampler) => {
+                sampler.ensure_cached_chunk(&mut cache, chunk_x, chunk_z, false)
+            }
+            Self::Nether(sampler) => {
+                sampler.ensure_cached_chunk(&mut cache, chunk_x, chunk_z, false)
+            }
+            Self::End(sampler) => sampler.ensure_cached_chunk(&mut cache, chunk_x, chunk_z, false),
+        }
+        let chunk = cache
+            .touch((chunk_x, chunk_z))
+            .expect("surface chunk must have been cached");
+        chunk
+            .pre_carver_surface
+            .iter()
+            .map(|column| (column.height, column.state, column.exists))
+            .collect()
     }
 
     fn tile_with_cache_mode(
@@ -1071,9 +1136,10 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
                         })
                         .unwrap_or(default_block_id),
                     AquiferResult::Fluid(state) => state,
-                    AquiferResult::Air => return,
+                    AquiferResult::Air => return ColumnFlow::Continue,
                 };
                 blocks.set_initial(local_x, world_y, local_z, state);
+                ColumnFlow::Continue
             },
         );
 
@@ -1108,6 +1174,168 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             InMemorySurfaceBiomeAccess::new(&self.biome_source, chunk_x, chunk_z, min_y, height);
         stage.build_surface(&mut blocks, &mut biomes, preliminary_surface_corners);
         blocks
+    }
+
+    /// Prototype bounded producer for this chunk's top-surface signal.
+    ///
+    /// Runs the same noise, aquifer, ore-vein and Surface-rule evaluation as
+    /// [`Self::sample_surface_chunk_data`], but stops each column `lookahead`
+    /// blocks below its topmost solid block and runs the Surface stage against
+    /// a chunk whose vertical extent is only the window those stops describe.
+    ///
+    /// The generated path is untouched and stays authoritative. This exists to
+    /// be compared against it and measured, not to replace it.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "mirrors sample_surface_chunk_data step for step so the two can be compared"
+    )]
+    fn surface_signal_chunk(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+        lookahead: i32,
+        headroom: i32,
+    ) -> (Box<[SurfaceColumn; 256]>, SurfaceSignalStats) {
+        let chunk_min_x = chunk_x * 16;
+        let chunk_min_z = chunk_z * 16;
+        let min_y = N::Settings::MIN_Y;
+        let height = N::Settings::HEIGHT;
+        let default_block_id = N::Settings::default_block_id();
+
+        let mut recorders: Vec<ColumnRecorder> = (0..256).map(|_| ColumnRecorder::new()).collect();
+        let mut density_evaluations = 0_u64;
+
+        let mut noise_chunk = NoiseChunk::<N>::new(chunk_min_x, chunk_min_z);
+        let mut column_cache = N::ColumnCache::default();
+        column_cache.init_grid(chunk_min_x, chunk_min_z, &self.noises);
+        let mut aquifer = Aquifer::<N>::new(
+            chunk_min_x,
+            chunk_min_z,
+            min_y,
+            height,
+            &self.splitter,
+            &self.noises,
+            column_cache.clone(),
+        );
+
+        noise_chunk.fill(
+            &self.noises,
+            &mut column_cache,
+            None,
+            |local_x, world_y, local_z, density, interpolated, cache| {
+                density_evaluations += 1;
+                let state = match aquifer.compute_substance(
+                    &self.noises,
+                    chunk_min_x + local_x as i32,
+                    world_y,
+                    chunk_min_z + local_z as i32,
+                    density,
+                ) {
+                    AquiferResult::Solid => Some(
+                        self.ore_veinifier
+                            .as_ref()
+                            .and_then(|ore_veinifier| {
+                                ore_veinifier.compute_interpolated(
+                                    &*self.noises,
+                                    cache,
+                                    interpolated,
+                                    chunk_min_x + local_x as i32,
+                                    world_y,
+                                    chunk_min_z + local_z as i32,
+                                )
+                            })
+                            .unwrap_or(default_block_id),
+                    ),
+                    AquiferResult::Fluid(state) => Some(state),
+                    AquiferResult::Air => None,
+                };
+                recorders[local_z * 16 + local_x].record(world_y, state, lookahead)
+            },
+        );
+
+        // The window has to cover every block any column recorded, and reach
+        // down to the lowest stop, so the Surface stage sees the same blocks
+        // near each surface that the full chunk would have held.
+        let window_min_y = recorders
+            .iter()
+            .map(ColumnRecorder::window_floor::<N>)
+            .min()
+            .unwrap_or(min_y);
+        let window_max_y = recorders
+            .iter()
+            .map(ColumnRecorder::window_ceiling::<N>)
+            .max()
+            .unwrap_or(min_y + 1)
+            .max(window_min_y + 1)
+            .saturating_add(headroom)
+            .min(min_y + height);
+        let window_span = window_max_y - window_min_y;
+        let unbounded_columns = recorders
+            .iter()
+            .filter(|recorder| recorder.stop_y.is_none())
+            .count() as u32;
+
+        let mut blocks =
+            InMemorySurfaceChunk::new(chunk_min_x, chunk_min_z, window_min_y, window_span);
+        for (index, recorder) in recorders.iter().enumerate() {
+            let local_x = index % 16;
+            let local_z = index / 16;
+            for &(world_y, state) in &recorder.blocks {
+                if (window_min_y..window_max_y).contains(&world_y) {
+                    blocks.set_initial(local_x, world_y, local_z, state);
+                }
+            }
+        }
+
+        let stage = SurfaceStage::<N>::new(
+            &self.surface_system,
+            default_block_id,
+            self.biome_zoom_seed,
+            self.surface_extensions,
+        );
+        let preliminary_surface_corners =
+            stage
+                .needs_preliminary_surface()
+                .then(|| PreliminarySurfaceCorners {
+                    nw: aquifer.preliminary_surface_level(&self.noises, chunk_min_x, chunk_min_z),
+                    ne: aquifer.preliminary_surface_level(
+                        &self.noises,
+                        chunk_min_x + 16,
+                        chunk_min_z,
+                    ),
+                    sw: aquifer.preliminary_surface_level(
+                        &self.noises,
+                        chunk_min_x,
+                        chunk_min_z + 16,
+                    ),
+                    se: aquifer.preliminary_surface_level(
+                        &self.noises,
+                        chunk_min_x + 16,
+                        chunk_min_z + 16,
+                    ),
+                });
+        let mut biomes =
+            InMemorySurfaceBiomeAccess::new(&self.biome_source, chunk_x, chunk_z, min_y, height);
+        stage.build_surface(&mut blocks, &mut biomes, preliminary_surface_corners);
+
+        let columns = Box::new(std::array::from_fn(|index| {
+            let (height, state, exists) = blocks.surface_column(index, self.surface_view);
+            SurfaceColumn {
+                height,
+                state,
+                exists,
+            }
+        }));
+        let stats = SurfaceSignalStats {
+            density_evaluations,
+            full_density_evaluations: 256 * height as u64,
+            windowed_block_slots: 16 * 16 * window_span as usize,
+            full_block_slots: 16 * 16 * height as usize,
+            window_min_y,
+            window_max_y,
+            unbounded_columns,
+        };
+        (columns, stats)
     }
 
     fn apply_carvers_to_chunk(&self, chunk: &mut InMemorySurfaceChunk) {
@@ -1265,7 +1493,7 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
                     || (local_z as u32) % lod != 0
                     || (y - min_y).unsigned_abs() % lod != 0
                 {
-                    return;
+                    return ColumnFlow::Continue;
                 }
                 let x_cell = local_x as u32 / lod;
                 let z_cell = local_z as u32 / lod;
@@ -1284,6 +1512,7 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
                     AquiferResult::Fluid(_) => 3,
                 };
                 voxels[index] = material;
+                ColumnFlow::Continue
             },
         );
         NoiseVolume {
