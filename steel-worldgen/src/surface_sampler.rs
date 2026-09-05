@@ -27,7 +27,10 @@ use crate::surface::{
     PreliminarySurfaceCorners, SurfaceBiomeAccess, SurfaceBlockAccess, SurfaceExtensions,
     SurfaceStage, SurfaceSystem,
 };
-use crate::surface_signal::{ColumnRecorder, SurfaceSignalStats};
+use crate::surface_signal::{
+    ColumnRecorder, ExtensionWindowDemand, SurfaceSignalStats, SurfaceSignalWindow,
+    extension_window_demand,
+};
 use crate::utils::find_solid_surface_below_ceiling;
 use crate::vegetation::{VegetationBlockAccess, VegetationStage};
 use steel_registry::feature::FeatureHeightmap;
@@ -409,17 +412,17 @@ impl SurfaceSampler {
         chunk_x: i32,
         chunk_z: i32,
         lookahead: i32,
-        headroom: i32,
+        window: SurfaceSignalWindow,
     ) -> (Vec<(i16, BlockStateId, bool)>, SurfaceSignalStats) {
         let (columns, stats) = match self {
             Self::Overworld(sampler) => {
-                sampler.surface_signal_chunk(chunk_x, chunk_z, lookahead, headroom)
+                sampler.surface_signal_chunk(chunk_x, chunk_z, lookahead, window)
             }
             Self::Nether(sampler) => {
-                sampler.surface_signal_chunk(chunk_x, chunk_z, lookahead, headroom)
+                sampler.surface_signal_chunk(chunk_x, chunk_z, lookahead, window)
             }
             Self::End(sampler) => {
-                sampler.surface_signal_chunk(chunk_x, chunk_z, lookahead, headroom)
+                sampler.surface_signal_chunk(chunk_x, chunk_z, lookahead, window)
             }
         };
         let flattened = columns
@@ -1194,7 +1197,7 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         chunk_x: i32,
         chunk_z: i32,
         lookahead: i32,
-        headroom: i32,
+        window: SurfaceSignalWindow,
     ) -> (Box<[SurfaceColumn; 256]>, SurfaceSignalStats) {
         let chunk_min_x = chunk_x * 16;
         let chunk_min_z = chunk_z * 16;
@@ -1253,40 +1256,6 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
             },
         );
 
-        // The window has to cover every block any column recorded, and reach
-        // down to the lowest stop, so the Surface stage sees the same blocks
-        // near each surface that the full chunk would have held.
-        let window_min_y = recorders
-            .iter()
-            .map(ColumnRecorder::window_floor::<N>)
-            .min()
-            .unwrap_or(min_y);
-        let window_max_y = recorders
-            .iter()
-            .map(ColumnRecorder::window_ceiling::<N>)
-            .max()
-            .unwrap_or(min_y + 1)
-            .max(window_min_y + 1)
-            .saturating_add(headroom)
-            .min(min_y + height);
-        let window_span = window_max_y - window_min_y;
-        let unbounded_columns = recorders
-            .iter()
-            .filter(|recorder| recorder.stop_y.is_none())
-            .count() as u32;
-
-        let mut blocks =
-            InMemorySurfaceChunk::new(chunk_min_x, chunk_min_z, window_min_y, window_span);
-        for (index, recorder) in recorders.iter().enumerate() {
-            let local_x = index % 16;
-            let local_z = index / 16;
-            for &(world_y, state) in &recorder.blocks {
-                if (window_min_y..window_max_y).contains(&world_y) {
-                    blocks.set_initial(local_x, world_y, local_z, state);
-                }
-            }
-        }
-
         let stage = SurfaceStage::<N>::new(
             &self.surface_system,
             default_block_id,
@@ -1314,6 +1283,62 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
                         chunk_min_z + 16,
                     ),
                 });
+
+        // The window has to cover every block any column recorded, reach down
+        // to the lowest stop, and additionally cover whatever the Surface
+        // stage's extensions read or write outside the noise column, so the
+        // stage sees the same blocks the full chunk would have held.
+        let noise_floor = recorders
+            .iter()
+            .map(ColumnRecorder::window_floor::<N>)
+            .min()
+            .unwrap_or(min_y);
+        let noise_ceiling = recorders
+            .iter()
+            .map(ColumnRecorder::window_ceiling::<N>)
+            .max()
+            .unwrap_or(min_y + 1);
+        let extension_demand = match window {
+            SurfaceSignalWindow::Fixed(_) => ExtensionWindowDemand::NONE,
+            SurfaceSignalWindow::Derived => extension_window_demand(
+                &self.surface_system,
+                self.surface_extensions,
+                chunk_min_x,
+                chunk_min_z,
+                preliminary_surface_corners,
+            ),
+        };
+        let headroom = match window {
+            SurfaceSignalWindow::Fixed(headroom) => headroom,
+            SurfaceSignalWindow::Derived => 0,
+        };
+        let window_min_y = extension_demand
+            .floor
+            .map_or(noise_floor, |floor| noise_floor.min(floor))
+            .max(min_y);
+        let window_max_y = noise_ceiling
+            .saturating_add(headroom)
+            .max(extension_demand.ceiling.unwrap_or(i32::MIN))
+            .max(window_min_y + 1)
+            .min(min_y + height);
+        let window_span = window_max_y - window_min_y;
+        let unbounded_columns = recorders
+            .iter()
+            .filter(|recorder| recorder.stop_y.is_none())
+            .count() as u32;
+
+        let mut blocks =
+            InMemorySurfaceChunk::new(chunk_min_x, chunk_min_z, window_min_y, window_span);
+        for (index, recorder) in recorders.iter().enumerate() {
+            let local_x = index % 16;
+            let local_z = index / 16;
+            for &(world_y, state) in &recorder.blocks {
+                if (window_min_y..window_max_y).contains(&world_y) {
+                    blocks.set_initial(local_x, world_y, local_z, state);
+                }
+            }
+        }
+
         let mut biomes =
             InMemorySurfaceBiomeAccess::new(&self.biome_source, chunk_x, chunk_z, min_y, height);
         stage.build_surface(&mut blocks, &mut biomes, preliminary_surface_corners);

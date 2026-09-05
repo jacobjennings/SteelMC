@@ -34,6 +34,31 @@ pub struct PreliminarySurfaceCorners {
     pub se: i32,
 }
 
+impl PreliminarySurfaceCorners {
+    /// Lowest block Y the Surface rules and the frozen ocean extension treat
+    /// as belonging to this column's surface.
+    ///
+    /// The frozen ocean extension descends to this level, so a producer that
+    /// materializes only part of a column has to reach it too: the extension
+    /// draws from a seeded random only inside its air test, and a slot read
+    /// outside the materialized range looks like air, which would consume a
+    /// value the full column never consumes and desynchronize the stream.
+    #[must_use]
+    pub fn min_surface_level(self, local_x: usize, local_z: usize, surface_depth: i32) -> i32 {
+        let t_x = f64::from(local_x as u8) / 16.0;
+        let t_z = f64::from(local_z as u8) / 16.0;
+        let interp = lerp2(
+            t_x,
+            t_z,
+            f64::from(self.nw),
+            f64::from(self.ne),
+            f64::from(self.sw),
+            f64::from(self.se),
+        );
+        interp.floor() as i32 + surface_depth - 8
+    }
+}
+
 /// The Vanilla surface extensions a biome source can require.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SurfaceExtensions {
@@ -248,21 +273,10 @@ impl<'a, N: DimensionNoises> SurfaceStage<'a, N> {
                 };
                 condition_noise_cache.reset();
 
-                let min_surface_level = if let Some(corners) = preliminary_surface_corners {
-                    let t_x = f64::from(local_x as u8) / 16.0;
-                    let t_z = f64::from(local_z as u8) / 16.0;
-                    let interp = lerp2(
-                        t_x,
-                        t_z,
-                        f64::from(corners.nw),
-                        f64::from(corners.ne),
-                        f64::from(corners.sw),
-                        f64::from(corners.se),
-                    );
-                    interp.floor() as i32 + surface_depth - 8
-                } else {
-                    0
-                };
+                let min_surface_level = preliminary_surface_corners
+                    .map_or(0, |corners| {
+                        corners.min_surface_level(local_x, local_z, surface_depth)
+                    });
 
                 // Vanilla's steep predicate is asymmetric: south >= north + 4
                 // or west >= east + 4. Do not replace this with an absolute

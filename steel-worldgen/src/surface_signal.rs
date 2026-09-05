@@ -16,6 +16,8 @@
 
 use crate::density::{DimensionNoises, NoiseSettings};
 use crate::noise::ColumnFlow;
+use crate::surface_stage::{PreliminarySurfaceCorners, SurfaceExtensions};
+use crate::surface_system::SurfaceSystem;
 use steel_registry::blocks::block_state_ext::BlockStateExt;
 use steel_utils::BlockStateId;
 
@@ -34,20 +36,126 @@ use steel_utils::BlockStateId;
 /// raising it to 2, 8 or 32 changes nothing.
 pub const DEFAULT_SURFACE_SIGNAL_LOOKAHEAD: i32 = 1;
 
-/// Blocks above a column's topmost noise block that the window still covers.
+/// Blocks above a column's topmost noise block that a fixed window covers.
 ///
-/// The Surface stage does not only rewrite blocks the noise produced. It also
-/// writes above them, so a window that stops at the top of the noise column
-/// silently drops those writes and reports a lower surface. The measured
-/// example is frozen ocean, where a generated column surfaces at Y 72 while a
-/// window with no headroom reports 62.
-///
-/// This value is a working figure, not a proven bound. The equivalence test
-/// sweeps it, and the smallest exact headroom depends on which columns are
-/// sampled: one declared fixture set needed 16 and another needed 4. Nothing
-/// here establishes a maximum for the whole Overworld, so a production version
-/// needs either a proof from the extension code or a much wider sample.
+/// This is the value the first prototype shipped, and it is kept only so the
+/// equivalence test can still measure a fixed window against the derived one.
+/// It is not a bound. The Surface stage writes above the noise column through
+/// two extensions whose reach is decided by noise, so no constant is exact
+/// everywhere, and this one is wrong in eroded badlands. Use
+/// [`SurfaceSignalWindow::Derived`] instead.
 pub const DEFAULT_SURFACE_SIGNAL_HEADROOM: i32 = 16;
+
+/// How a bounded producer decides the vertical extent of its window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceSignalWindow {
+    /// A constant number of blocks above the topmost noise block.
+    ///
+    /// Measurement only. Nothing establishes that any constant is enough.
+    Fixed(i32),
+    /// The extent the Surface stage's own extensions ask for.
+    ///
+    /// The Surface rules descend from the world-surface heightmap and never
+    /// write above it, so the noise column alone needs no headroom. Only the
+    /// eroded badlands and frozen ocean extensions write higher, and each
+    /// decides how high from 2D noise at the column's own X and Z before any
+    /// block exists. Asking them directly replaces a guess with the value
+    /// they will use.
+    Derived,
+}
+
+/// The vertical extent one chunk's surface extensions require.
+///
+/// `ceiling` is exclusive. Both fields are already the maximum and minimum
+/// over the chunk's 256 columns, because the windowed chunk is one box rather
+/// than 256 independent columns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExtensionWindowDemand {
+    /// Lowest block Y an extension reads or writes.
+    pub floor: Option<i32>,
+    /// Exclusive upper bound of the blocks an extension reads or writes.
+    pub ceiling: Option<i32>,
+}
+
+impl ExtensionWindowDemand {
+    /// The demand of a chunk whose biome source needs no extension.
+    pub const NONE: Self = Self {
+        floor: None,
+        ceiling: None,
+    };
+
+    /// Records one column's required top block Y.
+    fn require_top(&mut self, top_block_y: i32) {
+        // The badlands extension reports a new start height one block above
+        // its topmost write, and the Surface rules then read that slot. The
+        // frozen ocean extension starts one block above its iceberg top.
+        // Both therefore need one slot above `top_block_y`, and the ceiling
+        // is exclusive, so it sits two above.
+        let ceiling = top_block_y + 2;
+        self.ceiling = Some(self.ceiling.map_or(ceiling, |current: i32| current.max(ceiling)));
+    }
+
+    /// Records one column's required bottom block Y.
+    fn require_floor(&mut self, floor_block_y: i32) {
+        self.floor = Some(self.floor.map_or(floor_block_y, |current: i32| current.min(floor_block_y)));
+    }
+}
+
+/// Asks a chunk's active surface extensions how far they reach.
+///
+/// The biome at each column is not known before the fill runs, so every
+/// extension the biome source can produce is evaluated at every column. That
+/// is conservative rather than exact: it can only widen the window, never
+/// narrow it below what the generated path needs. It costs three 2D noise
+/// samples per column per active extension, against the tens of thousands of
+/// density evaluations the window removes.
+///
+/// `preliminary_surface_corners` is required for the frozen ocean floor and
+/// is otherwise unused. Passing `None` while that extension is active leaves
+/// the floor unconstrained, which is not safe, so the caller supplies the
+/// same corners it hands the Surface stage.
+#[must_use]
+pub fn extension_window_demand(
+    system: &SurfaceSystem,
+    extensions: SurfaceExtensions,
+    chunk_min_x: i32,
+    chunk_min_z: i32,
+    preliminary_surface_corners: Option<PreliminarySurfaceCorners>,
+) -> ExtensionWindowDemand {
+    let mut demand = ExtensionWindowDemand::NONE;
+    if !extensions.eroded_badlands && !extensions.frozen_ocean {
+        return demand;
+    }
+
+    for local_z in 0..16usize {
+        for local_x in 0..16usize {
+            let block_x = chunk_min_x + local_x as i32;
+            let block_z = chunk_min_z + local_z as i32;
+
+            if extensions.eroded_badlands
+                && let Some(top) = system.eroded_badlands_extension_top(block_x, block_z)
+            {
+                demand.require_top(top);
+            }
+
+            if extensions.frozen_ocean
+                && let Some(top) = system.frozen_ocean_extension_top(block_x, block_z)
+            {
+                demand.require_top(top);
+                if let Some(corners) = preliminary_surface_corners {
+                    let surface_depth = system.get_surface_depth(block_x, block_z);
+                    demand.require_floor(corners.min_surface_level(
+                        local_x,
+                        local_z,
+                        surface_depth,
+                    ));
+                }
+            }
+        }
+    }
+
+    demand
+}
 
 /// What the bounded producer skipped relative to a full column fill.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

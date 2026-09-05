@@ -420,10 +420,52 @@ impl SurfaceSystem {
 }
 
 impl SurfaceSystem {
+    /// Topmost block Y `eroded_badlands_extension` can write in this column.
+    ///
+    /// The extension's vertical reach depends only on `block_x` and `block_z`:
+    /// three 2D noise samples fix it before any block of the column exists. A
+    /// producer that materializes part of a column can therefore size its
+    /// window from this rather than guess a headroom above the noise. `None`
+    /// means the extension writes nothing at this column.
+    #[must_use]
+    pub fn eroded_badlands_extension_top(&self, block_x: i32, block_z: i32) -> Option<i32> {
+        let pillar_buffer = f64::min(
+            (self
+                .badlands_surface_noise
+                .get_value(f64::from(block_x), 0.0, f64::from(block_z))
+                * 8.25)
+                .abs(),
+            self.badlands_pillar_noise.get_value(
+                f64::from(block_x) * 0.2,
+                0.0,
+                f64::from(block_z) * 0.2,
+            ) * 15.0,
+        );
+
+        if pillar_buffer <= 0.0 {
+            return None;
+        }
+
+        let pillar_floor = (self.badlands_pillar_roof_noise.get_value(
+            f64::from(block_x) * 0.75,
+            0.0,
+            f64::from(block_z) * 0.75,
+        ) * 1.5)
+            .abs();
+
+        let extension_top = 64.0
+            + f64::min(
+                pillar_buffer * pillar_buffer * 2.5,
+                (pillar_floor * 50.0).ceil() + 24.0,
+            );
+        Some(extension_top.floor() as i32)
+    }
+
     /// Eroded badlands extension — adds terracotta pillars above the surface.
     ///
-    /// Matches vanilla's `SurfaceSystem.erodedBadlandsExtension()`.
-    /// Returns the new `start_height` if blocks were added above the original surface.
+    /// Matches vanilla's `SurfaceSystem.erodedBadlandsExtension()`. Returns the
+    /// new `start_height` if blocks were added above the original surface, and
+    /// `height` unchanged otherwise.
     #[expect(
         clippy::too_many_arguments,
         reason = "matches vanilla SurfaceSystem.erodedBadlandsExtension signature"
@@ -439,36 +481,9 @@ impl SurfaceSystem {
         height: i32,
         min_y: i32,
     ) -> i32 {
-        let pillar_buffer = f64::min(
-            (self
-                .badlands_surface_noise
-                .get_value(f64::from(block_x), 0.0, f64::from(block_z))
-                * 8.25)
-                .abs(),
-            self.badlands_pillar_noise.get_value(
-                f64::from(block_x) * 0.2,
-                0.0,
-                f64::from(block_z) * 0.2,
-            ) * 15.0,
-        );
-
-        if pillar_buffer <= 0.0 {
+        let Some(start_y) = self.eroded_badlands_extension_top(block_x, block_z) else {
             return height;
-        }
-
-        let pillar_floor = (self.badlands_pillar_roof_noise.get_value(
-            f64::from(block_x) * 0.75,
-            0.0,
-            f64::from(block_z) * 0.75,
-        ) * 1.5)
-            .abs();
-
-        let extension_top = 64.0
-            + f64::min(
-                pillar_buffer * pillar_buffer * 2.5,
-                (pillar_floor * 50.0).ceil() + 24.0,
-            );
-        let start_y = extension_top.floor() as i32;
+        };
 
         if height > start_y {
             return height;
@@ -504,6 +519,55 @@ impl SurfaceSystem {
         start_y + 1
     }
 
+    /// Iceberg height above sea level before the slight-melt reduction.
+    ///
+    /// `None` means no iceberg forms at this column. Like the badlands
+    /// ceiling this depends only on `block_x` and `block_z`.
+    fn frozen_ocean_iceberg_height(&self, block_x: i32, block_z: i32) -> Option<f64> {
+        let iceberg = f64::min(
+            (self
+                .iceberg_surface_noise
+                .get_value(f64::from(block_x), 0.0, f64::from(block_z))
+                * 8.25)
+                .abs(),
+            self.iceberg_pillar_noise.get_value(
+                f64::from(block_x) * 1.28,
+                0.0,
+                f64::from(block_z) * 1.28,
+            ) * 15.0,
+        );
+
+        if iceberg <= 1.8 {
+            return None;
+        }
+
+        let iceberg_roof = (self.iceberg_pillar_roof_noise.get_value(
+            f64::from(block_x) * 1.17,
+            0.0,
+            f64::from(block_z) * 1.17,
+        ) * 1.5)
+            .abs();
+
+        Some(f64::min(
+            iceberg * iceberg * 1.2,
+            (iceberg_roof * 40.0).ceil() + 14.0,
+        ))
+    }
+
+    /// Topmost block Y `collect_frozen_ocean_extension_writes` can write in
+    /// this column, ignoring the column's own height and the slight melt.
+    ///
+    /// The melt test needs the column's biome, which a producer sizing a
+    /// window does not have yet, and it only ever lowers the iceberg by two
+    /// blocks. Leaving it out therefore keeps this an upper bound rather than
+    /// an estimate. `None` means the extension writes nothing above the
+    /// column's own height here.
+    #[must_use]
+    pub fn frozen_ocean_extension_top(&self, block_x: i32, block_z: i32) -> Option<i32> {
+        let top = self.frozen_ocean_iceberg_height(block_x, block_z)?;
+        (top > 2.0).then(|| (top + f64::from(self.sea_level)) as i32)
+    }
+
     /// Frozen ocean iceberg extension — adds packed ice and snow blocks.
     ///
     /// Collects the same writes as vanilla's `SurfaceSystem.frozenOceanExtension()`.
@@ -523,31 +587,9 @@ impl SurfaceSystem {
         column: &[BlockStateId],
         writes: &mut Vec<(usize, BlockStateId)>,
     ) {
-        let iceberg = f64::min(
-            (self
-                .iceberg_surface_noise
-                .get_value(f64::from(block_x), 0.0, f64::from(block_z))
-                * 8.25)
-                .abs(),
-            self.iceberg_pillar_noise.get_value(
-                f64::from(block_x) * 1.28,
-                0.0,
-                f64::from(block_z) * 1.28,
-            ) * 15.0,
-        );
-
-        if iceberg <= 1.8 {
+        let Some(mut top) = self.frozen_ocean_iceberg_height(block_x, block_z) else {
             return;
-        }
-
-        let iceberg_roof = (self.iceberg_pillar_roof_noise.get_value(
-            f64::from(block_x) * 1.17,
-            0.0,
-            f64::from(block_z) * 1.17,
-        ) * 1.5)
-            .abs();
-
-        let mut top = f64::min(iceberg * iceberg * 1.2, (iceberg_roof * 40.0).ceil() + 14.0);
+        };
 
         if self.should_melt_frozen_ocean_iceberg_slightly(biome_id, block_x, block_z) {
             top -= 2.0;
