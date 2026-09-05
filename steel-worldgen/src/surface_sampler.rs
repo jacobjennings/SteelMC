@@ -2225,14 +2225,16 @@ impl VegetationBlockAccess for InMemoryVegetationRegion<'_> {
     }
 }
 
-fn canonical_block_key(state: BlockStateId) -> String {
+/// Canonical block identifier for a state, as the terrain payload spells it.
+pub fn canonical_block_key(state: BlockStateId) -> String {
     let Some(block) = REGISTRY.blocks.by_state_id(state) else {
         panic!("surface host produced an unknown block state {}", state.0);
     };
     block.key.to_string()
 }
 
-fn canonical_block_state_key(state: BlockStateId) -> String {
+/// Canonical block state key, including properties, as the payload spells it.
+pub fn canonical_block_state_key(state: BlockStateId) -> String {
     let block = canonical_block_key(state);
     let properties = REGISTRY.blocks.get_properties(state);
     if properties.is_empty() {

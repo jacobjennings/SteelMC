@@ -1,13 +1,14 @@
 //! Byte-oriented WebAssembly adapter for Steel world generation.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use serde::Serialize;
 use steel_registry::REGISTRY;
 use steel_utils::random::{
     Random, RandomSplitter, legacy_random::LegacyRandom, xoroshiro::Xoroshiro,
 };
-use steel_utils::{BlockPos, ChunkPos};
+use steel_utils::{BlockPos, BlockStateId, ChunkPos};
 use steel_worldgen::{
     biomes::BiomeSourceKind,
     density::{DimensionNoises, NoiseSettings},
@@ -17,8 +18,9 @@ use steel_worldgen::{
     structure::{GenerationContext, StructureGenerator, StructureStart},
     surface_sampler::{
         DEFAULT_SURFACE_CHUNK_CACHE_CAPACITY, NoiseVolume, SurfaceChunkCache, SurfaceDimension,
-        SurfaceSampler, SurfaceTile,
+        SurfaceSampler, SurfaceTile, canonical_block_state_key,
     },
+    surface_signal::{DEFAULT_SURFACE_SIGNAL_LOOKAHEAD, SurfaceSignalStats, SurfaceSignalWindow},
 };
 use wasm_bindgen::prelude::*;
 
@@ -118,6 +120,53 @@ impl SteelWorldgen {
             tile,
             None,
             compact_surface_blocks.unwrap_or(false),
+        ))
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Runs one chunk through the bounded surface signal or the generated path.
+    ///
+    /// Both arms return the same per-column shape, so a caller can time them
+    /// against each other and compare their results on the same chunk. The
+    /// generated path stays authoritative: nothing here changes what a tile
+    /// contains, and no tile entry point calls this.
+    ///
+    /// `include_columns` controls whether the per-column arrays are
+    /// serialized. A timing caller leaves it off and reads `digest`, which is
+    /// computed from every column either way so the work cannot be skipped.
+    ///
+    /// # Errors
+    /// Returns an error when serialization fails.
+    pub fn surface_signal_columns(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+        bounded: bool,
+        include_columns: Option<bool>,
+    ) -> Result<String, JsValue> {
+        let (columns, stats) = if bounded {
+            let (columns, stats) = self.sampler.surface_signal_chunk(
+                chunk_x,
+                chunk_z,
+                DEFAULT_SURFACE_SIGNAL_LOOKAHEAD,
+                SurfaceSignalWindow::Derived,
+            );
+            (columns, Some(stats))
+        } else {
+            (
+                self.sampler.generated_surface_columns(chunk_x, chunk_z),
+                None,
+            )
+        };
+        serde_json::to_string(&SurfaceSignalColumnsResponse::new(
+            &self.seed,
+            self.dimension,
+            chunk_x,
+            chunk_z,
+            bounded,
+            &columns,
+            stats,
+            include_columns.unwrap_or(false),
         ))
         .map_err(|error| JsValue::from_str(&error.to_string()))
     }
@@ -428,6 +477,123 @@ fn horizontal_distance_sqr(a: BlockPos, b: BlockPos) -> i64 {
     let dx = i64::from(a.0.x) - i64::from(b.0.x);
     let dz = i64::from(a.0.z) - i64::from(b.0.z);
     dx * dx + dz * dz
+}
+
+/// One chunk's per-column surface result from one of the two producers.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SurfaceSignalColumnsResponse<'a> {
+    seed: &'a str,
+    dimension: &'a str,
+    chunk_x: i32,
+    chunk_z: i32,
+    /// True for the bounded producer, false for the generated path.
+    bounded: bool,
+    /// Every column folded into one number, so a timing-only call still pays
+    /// for the whole result and cannot have it optimized away.
+    digest: i64,
+    /// Columns that produced a block at all.
+    present_columns: u32,
+    /// Distinct canonical block state keys the chunk produced.
+    distinct_states: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    heights: Option<Vec<i16>>,
+    /// Index into `states`, parallel to `heights`. A column with no block
+    /// carries the index of its state anyway, and `exists` says which.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_indices: Option<Vec<u16>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    states: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exists: Option<Vec<bool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats: Option<SurfaceSignalStatsResponse>,
+}
+
+impl<'a> SurfaceSignalColumnsResponse<'a> {
+    fn new(
+        seed: &'a str,
+        dimension: &'a str,
+        chunk_x: i32,
+        chunk_z: i32,
+        bounded: bool,
+        columns: &[(i16, BlockStateId, bool)],
+        stats: Option<SurfaceSignalStats>,
+        include_columns: bool,
+    ) -> Self {
+        let mut digest: i64 = 0;
+        let mut present_columns = 0;
+        let mut state_lookup: HashMap<BlockStateId, u16> = HashMap::new();
+        let mut states: Vec<String> = Vec::new();
+        let mut state_indices: Vec<u16> = Vec::with_capacity(columns.len());
+        let mut heights: Vec<i16> = Vec::with_capacity(columns.len());
+        let mut exists: Vec<bool> = Vec::with_capacity(columns.len());
+        for (index, (height, state, column_exists)) in columns.iter().enumerate() {
+            let index = index as i64;
+            digest = digest
+                .wrapping_add(i64::from(*height).wrapping_mul(index + 1))
+                .wrapping_add(i64::from(state.0).wrapping_mul(index + 3))
+                .wrapping_add(i64::from(*column_exists));
+            if *column_exists {
+                present_columns += 1;
+            }
+            let state_index = match state_lookup.get(state) {
+                Some(state_index) => *state_index,
+                None => {
+                    let state_index = u16::try_from(states.len()).unwrap_or(u16::MAX);
+                    state_lookup.insert(*state, state_index);
+                    states.push(canonical_block_state_key(*state));
+                    state_index
+                }
+            };
+            state_indices.push(state_index);
+            heights.push(*height);
+            exists.push(*column_exists);
+        }
+        let distinct_states = states.len();
+        Self {
+            seed,
+            dimension,
+            chunk_x,
+            chunk_z,
+            bounded,
+            digest,
+            present_columns,
+            distinct_states,
+            heights: include_columns.then_some(heights),
+            state_indices: include_columns.then_some(state_indices),
+            states: include_columns.then_some(states),
+            exists: include_columns.then_some(exists),
+            stats: stats.map(SurfaceSignalStatsResponse::from),
+        }
+    }
+}
+
+/// What the bounded producer skipped, as the browser reads it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SurfaceSignalStatsResponse {
+    density_evaluations: u64,
+    full_density_evaluations: u64,
+    windowed_block_slots: usize,
+    full_block_slots: usize,
+    window_min_y: i32,
+    window_max_y: i32,
+    unbounded_columns: u32,
+}
+
+impl From<SurfaceSignalStats> for SurfaceSignalStatsResponse {
+    fn from(stats: SurfaceSignalStats) -> Self {
+        Self {
+            density_evaluations: stats.density_evaluations,
+            full_density_evaluations: stats.full_density_evaluations,
+            windowed_block_slots: stats.windowed_block_slots,
+            full_block_slots: stats.full_block_slots,
+            window_min_y: stats.window_min_y,
+            window_max_y: stats.window_max_y,
+            unbounded_columns: stats.unbounded_columns,
+        }
+    }
 }
 
 #[derive(Serialize)]
