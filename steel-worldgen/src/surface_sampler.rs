@@ -28,8 +28,8 @@ use crate::surface::{
     SurfaceStage, SurfaceSystem,
 };
 use crate::surface_signal::{
-    ColumnRecorder, ExtensionWindowDemand, SurfaceSignalStats, SurfaceSignalWindow,
-    extension_window_demand,
+    ColumnRecorder, DEFAULT_SURFACE_SIGNAL_LOOKAHEAD, ExtensionWindowDemand, SurfaceSignalStats,
+    SurfaceSignalWindow, extension_window_demand,
 };
 use crate::utils::find_solid_surface_below_ceiling;
 use crate::vegetation::{VegetationBlockAccess, VegetationStage};
@@ -179,11 +179,34 @@ pub struct SurfaceChunkCacheStats {
     pub peak_retained_chunks: usize,
     /// Largest simultaneous payload of flat chunks used for vegetation.
     pub peak_live_flat_chunk_bytes: usize,
+    /// Retained entries whose bounded columns were replaced by generated ones.
+    ///
+    /// A cheap Coarse entry must never be what a later Full request builds on,
+    /// so this counts the times a Full request found one and regenerated it.
+    pub bounded_surface_replacements: u64,
+}
+
+/// Which producer filled a cache entry's pre-carver surface columns.
+///
+/// [`CoarseSurfaceSource::Generated`] is the authoritative path and the
+/// default everywhere. [`CoarseSurfaceSource::Bounded`] selects the bounded
+/// top-surface producer, which reproduces the same per-column height, block
+/// state and presence flag without materializing the whole column. It is a
+/// research toggle: it is exact on the fixtures it has been measured on and
+/// is not proven exact everywhere, so nothing selects it by default and
+/// anything needing the generated path regenerates rather than reusing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoarseSurfaceSource {
+    /// Columns read from a fully generated chunk.
+    Generated,
+    /// Columns read from the bounded top-surface producer.
+    Bounded,
 }
 
 struct CachedSurfaceChunk {
     pre_carver_surface: Box<[SurfaceColumn; 256]>,
     post_carver: Option<PalettizedSurfaceChunk>,
+    surface_source: CoarseSurfaceSource,
     last_used: u64,
 }
 
@@ -360,7 +383,15 @@ impl SurfaceSampler {
         size: u32,
         resolution: u32,
     ) -> SurfaceTile {
-        self.tile_with_cache_mode(cache, origin_x, origin_z, size, resolution, true)
+        self.tile_with_cache_mode(
+            cache,
+            origin_x,
+            origin_z,
+            size,
+            resolution,
+            true,
+            CoarseSurfaceSource::Generated,
+        )
     }
 
     /// Samples an exact square without generating or carving the vegetation halo.
@@ -373,7 +404,41 @@ impl SurfaceSampler {
         size: u32,
         resolution: u32,
     ) -> SurfaceTile {
-        self.tile_with_cache_mode(cache, origin_x, origin_z, size, resolution, false)
+        self.coarse_tile_with_cache_from(
+            cache,
+            origin_x,
+            origin_z,
+            size,
+            resolution,
+            CoarseSurfaceSource::Generated,
+        )
+    }
+
+    /// Samples a coarse square, choosing which producer fills its columns.
+    ///
+    /// The returned tile has the same shape, palettes and field meanings
+    /// whichever source is chosen: only the way the surface columns are
+    /// produced differs. [`CoarseSurfaceSource::Generated`] is what
+    /// [`Self::coarse_tile_with_cache`] uses and stays authoritative.
+    #[must_use]
+    pub fn coarse_tile_with_cache_from(
+        &self,
+        cache: &mut SurfaceChunkCache,
+        origin_x: i32,
+        origin_z: i32,
+        size: u32,
+        resolution: u32,
+        surface_source: CoarseSurfaceSource,
+    ) -> SurfaceTile {
+        self.tile_with_cache_mode(
+            cache,
+            origin_x,
+            origin_z,
+            size,
+            resolution,
+            false,
+            surface_source,
+        )
     }
 
     /// Samples biomes using a dimension-appropriate approximate surface.
@@ -444,13 +509,27 @@ impl SurfaceSampler {
     ) -> Vec<(i16, BlockStateId, bool)> {
         let mut cache = SurfaceChunkCache::new(4);
         match self {
-            Self::Overworld(sampler) => {
-                sampler.ensure_cached_chunk(&mut cache, chunk_x, chunk_z, false)
-            }
-            Self::Nether(sampler) => {
-                sampler.ensure_cached_chunk(&mut cache, chunk_x, chunk_z, false)
-            }
-            Self::End(sampler) => sampler.ensure_cached_chunk(&mut cache, chunk_x, chunk_z, false),
+            Self::Overworld(sampler) => sampler.ensure_cached_chunk(
+                &mut cache,
+                chunk_x,
+                chunk_z,
+                false,
+                CoarseSurfaceSource::Generated,
+            ),
+            Self::Nether(sampler) => sampler.ensure_cached_chunk(
+                &mut cache,
+                chunk_x,
+                chunk_z,
+                false,
+                CoarseSurfaceSource::Generated,
+            ),
+            Self::End(sampler) => sampler.ensure_cached_chunk(
+                &mut cache,
+                chunk_x,
+                chunk_z,
+                false,
+                CoarseSurfaceSource::Generated,
+            ),
         }
         let chunk = cache
             .touch((chunk_x, chunk_z))
@@ -470,6 +549,7 @@ impl SurfaceSampler {
         size: u32,
         resolution: u32,
         include_vegetation: bool,
+        surface_source: CoarseSurfaceSource,
     ) -> SurfaceTile {
         match self {
             Self::Overworld(sampler) => sampler.tile_with_cache(
@@ -479,6 +559,7 @@ impl SurfaceSampler {
                 size,
                 resolution,
                 include_vegetation,
+                surface_source,
             ),
             Self::Nether(sampler) => sampler.tile_with_cache(
                 cache,
@@ -487,6 +568,7 @@ impl SurfaceSampler {
                 size,
                 resolution,
                 include_vegetation,
+                surface_source,
             ),
             Self::End(sampler) => sampler.tile_with_cache(
                 cache,
@@ -495,6 +577,7 @@ impl SurfaceSampler {
                 size,
                 resolution,
                 include_vegetation,
+                surface_source,
             ),
         }
     }
@@ -671,6 +754,7 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         size: u32,
         resolution: u32,
         include_vegetation: bool,
+        surface_source: CoarseSurfaceSource,
     ) -> SurfaceTile {
         assert!(size > 0 && resolution > 0 && size.is_multiple_of(resolution));
         let samples_per_side = size / resolution + 1;
@@ -691,7 +775,13 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
                 let z = origin_z.saturating_add((sample_z * resolution) as i32);
                 let chunk_x = x.div_euclid(16);
                 let chunk_z = z.div_euclid(16);
-                self.ensure_cached_chunk(cache, chunk_x, chunk_z, include_vegetation);
+                self.ensure_cached_chunk(
+                    cache,
+                    chunk_x,
+                    chunk_z,
+                    include_vegetation,
+                    surface_source,
+                );
                 let chunk = cache
                     .touch((chunk_x, chunk_z))
                     .expect("surface chunk must have been cached");
@@ -909,7 +999,16 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         let mut chunks = HashMap::new();
         for chunk_z in source_min_chunk_z - 1..=source_max_chunk_z + 1 {
             for chunk_x in source_min_chunk_x - 1..=source_max_chunk_x + 1 {
-                self.ensure_cached_chunk(cache, chunk_x, chunk_z, true);
+                // The vegetation halo reads whole carved columns, so every
+                // source chunk takes the generated path even when the caller
+                // reached here through a bounded Coarse request.
+                self.ensure_cached_chunk(
+                    cache,
+                    chunk_x,
+                    chunk_z,
+                    true,
+                    CoarseSurfaceSource::Generated,
+                );
                 let cached_chunk = cache
                     .touch((chunk_x, chunk_z))
                     .expect("vegetation halo chunk must have been cached");
@@ -1046,48 +1145,83 @@ impl<N: DimensionNoises> DimensionSurfaceSampler<N> {
         chunk_x: i32,
         chunk_z: i32,
         include_carvers: bool,
+        surface_source: CoarseSurfaceSource,
     ) {
         let key = (chunk_x, chunk_z);
-        if cache.chunks.contains_key(&key) {
+        if let Some(entry) = cache.chunks.get(&key) {
             cache.stats.hits += 1;
-            if include_carvers
-                && cache
-                    .chunks
-                    .get(&key)
-                    .is_some_and(|entry| entry.post_carver.is_none())
-            {
-                let mut post_carver = self.sample_surface_chunk_data(chunk_x, chunk_z);
-                self.apply_carvers_to_chunk(&mut post_carver);
+            let missing_carvers = include_carvers && entry.post_carver.is_none();
+            // A retained entry produced by the bounded source is never what a
+            // carving or vegetation request builds on. That request already
+            // regenerates the whole chunk to carve it, so taking the generated
+            // columns from the chunk it just made costs nothing and removes any
+            // chance of a cheap Coarse entry deciding what Full shows.
+            let bounded_columns = matches!(entry.surface_source, CoarseSurfaceSource::Bounded);
+            if missing_carvers || (include_carvers && bounded_columns) {
+                let mut chunk = self.sample_surface_chunk_data(chunk_x, chunk_z);
+                let regenerated = self.pre_carver_columns(&chunk);
+                self.apply_carvers_to_chunk(&mut chunk);
+                let post_carver = PalettizedSurfaceChunk::from(chunk);
+                if bounded_columns {
+                    cache.stats.bounded_surface_replacements += 1;
+                }
                 if let Some(entry) = cache.chunks.get_mut(&key) {
-                    entry.post_carver = Some(PalettizedSurfaceChunk::from(post_carver));
+                    entry.pre_carver_surface = regenerated;
+                    entry.post_carver = Some(post_carver);
+                    entry.surface_source = CoarseSurfaceSource::Generated;
                 }
             }
             return;
         }
         cache.stats.misses += 1;
-        let pre_carver_chunk = self.sample_surface_chunk_data(chunk_x, chunk_z);
-        let pre_carver_surface = Box::new(std::array::from_fn(|index| {
-            let (height, state, exists) = pre_carver_chunk.surface_column(index, self.surface_view);
-            SurfaceColumn {
-                height,
-                state,
-                exists,
-            }
-        }));
-        let post_carver = include_carvers.then(|| {
-            let mut chunk = pre_carver_chunk;
-            self.apply_carvers_to_chunk(&mut chunk);
-            PalettizedSurfaceChunk::from(chunk)
-        });
+        // The bounded producer supplies surface columns only. Anything needing
+        // the whole column, which is everything carvers and vegetation touch,
+        // takes the generated path regardless of what was asked for.
+        let use_bounded =
+            matches!(surface_source, CoarseSurfaceSource::Bounded) && !include_carvers;
+        let (pre_carver_surface, post_carver, entry_source) = if use_bounded {
+            let (columns, _stats) = self.surface_signal_chunk(
+                chunk_x,
+                chunk_z,
+                DEFAULT_SURFACE_SIGNAL_LOOKAHEAD,
+                SurfaceSignalWindow::Derived,
+            );
+            (columns, None, CoarseSurfaceSource::Bounded)
+        } else {
+            let pre_carver_chunk = self.sample_surface_chunk_data(chunk_x, chunk_z);
+            let pre_carver_surface = self.pre_carver_columns(&pre_carver_chunk);
+            let post_carver = include_carvers.then(|| {
+                let mut chunk = pre_carver_chunk;
+                self.apply_carvers_to_chunk(&mut chunk);
+                PalettizedSurfaceChunk::from(chunk)
+            });
+            (
+                pre_carver_surface,
+                post_carver,
+                CoarseSurfaceSource::Generated,
+            )
+        };
         cache.clock = cache.clock.wrapping_add(1);
         cache.insert(
             key,
             CachedSurfaceChunk {
                 pre_carver_surface,
                 post_carver,
+                surface_source: entry_source,
                 last_used: cache.clock,
             },
         );
+    }
+
+    fn pre_carver_columns(&self, chunk: &InMemorySurfaceChunk) -> Box<[SurfaceColumn; 256]> {
+        Box::new(std::array::from_fn(|index| {
+            let (height, state, exists) = chunk.surface_column(index, self.surface_view);
+            SurfaceColumn {
+                height,
+                state,
+                exists,
+            }
+        }))
     }
 
     fn sample_surface_chunk_data(&self, chunk_x: i32, chunk_z: i32) -> InMemorySurfaceChunk {

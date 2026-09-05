@@ -1,6 +1,6 @@
 //! Byte-oriented WebAssembly adapter for Steel world generation.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use serde::Serialize;
@@ -17,8 +17,8 @@ use steel_worldgen::{
     noise_parameters::get_noise_parameters,
     structure::{GenerationContext, StructureGenerator, StructureStart},
     surface_sampler::{
-        DEFAULT_SURFACE_CHUNK_CACHE_CAPACITY, NoiseVolume, SurfaceChunkCache, SurfaceDimension,
-        SurfaceSampler, SurfaceTile, canonical_block_state_key,
+        CoarseSurfaceSource, DEFAULT_SURFACE_CHUNK_CACHE_CAPACITY, NoiseVolume, SurfaceChunkCache,
+        SurfaceDimension, SurfaceSampler, SurfaceTile, canonical_block_state_key,
     },
     surface_signal::{DEFAULT_SURFACE_SIGNAL_LOOKAHEAD, SurfaceSignalStats, SurfaceSignalWindow},
 };
@@ -48,6 +48,7 @@ pub struct SteelWorldgen {
     markers: StructureMarkerSampler,
     seed: String,
     dimension: &'static str,
+    coarse_surface_source: Cell<CoarseSurfaceSource>,
 }
 
 #[wasm_bindgen]
@@ -87,6 +88,7 @@ impl SteelWorldgen {
             markers,
             seed: seed.to_owned(),
             dimension: name,
+            coarse_surface_source: Cell::new(CoarseSurfaceSource::Generated),
         })
     }
 
@@ -180,6 +182,50 @@ impl SteelWorldgen {
             .peak_live_flat_chunk_bytes
     }
 
+    /// Chooses which producer fills a Coarse tile's surface columns.
+    ///
+    /// `"generated"` is the default and the authoritative path. `"bounded"`
+    /// selects the bounded top-surface producer. This is a research toggle:
+    /// the two are measured against each other through the same entry point
+    /// with the same arguments, so nothing about a caller changes when it
+    /// moves. It has no effect on `terrain_tile`, which always generates.
+    ///
+    /// # Errors
+    /// Returns an error for an unknown source name.
+    pub fn set_coarse_surface_source(&self, source: &str) -> Result<(), JsValue> {
+        let source = match source {
+            "generated" => CoarseSurfaceSource::Generated,
+            "bounded" => CoarseSurfaceSource::Bounded,
+            _ => {
+                return Err(JsValue::from_str(
+                    "coarse surface source must be \"generated\" or \"bounded\"",
+                ));
+            }
+        };
+        self.coarse_surface_source.set(source);
+        Ok(())
+    }
+
+    /// Reports which producer Coarse tiles are currently using.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn coarse_surface_source(&self) -> String {
+        match self.coarse_surface_source.get() {
+            CoarseSurfaceSource::Generated => "generated".to_owned(),
+            CoarseSurfaceSource::Bounded => "bounded".to_owned(),
+        }
+    }
+
+    /// Retained entries whose bounded columns a Full request has replaced.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn bounded_surface_replacements(&self) -> u64 {
+        self.surface_chunk_cache
+            .borrow()
+            .stats()
+            .bounded_surface_replacements
+    }
+
     /// Generates a terrain tile without vegetation generation or carving.
     ///
     /// # Errors
@@ -193,12 +239,13 @@ impl SteelWorldgen {
         compact_surface_blocks: Option<bool>,
     ) -> Result<String, JsValue> {
         validate_terrain_grid(size, resolution)?;
-        let tile = self.sampler.coarse_tile_with_cache(
+        let tile = self.sampler.coarse_tile_with_cache_from(
             &mut self.surface_chunk_cache.borrow_mut(),
             x,
             z,
             size,
             resolution,
+            self.coarse_surface_source.get(),
         );
         serde_json::to_string(&TerrainResponse::new(
             &self.seed,
