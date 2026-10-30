@@ -86,27 +86,31 @@ pub struct ChunkAccess<'a, W: BlockStorage>(pub &'a mut W);
 
 impl<W: BlockStorage> GroundCoverAccess for ChunkAccess<'_, W> {
     fn test(&mut self, predicate: &BlockPredicate, pos: BlockPos) -> bool {
-        let BlockPredicate::MatchingBlocks { blocks, offset } = predicate else {
-            panic!("unsupported comparison predicate");
-        };
-        let state = self.0.read(pos.offset(offset.x, offset.y, offset.z));
-        blocks.0.contains(&state.get_block())
+        match predicate {
+            BlockPredicate::MatchingBlocks { blocks, offset } => {
+                let state = self.0.read(pos.offset(offset.x, offset.y, offset.z));
+                blocks.0.contains(&state.get_block())
+            }
+            BlockPredicate::MatchingBlockTag { tag, offset } => self
+                .0
+                .read(pos.offset(offset.x, offset.y, offset.z))
+                .get_block()
+                .has_tag(tag),
+            BlockPredicate::Not { predicate } => !GroundCoverAccess::test(self, predicate, pos),
+            _ => panic!("unsupported comparison predicate"),
+        }
     }
 
     fn state(
         &mut self,
         provider: &BlockStateProviderKind,
-        _random: &mut WorldgenRandom,
-        _pos: BlockPos,
+        random: &mut WorldgenRandom,
+        pos: BlockPos,
     ) -> BlockStateId {
-        let BlockStateProviderKind::Simple { state } = provider else {
-            panic!("unsupported comparison provider");
-        };
-        steel_worldgen::state_resolver::WorldgenStateResolver::feature_block_state_from_data(
-            &REGISTRY,
-            state,
-            "ground-cover comparison",
-        )
+        match portable_feature::providers::state(self, &REGISTRY, provider, random, pos) {
+            Ok(state) => state,
+            Err(error) => panic!("{error}"),
+        }
     }
 
     fn optional_state(
@@ -115,7 +119,10 @@ impl<W: BlockStorage> GroundCoverAccess for ChunkAccess<'_, W> {
         random: &mut WorldgenRandom,
         pos: BlockPos,
     ) -> Option<BlockStateId> {
-        Some(self.state(provider, random, pos))
+        match portable_feature::providers::optional_state(self, &REGISTRY, provider, random, pos) {
+            Ok(state) => state,
+            Err(error) => panic!("{error}"),
+        }
     }
 
     fn accepted_neighbor(&mut self, accepted: &BlockHolderSet, pos: BlockPos) -> bool {
@@ -135,13 +142,13 @@ pub fn projected<W: BlockStorage>(
     world: &mut ChunkAccess<'_, W>,
     random: &mut WorldgenRandom,
     origin: BlockPos,
+    providers: bool,
 ) {
     let config = ProjectedRandomPatchySquareConfiguration {
-        block: BlockStateProviderKind::Simple {
-            state: BlockStateData {
-                block: &vanilla_blocks::SHORT_GRASS,
-                properties: &[],
-            },
+        block: if providers {
+            optional_weighted()
+        } else {
+            simple(&vanilla_blocks::SHORT_GRASS)
         },
         project_through: air(),
         size: IntProvider::Constant(2),
@@ -154,15 +161,23 @@ pub fn spread<W: BlockStorage>(
     world: &mut ChunkAccess<'_, W>,
     random: &mut WorldgenRandom,
     origin: BlockPos,
+    providers: bool,
 ) {
     let config = RandomNeighborSpreadConfiguration {
-        block: BlockStateProviderKind::Simple {
-            state: BlockStateData {
-                block: &vanilla_blocks::OAK_LEAVES,
-                properties: &[],
-            },
+        block: if providers {
+            weighted(
+                64,
+                &vanilla_blocks::OAK_LEAVES,
+                &vanilla_blocks::BIRCH_LEAVES,
+            )
+        } else {
+            simple(&vanilla_blocks::OAK_LEAVES)
         },
-        accepted_neighbors: BlockHolderSet::Entries(vec![&vanilla_blocks::OAK_LEAVES]),
+        accepted_neighbors: BlockHolderSet::Entries(if providers {
+            vec![&vanilla_blocks::OAK_LEAVES, &vanilla_blocks::BIRCH_LEAVES]
+        } else {
+            vec![&vanilla_blocks::OAK_LEAVES]
+        }),
         can_replace: air(),
         attempts: IntProvider::Constant(64),
         xz_offset: IntProvider::Uniform {
@@ -182,4 +197,119 @@ fn air() -> BlockPredicate {
         blocks: BlockRefList(vec![&vanilla_blocks::AIR]),
         offset: Default::default(),
     }
+}
+
+impl<W: BlockStorage> portable_feature::providers::ProviderAccess for ChunkAccess<'_, W> {
+    fn test(&mut self, predicate: &BlockPredicate, pos: BlockPos) -> Result<bool, &'static str> {
+        Ok(GroundCoverAccess::test(self, predicate, pos))
+    }
+
+    fn block(&mut self, pos: BlockPos) -> Result<BlockStateId, &'static str> {
+        Ok(self.0.read(pos))
+    }
+}
+
+fn simple(block: steel_registry::blocks::BlockRef) -> BlockStateProviderKind {
+    BlockStateProviderKind::Simple {
+        state: BlockStateData {
+            block,
+            properties: &[],
+        },
+    }
+}
+
+fn weighted(
+    total: i32,
+    first: steel_registry::blocks::BlockRef,
+    second: steel_registry::blocks::BlockRef,
+) -> BlockStateProviderKind {
+    BlockStateProviderKind::Weighted {
+        entries: vec![
+            WeightedBlockState {
+                data: BlockStateData {
+                    block: &vanilla_blocks::STONE,
+                    properties: &[],
+                },
+                weight: 0,
+            },
+            WeightedBlockState {
+                data: BlockStateData {
+                    block: first,
+                    properties: &[],
+                },
+                weight: (total / 3).max(1),
+            },
+            WeightedBlockState {
+                data: BlockStateData {
+                    block: second,
+                    properties: &[],
+                },
+                weight: total - (total / 3).max(1),
+            },
+        ],
+    }
+}
+
+fn decline() -> BlockStateProviderKind {
+    BlockStateProviderKind::RuleBased {
+        fallback: None,
+        rules: vec![],
+    }
+}
+
+fn optional_weighted() -> BlockStateProviderKind {
+    BlockStateProviderKind::RuleBased {
+        fallback: None,
+        rules: vec![
+            RuleBasedStateProviderRule {
+                if_true: air(),
+                then: decline(),
+            },
+            RuleBasedStateProviderRule {
+                if_true: air(),
+                then: weighted(3, &vanilla_blocks::SHORT_GRASS, &vanilla_blocks::FERN),
+            },
+        ],
+    }
+}
+
+// Direct readbacks exercise refusal, nested continuation, fallback and both
+// native weighted selector sizes. They do not write or select biome features.
+pub fn provider_readbacks<W: BlockStorage>(
+    world: &mut ChunkAccess<'_, W>,
+    seed: u64,
+    pos: BlockPos,
+) -> serde_json::Value {
+    use steel_utils::random::Random as _;
+    let mut random = WorldgenRandom::from_seed(seed);
+    let providers = [
+        BlockStateProviderKind::Reference(
+            &steel_registry::vanilla_block_state_providers::SOIL_BENEATH_TREE,
+        ),
+        decline(),
+        optional_weighted(),
+        BlockStateProviderKind::RuleBased {
+            fallback: Some(Box::new(simple(&vanilla_blocks::DIRT))),
+            rules: vec![],
+        },
+        weighted(1, &vanilla_blocks::SHORT_GRASS, &vanilla_blocks::FERN),
+        weighted(3, &vanilla_blocks::SHORT_GRASS, &vanilla_blocks::FERN),
+        weighted(
+            64,
+            &vanilla_blocks::OAK_LEAVES,
+            &vanilla_blocks::BIRCH_LEAVES,
+        ),
+    ];
+    let mut samples = Vec::new();
+    for provider in providers {
+        for _ in 0..12 {
+            let optional = world.optional_state(&provider, &mut random, pos);
+            let required = world.state(&provider, &mut random, pos);
+            samples.push(serde_json::json!({
+                "optional": optional.map(|state| state.get_block().key.to_string()),
+                "required": required.get_block().key.to_string(),
+            }));
+        }
+    }
+    serde_json::json!({"samples": samples, "nextInt": random.next_i32()})
 }

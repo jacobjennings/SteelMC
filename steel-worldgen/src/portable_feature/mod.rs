@@ -4,6 +4,8 @@
 //! writes immediately, including writes outside the origin chunk. These kernels
 //! do not select biome features, run placement modifiers or qualify Full terrain.
 
+pub mod providers;
+
 use steel_registry::feature::{
     BlockHolderSet, BlockPredicate, BlockStateProviderKind,
     ProjectedRandomPatchySquareConfiguration, RandomNeighborSpreadConfiguration,

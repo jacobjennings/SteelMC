@@ -72,7 +72,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(output)?;
     for (seed, x, z) in [(3_860_052, 75, -56), (12_345, -162, -190)] {
         let sampler = PortableOverworld::new(seed);
-        let region_mode = std::env::args().nth(2).as_deref() == Some("region");
+        let region_mode = std::env::args()
+            .nth(2)
+            .as_deref()
+            .is_some_and(|mode| mode == "region" || mode == "providers");
         if region_mode {
             region_snapshots(output, seed, x, z, &sampler)?;
             continue;
@@ -92,12 +95,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut ground_cover::ChunkAccess(&mut chunk),
                 &mut random,
                 origin,
+                false,
             );
             snapshot(output, seed, x, z, "projected", &chunk)?;
             ground_cover::spread(
                 &mut ground_cover::ChunkAccess(&mut chunk),
                 &mut random,
                 origin,
+                false,
             );
             snapshot(output, seed, x, z, "spread", &chunk)?;
             fs::write(
@@ -121,6 +126,7 @@ fn region_snapshots(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use steel_utils::BlockPos;
     use steel_utils::random::{Random as _, worldgen_random::WorldgenRandom};
+    let providers = std::env::args().nth(2).as_deref() == Some("providers");
     let mut chunks = Vec::new();
     let mut origin_y = None;
     for dx in -1..=1 {
@@ -140,6 +146,18 @@ fn region_snapshots(
     }
     let mut region = PortableRegion::new(sampler, chunks)?;
     let origin = BlockPos::new(x * 16 + 15, origin_y.ok_or("center missing")?, z * 16 + 15);
+    if providers {
+        let mut window = region.write_window((x, z), 1)?;
+        let readbacks = ground_cover::provider_readbacks(
+            &mut ground_cover::ChunkAccess(&mut window),
+            seed,
+            origin,
+        );
+        fs::write(
+            output.join(format!("{seed}-{x}-{z}-providers.json")),
+            serde_json::to_vec(&readbacks)?,
+        )?;
+    }
     let mut random = WorldgenRandom::from_seed(seed);
     // Radius zero deliberately rejects the portion crossing the center boundary.
     let projected_writes = {
@@ -149,6 +167,7 @@ fn region_snapshots(
             &mut ground_cover::ChunkAccess(&mut observed),
             &mut random,
             origin,
+            providers,
         );
         [observed.accepted, observed.rejected]
     };
@@ -163,11 +182,13 @@ fn region_snapshots(
             &mut ground_cover::ChunkAccess(&mut observed),
             &mut random,
             origin,
+            providers,
         );
         ground_cover::spread(
             &mut ground_cover::ChunkAccess(&mut observed),
             &mut random,
             origin.offset(1, 0, 1),
+            providers,
         );
         [observed.accepted, observed.rejected]
     };

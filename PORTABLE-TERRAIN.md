@@ -190,3 +190,40 @@ Its retained decompiled source SHA-256 is
 [The implementation continuation](https://beads.thejenningshome.com/#/board/ca-4jrrw)
 retains natural decoration, complete demanded terrain, full write side effects,
 Wasm packaging and every viewer qualification requirement.
+
+## Portable state-provider sampling
+
+`portable_feature::providers` consumes the existing generated
+`BlockStateProviderKind` data. It resolves references, simple states, weighted
+states and rule-based states without a server dependency. `ProviderAccess`
+supplies fallible live predicates and block reads. Native optional refusal is
+`Ok(None)`. An unavailable provider or world operation is an error and cannot
+become a state. The other seven provider families return errors naming the
+unavailable family.
+
+The source contracts are Java 26.3 `BlockStateProvider`, `SimpleStateProvider`,
+`WeightedStateProvider`, `RuleBasedStateProvider`, `WeightedList`, `Weighted`
+and `WeightedRandom`, retained by ChunkAtlas's `collect-provider-source.py`.
+Weighted selection consumes one bounded integer, including a single-state list.
+It preserves entry order and zero-weight entries. Negative weights, empty total
+weight and total-weight overflow are refused before consuming RNG. The compact
+native selector's ordered subtraction is equivalent to its flat selector.
+Rules run in source order. A true rule whose nested optional provider declines
+continues to the next rule. Fallback runs only after all rules decline.
+Required sampling of an ordinary refusal reads the current block, exactly as
+native `RuleBasedStateProvider.getState` does. This does not authorize an
+absent-world fallback.
+
+The example's `providers` mode retains the `region` comparison footprint and
+all Noise/Material/Carvers snapshots. Its explicit projection uses nested air
+rules and weighted short grass/fern. Spreading uses weighted oak/birch leaves
+and shares storage and RNG across two calls. Direct provider readbacks cover the generated soil provider reference,
+optional refusal, required live-state reads, nested continuation, fallback and
+weighted totals 1, 3 and 64 with zero-weight entries. These configurations are
+comparison inputs, not hand-authored native registry assets or biome features.
+
+This increment does not integrate natural biome decoration or extend the
+server's provider dispatch. Survival, native placement/order, remaining provider
+families, complete setBlock side effects, structures, browser ABI and Wasm,
+artifact promotion and rendered scene qualification remain unfinished. No
+viewer package is qualified by these provider comparisons.
