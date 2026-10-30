@@ -4,6 +4,9 @@
 //! [`steel_core::worldgen::standalone`]. Responses keep the JSON shape the
 //! viewer already reads.
 
+mod generation;
+
+use generation::{GenerationCapabilities, OperationCapability};
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 use steel_core::worldgen::standalone::{
@@ -31,6 +34,28 @@ const DEFAULT_GRASS_COLOR: i32 = 0x6a_a8_4f;
 #[must_use]
 pub fn release() -> String {
     RELEASE.to_owned()
+}
+
+/// Returns stage qualification and named refusals. This does not generate terrain.
+///
+/// # Errors
+/// Returns a serialization error.
+#[wasm_bindgen]
+pub fn generation_capabilities() -> Result<String, JsValue> {
+    serde_json::to_string(&GenerationCapabilities::current())
+        .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// Checks admission without executing the requested operation.
+///
+/// # Errors
+/// Refuses unsupported or unknown operations by their stable reason code.
+#[wasm_bindgen]
+pub fn check_generation_operation(operation: &str) -> Result<(), JsValue> {
+    match OperationCapability::for_operation(operation).refusal() {
+        Some(reason) => Err(JsValue::from_str(reason)),
+        None => Ok(()),
+    }
 }
 
 /// Checks a tile grid request.
@@ -315,6 +340,7 @@ impl Generator {
             tile,
             height_approximation,
             compact_surface_blocks.unwrap_or(false),
+            detail,
         ))
         .map_err(|error| error.to_string())
     }
@@ -385,6 +411,8 @@ pub fn canonical_block_state_key(state: BlockStateId) -> String {
 struct TerrainResponse<'a> {
     generator: &'static str,
     version: &'static str,
+    generation_stage: &'static str,
+    native_full_qualified: bool,
     seed: &'a str,
     dimension: &'a str,
     origin_x: i32,
@@ -429,6 +457,7 @@ impl<'a> TerrainResponse<'a> {
         tile: StandaloneTile,
         height_approximation: Option<&'static str>,
         compact_surface_blocks: bool,
+        detail: TileDetail,
     ) -> Self {
         let mut terrain_heights = tile
             .heights
@@ -487,6 +516,12 @@ impl<'a> TerrainResponse<'a> {
         Self {
             generator: GENERATOR,
             version: RELEASE,
+            generation_stage: match detail {
+                TileDetail::Full => "features",
+                TileDetail::Coarse => "surface",
+                TileDetail::Biome => "biome",
+            },
+            native_full_qualified: false,
             seed,
             dimension,
             origin_x,
