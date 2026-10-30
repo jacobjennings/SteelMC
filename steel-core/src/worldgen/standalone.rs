@@ -202,6 +202,18 @@ impl ChunkSnapshot {
     }
 }
 
+/// Base-noise occupancy sampled in Y-then-Z-then-X order.
+pub struct NoiseVolume {
+    /// Clipped lower sampling bound.
+    pub min_y: i32,
+    /// Horizontal samples in a chunk footprint.
+    pub cells_xz: u32,
+    /// Vertical samples, with an exclusive upper bound.
+    pub cells_y: u32,
+    /// Air, default solid, water and lava palette indices.
+    pub voxels: Vec<u8>,
+}
+
 /// Retained-work counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StandaloneStats {
@@ -348,6 +360,84 @@ impl StandaloneWorldgen {
     #[must_use]
     pub const fn stats(&self) -> StandaloneStats {
         self.stats
+    }
+
+    /// Samples Java 26.3 noise before surface, carvers or decoration.
+    ///
+    /// Structure adaptation is excluded, matching the base-noise volume contract.
+    /// The fresh chunk is dropped after sampling and never enters the Terrain cache.
+    ///
+    /// # Errors
+    /// Returns an error for invalid coordinates, vertical bounds or LOD.
+    pub fn noise_volume_chunk(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+        requested_min_y: i32,
+        requested_max_y: i32,
+        lod: u32,
+    ) -> Result<NoiseVolume, String> {
+        if !matches!(lod, 1 | 4 | 16 | 64 | 256) {
+            return Err("LOD must be one of 1, 4, 16, 64, 256".to_owned());
+        }
+        if chunk_x
+            .checked_mul(16)
+            .and_then(|x| x.checked_add(15))
+            .is_none()
+            || chunk_z
+                .checked_mul(16)
+                .and_then(|z| z.checked_add(15))
+                .is_none()
+        {
+            return Err("chunk footprint must fit signed 32-bit block coordinates".to_owned());
+        }
+        let noise_min = self.generator.min_y();
+        let min_y = requested_min_y.max(noise_min);
+        let max_y = requested_max_y.min(noise_min + self.generator.gen_depth());
+        if min_y >= max_y {
+            return Err("volume range is empty or outside this dimension".to_owned());
+        }
+        self.pool.install(|| {
+            let chunk = self.empty_chunk(ChunkPos::new(chunk_x, chunk_z));
+            let generation = GenerationChunk::<TerrainPhase>::for_standalone(&chunk);
+            self.generator.fill_from_noise(generation, None);
+            generation.clear_post_noise_state();
+            let cells_xz = 16_u32.div_ceil(lod);
+            let cells_y = (max_y - min_y) as u32;
+            let cells_y = cells_y.div_ceil(lod);
+            let mut voxels = vec![0; (cells_xz * cells_xz * cells_y) as usize];
+            let water = vanilla_blocks::WATER.default_state();
+            let lava = vanilla_blocks::LAVA.default_state();
+            let mut column = Vec::new();
+            for z in 0..cells_xz {
+                for x in 0..cells_xz {
+                    chunk.sections.read_column_into(
+                        (x * lod) as usize,
+                        (z * lod) as usize,
+                        &mut column,
+                    );
+                    for y in 0..cells_y {
+                        let state = column[(min_y - self.min_y) as usize + (y * lod) as usize];
+                        voxels[(y * cells_xz * cells_xz + z * cells_xz + x) as usize] =
+                            if state.is_air() {
+                                0
+                            } else if state == water {
+                                2
+                            } else if state == lava {
+                                3
+                            } else {
+                                1
+                            };
+                    }
+                }
+            }
+            Ok(NoiseVolume {
+                min_y,
+                cells_xz,
+                cells_y,
+                voxels,
+            })
+        })
     }
 
     /// Generates one tile.
