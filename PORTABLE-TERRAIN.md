@@ -222,6 +222,17 @@ optional refusal, required live-state reads, nested continuation, fallback and
 weighted totals 1, 3 and 64 with zero-weight entries. These configurations are
 comparison inputs, not hand-authored native registry assets or biome features.
 
+Direct readbacks use sorted state-property keys. Additional refusal reads use
+natural non-air ground, then explicit non-default leaves and an X-axis log at
+the same retained position. Storage is restored before feature calls. Simple
+and weighted readbacks must preserve those explicit properties. Invalid weights
+(negative, empty list, zero total and overflow) and all seven unavailable
+families retain named errors and independent RNG controls. Required and optional
+portable error paths are both observed. Native invalid weights reject at
+construction, while portable checks reject at sampling. Unsupported portable
+families do not claim native Java errors. `examples/support/providers.rs` owns
+these comparison-only configurations. They change no generator algorithms.
+
 This increment does not integrate natural biome decoration or extend the
 server's provider dispatch. Survival, native placement/order, remaining provider
 families, complete setBlock side effects, structures, browser ABI and Wasm,

@@ -209,7 +209,7 @@ impl<W: BlockStorage> portable_feature::providers::ProviderAccess for ChunkAcces
     }
 }
 
-fn simple(block: steel_registry::blocks::BlockRef) -> BlockStateProviderKind {
+pub(super) fn simple(block: steel_registry::blocks::BlockRef) -> BlockStateProviderKind {
     BlockStateProviderKind::Simple {
         state: BlockStateData {
             block,
@@ -218,7 +218,7 @@ fn simple(block: steel_registry::blocks::BlockRef) -> BlockStateProviderKind {
     }
 }
 
-fn weighted(
+pub(super) fn weighted(
     total: i32,
     first: steel_registry::blocks::BlockRef,
     second: steel_registry::blocks::BlockRef,
@@ -250,14 +250,14 @@ fn weighted(
     }
 }
 
-fn decline() -> BlockStateProviderKind {
+pub(super) fn decline() -> BlockStateProviderKind {
     BlockStateProviderKind::RuleBased {
         fallback: None,
         rules: vec![],
     }
 }
 
-fn optional_weighted() -> BlockStateProviderKind {
+pub(super) fn optional_weighted() -> BlockStateProviderKind {
     BlockStateProviderKind::RuleBased {
         fallback: None,
         rules: vec![
@@ -271,45 +271,4 @@ fn optional_weighted() -> BlockStateProviderKind {
             },
         ],
     }
-}
-
-// Direct readbacks exercise refusal, nested continuation, fallback and both
-// native weighted selector sizes. They do not write or select biome features.
-pub fn provider_readbacks<W: BlockStorage>(
-    world: &mut ChunkAccess<'_, W>,
-    seed: u64,
-    pos: BlockPos,
-) -> serde_json::Value {
-    use steel_utils::random::Random as _;
-    let mut random = WorldgenRandom::from_seed(seed);
-    let providers = [
-        BlockStateProviderKind::Reference(
-            &steel_registry::vanilla_block_state_providers::SOIL_BENEATH_TREE,
-        ),
-        decline(),
-        optional_weighted(),
-        BlockStateProviderKind::RuleBased {
-            fallback: Some(Box::new(simple(&vanilla_blocks::DIRT))),
-            rules: vec![],
-        },
-        weighted(1, &vanilla_blocks::SHORT_GRASS, &vanilla_blocks::FERN),
-        weighted(3, &vanilla_blocks::SHORT_GRASS, &vanilla_blocks::FERN),
-        weighted(
-            64,
-            &vanilla_blocks::OAK_LEAVES,
-            &vanilla_blocks::BIRCH_LEAVES,
-        ),
-    ];
-    let mut samples = Vec::new();
-    for provider in providers {
-        for _ in 0..12 {
-            let optional = world.optional_state(&provider, &mut random, pos);
-            let required = world.state(&provider, &mut random, pos);
-            samples.push(serde_json::json!({
-                "optional": optional.map(|state| state.get_block().key.to_string()),
-                "required": required.get_block().key.to_string(),
-            }));
-        }
-    }
-    serde_json::json!({"samples": samples, "nextInt": random.next_i32()})
 }

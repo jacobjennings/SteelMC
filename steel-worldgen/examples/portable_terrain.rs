@@ -2,6 +2,8 @@
 
 #[path = "support/ground_cover.rs"]
 mod ground_cover;
+#[path = "support/providers.rs"]
+mod provider_readbacks;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -13,6 +15,24 @@ use steel_registry::blocks::block_state_ext::BlockStateExt;
 use steel_worldgen::portable_terrain::{
     MINECRAFT_VERSION, PortableChunk, PortableOverworld, PortableRegion,
 };
+
+fn state_key(state: steel_utils::BlockStateId) -> String {
+    let mut key = state.get_block().key.to_string();
+    let mut properties = REGISTRY.blocks.get_properties(state);
+    properties.sort_by(|a, b| a.0.cmp(b.0));
+    if !properties.is_empty() {
+        key.push('[');
+        key.push_str(
+            &properties
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        key.push(']');
+    }
+    key
+}
 
 fn snapshot(
     output: &Path,
@@ -26,20 +46,7 @@ fn snapshot(
     let mut lookup = BTreeMap::new();
     let mut indices = Vec::with_capacity(chunk.states().len());
     for state in chunk.states() {
-        let mut key = state.get_block().key.to_string();
-        let mut properties = REGISTRY.blocks.get_properties(*state);
-        properties.sort_by(|a, b| a.0.cmp(b.0));
-        if !properties.is_empty() {
-            key.push('[');
-            key.push_str(
-                &properties
-                    .iter()
-                    .map(|(name, value)| format!("{name}={value}"))
-                    .collect::<Vec<_>>()
-                    .join(","),
-            );
-            key.push(']');
-        }
+        let key = state_key(*state);
         let next = palette.len();
         let index = *lookup.entry(key.clone()).or_insert_with(|| {
             palette.push(key);
@@ -148,11 +155,8 @@ fn region_snapshots(
     let origin = BlockPos::new(x * 16 + 15, origin_y.ok_or("center missing")?, z * 16 + 15);
     if providers {
         let mut window = region.write_window((x, z), 1)?;
-        let readbacks = ground_cover::provider_readbacks(
-            &mut ground_cover::ChunkAccess(&mut window),
-            seed,
-            origin,
-        );
+        let readbacks =
+            provider_readbacks::collect(&mut ground_cover::ChunkAccess(&mut window), seed, origin);
         fs::write(
             output.join(format!("{seed}-{x}-{z}-providers.json")),
             serde_json::to_vec(&readbacks)?,
