@@ -6,7 +6,7 @@
 use steel_registry::Registry;
 use steel_registry::TaggedRegistryExt as _;
 use steel_registry::blocks::block_state_ext::BlockStateExt;
-use steel_registry::blocks::properties::BlockStateProperties;
+use steel_registry::blocks::properties::{BlockStateProperties, Property};
 use steel_registry::feature::BlockHolderSet;
 use steel_registry::feature::{BlockPredicate, BlockStateProviderKind};
 use steel_utils::Direction;
@@ -98,19 +98,14 @@ pub fn optional_state(
             let direction =
                 direction.unwrap_or_else(|| Direction::ALL[random.next_i32_bounded(6) as usize]);
             let mut sampled = state(world, registry, source, random, pos)?;
-            if sampled.try_get_value(&BlockStateProperties::AXIS).is_some() {
+            if supports_property(registry, sampled, &BlockStateProperties::AXIS)? {
                 sampled = sampled.set_value(&BlockStateProperties::AXIS, direction.axis());
             }
-            if sampled
-                .try_get_value(&BlockStateProperties::FACING)
-                .is_some()
-            {
+            if supports_property(registry, sampled, &BlockStateProperties::FACING)? {
                 sampled = sampled.set_value(&BlockStateProperties::FACING, direction);
             }
             if direction.is_horizontal()
-                && sampled
-                    .try_get_value(&BlockStateProperties::HORIZONTAL_FACING)
-                    .is_some()
+                && supports_property(registry, sampled, &BlockStateProperties::HORIZONTAL_FACING)?
             {
                 sampled = sampled.set_value(&BlockStateProperties::HORIZONTAL_FACING, direction);
             }
@@ -214,6 +209,27 @@ pub fn optional_state(
         data,
         "portable state provider",
     )))
+}
+
+// Native trySetValue requires the actual property, including its allowed values.
+// Facing and horizontal facing share a name but are distinct properties.
+fn supports_property(
+    registry: &Registry,
+    state: BlockStateId,
+    property: &impl Property,
+) -> Result<bool, &'static str> {
+    let block = registry
+        .blocks
+        .by_state_id(state)
+        .ok_or("invalid portable rotated state")?;
+    let expected = property.get_possible_value_names();
+    Ok(block.properties.iter().any(|candidate| {
+        let values = candidate.get_possible_value_names();
+        candidate.get_name() == property.get_name()
+            && candidate.integer_range() == property.integer_range()
+            && values.len() == expected.len()
+            && values.iter().all(|value| expected.contains(value))
+    }))
 }
 
 mod noise;
