@@ -100,6 +100,17 @@ pub trait ChunkGenerator: Send + Sync {
         neighbor_biomes: &dyn Fn(IVec3) -> u16,
     );
 
+    /// Builds only the visible surface for a standalone Coarse request.
+    /// Implementations may omit material writes below the top solid block.
+    /// The resulting chunk must never feed Carvers or Features.
+    fn build_coarse_surface(
+        &self,
+        chunk: GenerationChunk<'_, TerrainPhase>,
+        neighbor_biomes: &dyn Fn(IVec3) -> u16,
+    ) {
+        self.build_surface(chunk, neighbor_biomes);
+    }
+
     /// Applies carvers as part of Terrain generation.
     fn apply_carvers(&self, chunk: GenerationChunk<'_, TerrainPhase>);
 

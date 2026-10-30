@@ -325,9 +325,22 @@ pub struct StandaloneWorldgen {
     decorated: FxHashMap<(i32, i32), DecoratedEntry>,
     decorated_bytes: usize,
     stats: StandaloneStats,
+    bounded_coarse_surface: bool,
 }
 
 impl StandaloneWorldgen {
+    /// Selects the surface-only material scan for future Overworld Coarse misses.
+    /// Full upgrades always regenerate complete material columns.
+    pub fn set_bounded_coarse_surface(&mut self, enabled: bool) {
+        self.bounded_coarse_surface = enabled && self.dimension == StandaloneDimension::Overworld;
+    }
+
+    /// Whether future Overworld Coarse misses use the surface-only scan.
+    #[must_use]
+    pub const fn bounded_coarse_surface(&self) -> bool {
+        self.bounded_coarse_surface
+    }
+
     /// Creates a generator for one seed and dimension.
     ///
     /// `terrain_cache_capacity` bounds retained Terrain chunks. A request that
@@ -392,6 +405,7 @@ impl StandaloneWorldgen {
             decorated: FxHashMap::default(),
             decorated_bytes: 0,
             stats: StandaloneStats::default(),
+            bounded_coarse_surface: false,
         }
     }
 
@@ -1266,7 +1280,12 @@ impl StandaloneWorldgen {
         let generation = GenerationChunk::<TerrainPhase>::for_standalone(&chunk);
         self.generator
             .fill_from_noise(generation, beardifier.as_ref());
-        self.generator.build_surface(generation, &neighbor_biomes);
+        if !carve && self.bounded_coarse_surface {
+            self.generator
+                .build_coarse_surface(generation, &neighbor_biomes);
+        } else {
+            self.generator.build_surface(generation, &neighbor_biomes);
+        }
         let surface = self.surface_columns(&chunk);
         if carve {
             self.generator.apply_carvers(generation);

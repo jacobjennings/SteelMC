@@ -299,6 +299,305 @@ impl<N: VanillaPostNoiseStateType> VanillaGenerator<N> {
     }
 }
 
+impl<N: VanillaPostNoiseStateType> VanillaGenerator<N> {
+    #[expect(clippy::too_many_lines, reason = "splitting would hurt readability")]
+    fn build_surface_with_limit(
+        &self,
+        chunk: GenerationChunk<'_, TerrainPhase>,
+        neighbor_biomes: &dyn Fn(IVec3) -> u16,
+        surface_only: bool,
+    ) {
+        let min_y = N::Settings::MIN_Y;
+        let pos = chunk.pos();
+        let chunk_min_x = pos.0.x * 16;
+        let chunk_min_z = pos.0.y * 16;
+        let surface_rule_block_states = N::surface_rule_block_states();
+        let surface_rule_uses_biome = N::surface_rule_uses_biome();
+        let surface_rule_uses_preliminary_surface = N::surface_rule_uses_preliminary_surface();
+        let surface_rule_uses_surface_secondary = N::surface_rule_uses_surface_secondary();
+        let surface_rule_uses_steep = N::surface_rule_uses_steep();
+        let material_ore_vein_values = chunk
+            .with_post_noise_state_mut::<N::State, _>(N::material_ore_vein_values)
+            .unwrap_or_else(|| Arc::from([]));
+        let material_ore_vein_value_count = N::material_ore_vein_value_count();
+        let material_ore_vein_count = material_ore_vein_value_count / 2;
+        let mut material_cache = N::ColumnCache::default();
+        let lazy_surface_rule_biome =
+            surface_rule_uses_biome && surface_rule_uses_preliminary_surface;
+        let surface_needs_min_surface_level =
+            surface_rule_uses_preliminary_surface || self.surface_extension_biomes.frozen_ocean;
+        let surface_needs_biomes =
+            surface_rule_uses_biome || self.surface_extension_biomes.needs_surface_biome();
+        let chunk_quart_x = pos.0.x * 4;
+        let chunk_quart_z = pos.0.y * 4;
+
+        chunk.prime_world_surface_heightmap();
+
+        // Pre-compute preliminary surface corners only for rules/extensions that read them.
+        let preliminary_surface_corners = surface_needs_min_surface_level
+            .then(|| self.preliminary_surface_corners(chunk, chunk_min_x, chunk_min_z));
+
+        let eroded_badlands_id = (*vanilla_biomes::ERODED_BADLANDS).id() as u16;
+        let frozen_ocean_id = (*vanilla_biomes::FROZEN_OCEAN).id() as u16;
+        let deep_frozen_ocean_id = (*vanilla_biomes::DEEP_FROZEN_OCEAN).id() as u16;
+
+        // Pre-extract biome palette values only if surface rules/extensions need them.
+        let biome_data = surface_needs_biomes.then(|| chunk.read_all_biomes());
+        let section_count = chunk.section_count();
+
+        let mut pending_writes: Vec<(usize, BlockStateId)> = Vec::new();
+        let mut column_buf: Vec<BlockStateId> = Vec::new();
+        let mut material_ore_vein_results: SmallVec<[Option<BlockStateId>; 2]> = SmallVec::new();
+        let condition_noise_values = N::surface_noise_ids()
+            .iter()
+            .map(|_| Cell::new(0.0))
+            .collect::<Vec<_>>();
+        let condition_noise_initialized = N::surface_noise_ids()
+            .iter()
+            .map(|_| Cell::new(false))
+            .collect::<Vec<_>>();
+        let condition_noise_cache =
+            SurfaceConditionNoiseCache::new(&condition_noise_values, &condition_noise_initialized);
+
+        for local_x in 0..16usize {
+            for local_z in 0..16usize {
+                let block_x = chunk_min_x + local_x as i32;
+                let block_z = chunk_min_z + local_z as i32;
+
+                // Start scanning from one above the highest non-air block
+                let mut start_height = chunk.world_surface_height_at(local_x, local_z);
+
+                // Column-local Voronoi cache for fuzzed biome lookups.
+                let mut biome_col = biome_data.as_deref().map(|biome_data| {
+                    FuzzedBiomeColumn::new(
+                        biome_data,
+                        section_count,
+                        self.biome_zoom_seed,
+                        block_x,
+                        block_z,
+                        min_y,
+                        chunk_quart_x,
+                        chunk_quart_z,
+                        neighbor_biomes,
+                    )
+                });
+
+                // Eroded badlands extension: add terracotta pillars above surface
+                let surface_biome_id = if self.surface_extension_biomes.needs_surface_biome() {
+                    biome_col
+                        .as_mut()
+                        .map(|biome_col| biome_col.get(start_height))
+                } else {
+                    None
+                };
+                if self.surface_extension_biomes.eroded_badlands
+                    && surface_biome_id == Some(eroded_badlands_id)
+                {
+                    start_height = self.surface_system.eroded_badlands_extension(
+                        chunk,
+                        local_x,
+                        local_z,
+                        block_x,
+                        block_z,
+                        start_height,
+                        min_y,
+                    );
+                }
+
+                // Frozen-ocean extension consumes the materialized column and its
+                // random sequence. Keep its complete scan, including deep writes.
+                let stop_at_surface = surface_only
+                    && !surface_biome_id
+                        .is_some_and(|id| id == frozen_ocean_id || id == deep_frozen_ocean_id);
+
+                // Snapshot the column once — avoids per-block section locking in the Y scan.
+                // Taken after eroded_badlands_extension which may write blocks above the surface.
+                chunk.read_column_into(local_x, local_z, &mut column_buf);
+
+                // Surface depth for this column
+                let surface_depth = self.surface_system.get_surface_depth(block_x, block_z);
+
+                let surface_secondary = if surface_rule_uses_surface_secondary {
+                    self.surface_system.get_surface_secondary(block_x, block_z)
+                } else {
+                    0.0
+                };
+                condition_noise_cache.reset();
+
+                let min_surface_level = if let Some(corners) = preliminary_surface_corners {
+                    // Vanilla: (float)(blockX & 15) / 16.0F — exact for 0-15.
+                    let t_x = f64::from(local_x as u8) / 16.0;
+                    let t_z = f64::from(local_z as u8) / 16.0;
+                    let interp = lerp2(
+                        t_x,
+                        t_z,
+                        f64::from(corners.nw),
+                        f64::from(corners.ne),
+                        f64::from(corners.sw),
+                        f64::from(corners.se),
+                    );
+                    interp.floor() as i32 + surface_depth - 8
+                } else {
+                    0
+                };
+
+                // Steep condition: vanilla only checks south >= north + 4 and
+                // west >= east + 4 (asymmetric, not absolute difference).
+                let steep = surface_rule_uses_steep && {
+                    let z_north = local_z.saturating_sub(1);
+                    let z_south = (local_z + 1).min(15);
+                    let h_north = chunk.world_surface_height_at(local_x, z_north) - 1;
+                    let h_south = chunk.world_surface_height_at(local_x, z_south) - 1;
+                    if h_south >= h_north + 4 {
+                        true
+                    } else {
+                        let x_west = local_x.saturating_sub(1);
+                        let x_east = (local_x + 1).min(15);
+                        let h_west = chunk.world_surface_height_at(x_west, local_z) - 1;
+                        let h_east = chunk.world_surface_height_at(x_east, local_z) - 1;
+                        h_west >= h_east + 4
+                    }
+                };
+
+                let mut stone_depth_above: i32 = 0;
+                let mut water_height: i32 = i32::MIN;
+                let mut next_ceiling_stone_y: i32 = i32::MAX;
+                pending_writes.clear();
+
+                for y in (min_y..=start_height).rev() {
+                    let relative_y = (y - min_y) as usize;
+                    let state = column_buf[relative_y];
+
+                    if state.is_air() {
+                        stone_depth_above = 0;
+                        water_height = i32::MIN;
+                        continue;
+                    }
+
+                    if state.get_block().config.liquid {
+                        if water_height == i32::MIN {
+                            water_height = y + 1;
+                        }
+                        continue;
+                    }
+
+                    // Solid block — scan for stone_depth_below (lookahead)
+                    if next_ceiling_stone_y >= y {
+                        next_ceiling_stone_y = i32::MIN;
+                        for la_y in (min_y - 1..y).rev() {
+                            if la_y < min_y {
+                                next_ceiling_stone_y = la_y + 1;
+                                break;
+                            }
+                            let la_rel = (la_y - min_y) as usize;
+                            let la_state = column_buf[la_rel];
+                            // isStone = !isAir && !isLiquid
+                            if la_state.is_air() || la_state.get_block().config.liquid {
+                                next_ceiling_stone_y = la_y + 1;
+                                break;
+                            }
+                        }
+                    }
+
+                    stone_depth_above += 1;
+                    let stone_depth_below = y - next_ceiling_stone_y + 1;
+
+                    material_ore_vein_results.clear();
+                    material_ore_vein_results.resize(material_ore_vein_count, None);
+                    if let Some(ore_veinifier) = &self.ore_veinifier {
+                        let offset = (relative_y * 16 * 16 + local_z * 16 + local_x)
+                            * material_ore_vein_value_count;
+                        if let Some(values) = material_ore_vein_values
+                            .get(offset..offset + material_ore_vein_value_count)
+                        {
+                            N::fill_prefilled_material_ore_vein_results(
+                                &self.noises,
+                                &mut material_cache,
+                                ore_veinifier,
+                                values,
+                                block_x,
+                                y,
+                                block_z,
+                                &mut material_ore_vein_results,
+                            );
+                        }
+                    }
+
+                    let eager_biome_id = if surface_rule_uses_biome && !lazy_surface_rule_biome {
+                        biome_col.as_mut().map(|biome_col| biome_col.get(y))
+                    } else {
+                        None
+                    };
+                    let biome_provider = if lazy_surface_rule_biome {
+                        biome_col
+                            .as_mut()
+                            .map(|biome_col| biome_col as &mut dyn SurfaceBiomeProvider)
+                    } else {
+                        None
+                    };
+
+                    let mut ctx = SurfaceRuleContext::new(
+                        block_x,
+                        block_z,
+                        surface_depth,
+                        surface_secondary,
+                        min_surface_level,
+                        steep,
+                        y,
+                        stone_depth_above,
+                        stone_depth_below,
+                        water_height,
+                        eager_biome_id,
+                        biome_provider,
+                        &self.surface_system,
+                        &condition_noise_cache,
+                        surface_rule_block_states,
+                    )
+                    .with_ore_vein_results(&material_ore_vein_results);
+
+                    let replacement = N::try_apply_surface_rule(&mut ctx);
+                    if let Some(new_block) = replacement {
+                        pending_writes.push((relative_y, new_block));
+                    }
+                    let visible = replacement.unwrap_or(state);
+                    if stop_at_surface && !visible.is_air() && !visible.get_block().config.liquid {
+                        break;
+                    }
+                }
+
+                // Flush batched writes — holds each section's write guard once
+                if !pending_writes.is_empty() {
+                    chunk.write_column(local_x, local_z, &pending_writes);
+                    for &(relative_y, state) in &pending_writes {
+                        column_buf[relative_y] = state;
+                    }
+                }
+
+                // Frozen ocean iceberg extension: add packed ice and snow
+                if self.surface_extension_biomes.frozen_ocean
+                    && let Some(surface_biome_id) = surface_biome_id
+                        .filter(|id| *id == frozen_ocean_id || *id == deep_frozen_ocean_id)
+                {
+                    pending_writes.clear();
+                    self.surface_system.collect_frozen_ocean_extension_writes(
+                        surface_biome_id,
+                        block_x,
+                        block_z,
+                        start_height,
+                        min_surface_level,
+                        min_y,
+                        &column_buf,
+                        &mut pending_writes,
+                    );
+                    if !pending_writes.is_empty() {
+                        chunk.write_column(local_x, local_z, &pending_writes);
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
     fn min_y(&self) -> i32 {
         N::Settings::MIN_Y
@@ -542,289 +841,20 @@ impl<N: VanillaPostNoiseStateType> ChunkGenerator for VanillaGenerator<N> {
         chunk.install_post_noise_state(N::wrap_post_noise_state(aquifer, material_ore_vein_values));
     }
 
-    #[expect(clippy::too_many_lines, reason = "splitting would hurt readability")]
     fn build_surface(
         &self,
         chunk: GenerationChunk<'_, TerrainPhase>,
         neighbor_biomes: &dyn Fn(IVec3) -> u16,
     ) {
-        let min_y = N::Settings::MIN_Y;
-        let pos = chunk.pos();
-        let chunk_min_x = pos.0.x * 16;
-        let chunk_min_z = pos.0.y * 16;
-        let surface_rule_block_states = N::surface_rule_block_states();
-        let surface_rule_uses_biome = N::surface_rule_uses_biome();
-        let surface_rule_uses_preliminary_surface = N::surface_rule_uses_preliminary_surface();
-        let surface_rule_uses_surface_secondary = N::surface_rule_uses_surface_secondary();
-        let surface_rule_uses_steep = N::surface_rule_uses_steep();
-        let material_ore_vein_values = chunk
-            .with_post_noise_state_mut::<N::State, _>(N::material_ore_vein_values)
-            .unwrap_or_else(|| Arc::from([]));
-        let material_ore_vein_value_count = N::material_ore_vein_value_count();
-        let material_ore_vein_count = material_ore_vein_value_count / 2;
-        let mut material_cache = N::ColumnCache::default();
-        let lazy_surface_rule_biome =
-            surface_rule_uses_biome && surface_rule_uses_preliminary_surface;
-        let surface_needs_min_surface_level =
-            surface_rule_uses_preliminary_surface || self.surface_extension_biomes.frozen_ocean;
-        let surface_needs_biomes =
-            surface_rule_uses_biome || self.surface_extension_biomes.needs_surface_biome();
-        let chunk_quart_x = pos.0.x * 4;
-        let chunk_quart_z = pos.0.y * 4;
+        self.build_surface_with_limit(chunk, neighbor_biomes, false);
+    }
 
-        chunk.prime_world_surface_heightmap();
-
-        // Pre-compute preliminary surface corners only for rules/extensions that read them.
-        let preliminary_surface_corners = surface_needs_min_surface_level
-            .then(|| self.preliminary_surface_corners(chunk, chunk_min_x, chunk_min_z));
-
-        let eroded_badlands_id = (*vanilla_biomes::ERODED_BADLANDS).id() as u16;
-        let frozen_ocean_id = (*vanilla_biomes::FROZEN_OCEAN).id() as u16;
-        let deep_frozen_ocean_id = (*vanilla_biomes::DEEP_FROZEN_OCEAN).id() as u16;
-
-        // Pre-extract biome palette values only if surface rules/extensions need them.
-        let biome_data = surface_needs_biomes.then(|| chunk.read_all_biomes());
-        let section_count = chunk.section_count();
-
-        let mut pending_writes: Vec<(usize, BlockStateId)> = Vec::new();
-        let mut column_buf: Vec<BlockStateId> = Vec::new();
-        let mut material_ore_vein_results: SmallVec<[Option<BlockStateId>; 2]> = SmallVec::new();
-        let condition_noise_values = N::surface_noise_ids()
-            .iter()
-            .map(|_| Cell::new(0.0))
-            .collect::<Vec<_>>();
-        let condition_noise_initialized = N::surface_noise_ids()
-            .iter()
-            .map(|_| Cell::new(false))
-            .collect::<Vec<_>>();
-        let condition_noise_cache =
-            SurfaceConditionNoiseCache::new(&condition_noise_values, &condition_noise_initialized);
-
-        for local_x in 0..16usize {
-            for local_z in 0..16usize {
-                let block_x = chunk_min_x + local_x as i32;
-                let block_z = chunk_min_z + local_z as i32;
-
-                // Start scanning from one above the highest non-air block
-                let mut start_height = chunk.world_surface_height_at(local_x, local_z);
-
-                // Column-local Voronoi cache for fuzzed biome lookups.
-                let mut biome_col = biome_data.as_deref().map(|biome_data| {
-                    FuzzedBiomeColumn::new(
-                        biome_data,
-                        section_count,
-                        self.biome_zoom_seed,
-                        block_x,
-                        block_z,
-                        min_y,
-                        chunk_quart_x,
-                        chunk_quart_z,
-                        neighbor_biomes,
-                    )
-                });
-
-                // Eroded badlands extension: add terracotta pillars above surface
-                let surface_biome_id = if self.surface_extension_biomes.needs_surface_biome() {
-                    biome_col
-                        .as_mut()
-                        .map(|biome_col| biome_col.get(start_height))
-                } else {
-                    None
-                };
-                if self.surface_extension_biomes.eroded_badlands
-                    && surface_biome_id == Some(eroded_badlands_id)
-                {
-                    start_height = self.surface_system.eroded_badlands_extension(
-                        chunk,
-                        local_x,
-                        local_z,
-                        block_x,
-                        block_z,
-                        start_height,
-                        min_y,
-                    );
-                }
-
-                // Snapshot the column once — avoids per-block section locking in the Y scan.
-                // Taken after eroded_badlands_extension which may write blocks above the surface.
-                chunk.read_column_into(local_x, local_z, &mut column_buf);
-
-                // Surface depth for this column
-                let surface_depth = self.surface_system.get_surface_depth(block_x, block_z);
-
-                let surface_secondary = if surface_rule_uses_surface_secondary {
-                    self.surface_system.get_surface_secondary(block_x, block_z)
-                } else {
-                    0.0
-                };
-                condition_noise_cache.reset();
-
-                let min_surface_level = if let Some(corners) = preliminary_surface_corners {
-                    // Vanilla: (float)(blockX & 15) / 16.0F — exact for 0-15.
-                    let t_x = f64::from(local_x as u8) / 16.0;
-                    let t_z = f64::from(local_z as u8) / 16.0;
-                    let interp = lerp2(
-                        t_x,
-                        t_z,
-                        f64::from(corners.nw),
-                        f64::from(corners.ne),
-                        f64::from(corners.sw),
-                        f64::from(corners.se),
-                    );
-                    interp.floor() as i32 + surface_depth - 8
-                } else {
-                    0
-                };
-
-                // Steep condition: vanilla only checks south >= north + 4 and
-                // west >= east + 4 (asymmetric, not absolute difference).
-                let steep = surface_rule_uses_steep && {
-                    let z_north = local_z.saturating_sub(1);
-                    let z_south = (local_z + 1).min(15);
-                    let h_north = chunk.world_surface_height_at(local_x, z_north) - 1;
-                    let h_south = chunk.world_surface_height_at(local_x, z_south) - 1;
-                    if h_south >= h_north + 4 {
-                        true
-                    } else {
-                        let x_west = local_x.saturating_sub(1);
-                        let x_east = (local_x + 1).min(15);
-                        let h_west = chunk.world_surface_height_at(x_west, local_z) - 1;
-                        let h_east = chunk.world_surface_height_at(x_east, local_z) - 1;
-                        h_west >= h_east + 4
-                    }
-                };
-
-                let mut stone_depth_above: i32 = 0;
-                let mut water_height: i32 = i32::MIN;
-                let mut next_ceiling_stone_y: i32 = i32::MAX;
-                pending_writes.clear();
-
-                for y in (min_y..=start_height).rev() {
-                    let relative_y = (y - min_y) as usize;
-                    let state = column_buf[relative_y];
-
-                    if state.is_air() {
-                        stone_depth_above = 0;
-                        water_height = i32::MIN;
-                        continue;
-                    }
-
-                    if state.get_block().config.liquid {
-                        if water_height == i32::MIN {
-                            water_height = y + 1;
-                        }
-                        continue;
-                    }
-
-                    // Solid block — scan for stone_depth_below (lookahead)
-                    if next_ceiling_stone_y >= y {
-                        next_ceiling_stone_y = i32::MIN;
-                        for la_y in (min_y - 1..y).rev() {
-                            if la_y < min_y {
-                                next_ceiling_stone_y = la_y + 1;
-                                break;
-                            }
-                            let la_rel = (la_y - min_y) as usize;
-                            let la_state = column_buf[la_rel];
-                            // isStone = !isAir && !isLiquid
-                            if la_state.is_air() || la_state.get_block().config.liquid {
-                                next_ceiling_stone_y = la_y + 1;
-                                break;
-                            }
-                        }
-                    }
-
-                    stone_depth_above += 1;
-                    let stone_depth_below = y - next_ceiling_stone_y + 1;
-
-                    material_ore_vein_results.clear();
-                    material_ore_vein_results.resize(material_ore_vein_count, None);
-                    if let Some(ore_veinifier) = &self.ore_veinifier {
-                        let offset = (relative_y * 16 * 16 + local_z * 16 + local_x)
-                            * material_ore_vein_value_count;
-                        if let Some(values) = material_ore_vein_values
-                            .get(offset..offset + material_ore_vein_value_count)
-                        {
-                            N::fill_prefilled_material_ore_vein_results(
-                                &self.noises,
-                                &mut material_cache,
-                                ore_veinifier,
-                                values,
-                                block_x,
-                                y,
-                                block_z,
-                                &mut material_ore_vein_results,
-                            );
-                        }
-                    }
-
-                    let eager_biome_id = if surface_rule_uses_biome && !lazy_surface_rule_biome {
-                        biome_col.as_mut().map(|biome_col| biome_col.get(y))
-                    } else {
-                        None
-                    };
-                    let biome_provider = if lazy_surface_rule_biome {
-                        biome_col
-                            .as_mut()
-                            .map(|biome_col| biome_col as &mut dyn SurfaceBiomeProvider)
-                    } else {
-                        None
-                    };
-
-                    let mut ctx = SurfaceRuleContext::new(
-                        block_x,
-                        block_z,
-                        surface_depth,
-                        surface_secondary,
-                        min_surface_level,
-                        steep,
-                        y,
-                        stone_depth_above,
-                        stone_depth_below,
-                        water_height,
-                        eager_biome_id,
-                        biome_provider,
-                        &self.surface_system,
-                        &condition_noise_cache,
-                        surface_rule_block_states,
-                    )
-                    .with_ore_vein_results(&material_ore_vein_results);
-
-                    if let Some(new_block) = N::try_apply_surface_rule(&mut ctx) {
-                        pending_writes.push((relative_y, new_block));
-                    }
-                }
-
-                // Flush batched writes — holds each section's write guard once
-                if !pending_writes.is_empty() {
-                    chunk.write_column(local_x, local_z, &pending_writes);
-                    for &(relative_y, state) in &pending_writes {
-                        column_buf[relative_y] = state;
-                    }
-                }
-
-                // Frozen ocean iceberg extension: add packed ice and snow
-                if self.surface_extension_biomes.frozen_ocean
-                    && let Some(surface_biome_id) = surface_biome_id
-                        .filter(|id| *id == frozen_ocean_id || *id == deep_frozen_ocean_id)
-                {
-                    pending_writes.clear();
-                    self.surface_system.collect_frozen_ocean_extension_writes(
-                        surface_biome_id,
-                        block_x,
-                        block_z,
-                        start_height,
-                        min_surface_level,
-                        min_y,
-                        &column_buf,
-                        &mut pending_writes,
-                    );
-                    if !pending_writes.is_empty() {
-                        chunk.write_column(local_x, local_z, &pending_writes);
-                    }
-                }
-            }
-        }
+    fn build_coarse_surface(
+        &self,
+        chunk: GenerationChunk<'_, TerrainPhase>,
+        neighbor_biomes: &dyn Fn(IVec3) -> u16,
+    ) {
+        self.build_surface_with_limit(chunk, neighbor_biomes, true);
     }
 
     #[expect(
