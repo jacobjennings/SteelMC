@@ -4,6 +4,9 @@
 //! Structure density and Features are not executed. Chunk positions
 //! are bounded before arithmetic, and all block storage is owned by the caller.
 
+mod region;
+pub use region::{PortableRegion, RegionWindow};
+
 use steel_registry::blocks::block_state_ext::BlockStateExt;
 use steel_registry::{RegistryEntry, init_vanilla_registry, vanilla_blocks};
 use steel_utils::random::{Random, RandomSplitter, xoroshiro::Xoroshiro};

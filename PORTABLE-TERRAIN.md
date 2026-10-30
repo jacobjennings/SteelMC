@@ -151,3 +151,42 @@ The complete decoration region, selected vegetation, structure density,
 structure/feature interactions, browser ABI, dependency Wasm portability,
 artifact publication and full camera qualification remain on the linked
 continuation. The current source increment does not admit a viewer release.
+
+## Retained feature-region storage
+
+`PortableRegion` takes a complete rectangular set of this generator's completed
+Carvers chunks. It rejects empty, duplicate, mixed-generator, wrong-stage and
+incomplete input. It owns the chunks without regenerating neighbors. All feature
+calls share their current states, heightmaps and retained fluid-position lists.
+
+`write_window` opens a horizontal zone around a retained center chunk. The full
+zone must already be present. `RegionWindow::can_write` follows the pinned 26.3
+`WorldGenRegion.isWithinWriteZone` chessboard rule. A rejected write returns false
+before looking up storage. Negative coordinates use floor division. Reads can
+reach retained neighbors outside the write zone. Missing chunks and unsupported
+vertical reads fail explicitly. This view is for fresh Overworld storage and does
+not implement upgrading chunks or native out-of-build-height reads.
+
+The view exposes `write_state`, not the complete native `setBlock` operation.
+The feature host still owes POI, block-entity and postprocessing effects, provider
+and survival dispatch, native placement modifiers and feature selection/order.
+Those paths have no fallback in this storage API. Structure density remains
+absent from the retained terrain. These chunks must not be promoted to Full.
+
+The portable example's `region` mode retains 3 by 3 Noise/Material/Carvers chunks
+around each existing anchor. It applies the same explicit size-two grass
+projection at the center chunk's positive corner with radius-zero write rejection.
+Two successive leaf-spread calls then share a radius-one window and RNG, including
+an origin in the diagonal neighbor. Native comparison uses the native feature
+kernels with an explicit storage-only region host. Both hosts count accepted and
+rejected writes. These configurations exercise storage boundaries and ordered
+calls, not naturally selected vegetation or native biome decoration order.
+
+The source contract is the existing Java 26.3 `WorldGenRegion.class` SHA-256
+`f33962d43745ecd21ca163ab713c2af2f8fbcc84b490c285e4b5d8ea0f3b744e`.
+Its retained decompiled source SHA-256 is
+`d19dcd3701d950f4d8b604ee2efb3c044cb19499ef0025b0517196c3b8bb3339`.
+
+[The implementation continuation](https://beads.thejenningshome.com/#/board/ca-4jrrw)
+retains natural decoration, complete demanded terrain, full write side effects,
+Wasm packaging and every viewer qualification requirement.

@@ -7,30 +7,89 @@ use steel_utils::random::worldgen_random::WorldgenRandom;
 use steel_utils::value_providers::IntProvider;
 use steel_utils::{BlockPos, BlockStateId};
 use steel_worldgen::portable_feature::{self, GroundCoverAccess};
-use steel_worldgen::portable_terrain::PortableChunk;
+use steel_worldgen::portable_terrain::{PortableChunk, RegionWindow};
 use steel_worldgen::surface::SurfaceBlockAccess;
 
-pub struct ChunkAccess<'a, 'generator>(pub &'a mut PortableChunk<'generator>);
+pub trait BlockStorage {
+    fn read(&mut self, pos: BlockPos) -> BlockStateId;
+    fn write(&mut self, pos: BlockPos, state: BlockStateId) -> bool;
+}
 
-impl ChunkAccess<'_, '_> {
-    fn relative(&self, pos: BlockPos) -> (usize, usize, usize) {
-        let x = pos.x() - self.0.chunk_min_x();
-        let z = pos.z() - self.0.chunk_min_z();
-        let y = pos.y() - self.0.min_y();
+impl BlockStorage for PortableChunk<'_> {
+    fn read(&mut self, pos: BlockPos) -> BlockStateId {
+        let x = pos.x() - self.chunk_min_x();
+        let z = pos.z() - self.chunk_min_z();
+        let y = pos.y() - self.min_y();
         assert!((0..16).contains(&x) && (0..16).contains(&z) && (0..384).contains(&y));
-        (x as usize, y as usize, z as usize)
+        let Some(state) = self.get_relative_block(x as usize, y as usize, z as usize) else {
+            panic!("outside retained comparison chunk");
+        };
+        state
+    }
+    fn write(&mut self, pos: BlockPos, state: BlockStateId) -> bool {
+        let x = pos.x() - self.chunk_min_x();
+        let z = pos.z() - self.chunk_min_z();
+        let y = pos.y() - self.min_y();
+        assert!((0..16).contains(&x) && (0..16).contains(&z) && (0..384).contains(&y));
+        self.set_relative_block(x as usize, y as usize, z as usize, state);
+        true
     }
 }
 
-impl GroundCoverAccess for ChunkAccess<'_, '_> {
+impl BlockStorage for RegionWindow<'_, '_> {
+    fn read(&mut self, pos: BlockPos) -> BlockStateId {
+        match self.block(pos) {
+            Ok(state) => state,
+            Err(error) => panic!("{error}"),
+        }
+    }
+    fn write(&mut self, pos: BlockPos, state: BlockStateId) -> bool {
+        match self.write_state(pos, state) {
+            Ok(accepted) => accepted,
+            Err(error) => panic!("{error}"),
+        }
+    }
+}
+
+pub struct ObservedStorage<'a, W: BlockStorage> {
+    pub inner: &'a mut W,
+    pub accepted: usize,
+    pub rejected: usize,
+}
+
+impl<'a, W: BlockStorage> ObservedStorage<'a, W> {
+    pub fn new(inner: &'a mut W) -> Self {
+        Self {
+            inner,
+            accepted: 0,
+            rejected: 0,
+        }
+    }
+}
+
+impl<W: BlockStorage> BlockStorage for ObservedStorage<'_, W> {
+    fn read(&mut self, pos: BlockPos) -> BlockStateId {
+        self.inner.read(pos)
+    }
+    fn write(&mut self, pos: BlockPos, state: BlockStateId) -> bool {
+        let accepted = self.inner.write(pos, state);
+        if accepted {
+            self.accepted += 1;
+        } else {
+            self.rejected += 1;
+        }
+        accepted
+    }
+}
+
+pub struct ChunkAccess<'a, W: BlockStorage>(pub &'a mut W);
+
+impl<W: BlockStorage> GroundCoverAccess for ChunkAccess<'_, W> {
     fn test(&mut self, predicate: &BlockPredicate, pos: BlockPos) -> bool {
         let BlockPredicate::MatchingBlocks { blocks, offset } = predicate else {
             panic!("unsupported comparison predicate");
         };
-        let (x, y, z) = self.relative(pos.offset(offset.x, offset.y, offset.z));
-        let Some(state) = self.0.get_relative_block(x, y, z) else {
-            panic!("outside retained comparison chunk");
-        };
+        let state = self.0.read(pos.offset(offset.x, offset.y, offset.z));
         blocks.0.contains(&state.get_block())
     }
 
@@ -63,20 +122,20 @@ impl GroundCoverAccess for ChunkAccess<'_, '_> {
         let BlockHolderSet::Entries(blocks) = accepted else {
             panic!("unsupported comparison holder set");
         };
-        let (x, y, z) = self.relative(pos);
-        let Some(state) = self.0.get_relative_block(x, y, z) else {
-            panic!("outside retained comparison chunk");
-        };
+        let state = self.0.read(pos);
         blocks.contains(&state.get_block())
     }
 
     fn set_block(&mut self, pos: BlockPos, state: BlockStateId) {
-        let (x, y, z) = self.relative(pos);
-        self.0.set_relative_block(x, y, z, state);
+        self.0.write(pos, state);
     }
 }
 
-pub fn projected(world: &mut ChunkAccess<'_, '_>, random: &mut WorldgenRandom, origin: BlockPos) {
+pub fn projected<W: BlockStorage>(
+    world: &mut ChunkAccess<'_, W>,
+    random: &mut WorldgenRandom,
+    origin: BlockPos,
+) {
     let config = ProjectedRandomPatchySquareConfiguration {
         block: BlockStateProviderKind::Simple {
             state: BlockStateData {
@@ -91,7 +150,11 @@ pub fn projected(world: &mut ChunkAccess<'_, '_>, random: &mut WorldgenRandom, o
     portable_feature::projected_random_patchy_square(world, random, &config, origin);
 }
 
-pub fn spread(world: &mut ChunkAccess<'_, '_>, random: &mut WorldgenRandom, origin: BlockPos) {
+pub fn spread<W: BlockStorage>(
+    world: &mut ChunkAccess<'_, W>,
+    random: &mut WorldgenRandom,
+    origin: BlockPos,
+) {
     let config = RandomNeighborSpreadConfiguration {
         block: BlockStateProviderKind::Simple {
             state: BlockStateData {

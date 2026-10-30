@@ -10,7 +10,9 @@ use std::path::Path;
 use serde_json::json;
 use steel_registry::REGISTRY;
 use steel_registry::blocks::block_state_ext::BlockStateExt;
-use steel_worldgen::portable_terrain::{MINECRAFT_VERSION, PortableChunk, PortableOverworld};
+use steel_worldgen::portable_terrain::{
+    MINECRAFT_VERSION, PortableChunk, PortableOverworld, PortableRegion,
+};
 
 fn snapshot(
     output: &Path,
@@ -70,6 +72,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(output)?;
     for (seed, x, z) in [(3_860_052, 75, -56), (12_345, -162, -190)] {
         let sampler = PortableOverworld::new(seed);
+        let region_mode = std::env::args().nth(2).as_deref() == Some("region");
+        if region_mode {
+            region_snapshots(output, seed, x, z, &sampler)?;
+            continue;
+        }
         let mut chunk = sampler.noise_chunk(x, z)?;
         snapshot(output, seed, x, z, "noise", &chunk)?;
         sampler.build_material(&mut chunk)?;
@@ -101,5 +108,78 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
         }
     }
+    Ok(())
+}
+
+// Explicit boundary configurations, not natural biome decoration.
+fn region_snapshots(
+    output: &Path,
+    seed: u64,
+    x: i32,
+    z: i32,
+    sampler: &PortableOverworld,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use steel_utils::BlockPos;
+    use steel_utils::random::{Random as _, worldgen_random::WorldgenRandom};
+    let mut chunks = Vec::new();
+    let mut origin_y = None;
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            let (cx, cz) = (x + dx, z + dz);
+            let mut chunk = sampler.noise_chunk(cx, cz)?;
+            snapshot(output, seed, cx, cz, "noise", &chunk)?;
+            sampler.build_material(&mut chunk)?;
+            snapshot(output, seed, cx, cz, "material", &chunk)?;
+            sampler.build_carvers(&mut chunk)?;
+            snapshot(output, seed, cx, cz, "carvers", &chunk)?;
+            if dx == 0 && dz == 0 {
+                origin_y = Some(chunk.heights()[15 * 16 + 15] + 3);
+            }
+            chunks.push(chunk);
+        }
+    }
+    let mut region = PortableRegion::new(sampler, chunks)?;
+    let origin = BlockPos::new(x * 16 + 15, origin_y.ok_or("center missing")?, z * 16 + 15);
+    let mut random = WorldgenRandom::from_seed(seed);
+    // Radius zero deliberately rejects the portion crossing the center boundary.
+    let projected_writes = {
+        let mut window = region.write_window((x, z), 0)?;
+        let mut observed = ground_cover::ObservedStorage::new(&mut window);
+        ground_cover::projected(
+            &mut ground_cover::ChunkAccess(&mut observed),
+            &mut random,
+            origin,
+        );
+        [observed.accepted, observed.rejected]
+    };
+    for ((cx, cz), chunk) in region.chunks() {
+        snapshot(output, seed, cx, cz, "region_projected", chunk)?;
+    }
+    // Same retained storage and RNG. Both calls can observe preceding writes.
+    let spread_writes = {
+        let mut window = region.write_window((x, z), 1)?;
+        let mut observed = ground_cover::ObservedStorage::new(&mut window);
+        ground_cover::spread(
+            &mut ground_cover::ChunkAccess(&mut observed),
+            &mut random,
+            origin,
+        );
+        ground_cover::spread(
+            &mut ground_cover::ChunkAccess(&mut observed),
+            &mut random,
+            origin.offset(1, 0, 1),
+        );
+        [observed.accepted, observed.rejected]
+    };
+    for ((cx, cz), chunk) in region.chunks() {
+        snapshot(output, seed, cx, cz, "region_spread", chunk)?;
+    }
+    fs::write(
+        output.join(format!("{seed}-{x}-{z}-rng.json")),
+        serde_json::to_vec(&json!({
+            "projectedWrites": projected_writes, "spreadWrites": spread_writes,
+            "nextInt": random.next_i32(), "origin": [origin.x(), origin.y(), origin.z()],
+        }))?,
+    )?;
     Ok(())
 }
