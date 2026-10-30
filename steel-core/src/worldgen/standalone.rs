@@ -2,8 +2,9 @@
 //!
 //! Browser builds and native comparison tools generate terrain with the same
 //! stage code as the server. Retained chunks stop after Terrain. A Full tile
-//! replays Features over copies of them, in x-then-z chunk order. Its result
-//! therefore does not depend on which tiles were requested before it.
+//! replays Features in a fixed neighborhood for each output chunk, in x-then-z
+//! source order. Cropping those chunks does not depend on tile alignment, size
+//! or request history.
 
 use std::cell::OnceCell;
 use std::sync::{Arc, Weak};
@@ -122,7 +123,7 @@ pub struct GeneratedBlock {
     pub y: i32,
     /// Absolute world Z.
     pub z: i32,
-    /// Final state after every source chunk of the tile decorated.
+    /// Final state after the output chunk's fixed source neighborhood decorated.
     pub state: BlockStateId,
 }
 
@@ -553,10 +554,15 @@ impl StandaloneWorldgen {
         let max_z = origin_z.saturating_add(size as i32 - 1);
         let tile_min = (origin_x.div_euclid(16), origin_z.div_euclid(16));
         let tile_max = (max_x.div_euclid(16), max_z.div_euclid(16));
-        let holders = self.decorate(tile_min, tile_max);
         let mut blocks = Vec::new();
         for chunk_x in tile_min.0..=tile_max.0 {
             for chunk_z in tile_min.1..=tile_max.1 {
+                // A request rectangle is a crop, never a decoration boundary.
+                // Use the same nine sources and fresh Terrain state for this
+                // output chunk even when another request also contains it.
+                // The wider replay below remains a native scheduling reference.
+                let key = (chunk_x, chunk_z);
+                let holders = self.decorate(key, key);
                 let Some(holder) = holders.get(&(chunk_x, chunk_z)) else {
                     unreachable!("tile chunk holder was just created");
                 };
