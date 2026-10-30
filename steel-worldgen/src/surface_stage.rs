@@ -26,6 +26,12 @@ use crate::surface::{
 pub struct MaterialSurfaceGrid([f32; 256]);
 
 impl MaterialSurfaceGrid {
+    /// Returns the float chunk-surface value for a local column.
+    #[must_use]
+    pub fn at(&self, x: usize, z: usize) -> f32 {
+        self.0[z * 16 + x]
+    }
+
     /// Samples the source-defined 16-by-1 interpolation from raw surface corners.
     #[must_use]
     pub fn from_corners(nw: f32, ne: f32, sw: f32, se: f32) -> Self {
@@ -410,7 +416,7 @@ impl<'a, N: DimensionNoises> SurfaceStage<'a, N> {
 /// This is Vanilla's BiomeManager choice between the eight neighboring quart
 /// cells. X/Z work is immutable within a block column; only the two Y
 /// candidate groups change while the Surface scan descends.
-struct FuzzedBiomeColumn<'a, B: SurfaceBiomeAccess + ?Sized> {
+pub(crate) struct FuzzedBiomeColumn<'a, B: SurfaceBiomeAccess + ?Sized> {
     biome_access: &'a mut B,
     biome_zoom_seed: i64,
     parent_x: i32,
@@ -425,7 +431,12 @@ struct FuzzedBiomeColumn<'a, B: SurfaceBiomeAccess + ?Sized> {
 }
 
 impl<'a, B: SurfaceBiomeAccess + ?Sized> FuzzedBiomeColumn<'a, B> {
-    fn new(biome_zoom_seed: i64, block_x: i32, block_z: i32, biome_access: &'a mut B) -> Self {
+    pub(crate) fn new(
+        biome_zoom_seed: i64,
+        block_x: i32,
+        block_z: i32,
+        biome_access: &'a mut B,
+    ) -> Self {
         let abs_x = block_x - 2;
         let abs_z = block_z - 2;
         let parent_x = abs_x >> 2;
@@ -496,7 +507,7 @@ impl<'a, B: SurfaceBiomeAccess + ?Sized> FuzzedBiomeColumn<'a, B> {
     }
 
     #[inline]
-    fn get(&mut self, block_y: i32) -> u16 {
+    pub(crate) fn get(&mut self, block_y: i32) -> u16 {
         let abs_y = block_y - 2;
         let parent_y = abs_y >> 2;
         let fract_y = f64::from(abs_y & 3) / 4.0;

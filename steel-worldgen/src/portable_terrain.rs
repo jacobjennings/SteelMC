@@ -1,23 +1,27 @@
-//! In-memory Noise and Material stages for Java 26.3.
+//! In-memory Noise, Material and Carvers stages for Java 26.3.
 //!
 //! This is an intermediate source port, not the viewer's Full terrain API.
-//! Structure density, carvers and Features are not executed. Chunk positions
+//! Structure density and Features are not executed. Chunk positions
 //! are bounded before arithmetic, and all block storage is owned by the caller.
 
 use steel_registry::blocks::block_state_ext::BlockStateExt;
 use steel_registry::{RegistryEntry, init_vanilla_registry, vanilla_blocks};
-use steel_utils::BlockStateId;
 use steel_utils::random::{Random, RandomSplitter, xoroshiro::Xoroshiro};
+use steel_utils::{BlockPos, BlockStateId, ChunkPos};
 
 use crate::biomes::{BiomeSourceKind, ChunkBiomeSampler, obfuscate_biome_seed};
 use crate::density::DimensionNoises;
 use crate::density_functions::overworld::OverworldNoises;
 use crate::noise::{Aquifer, AquiferResult, NoiseChunk, OreVeinifier};
 use crate::noise_parameters::get_noise_parameters;
+use crate::portable_carver::{
+    CarveRun, CarverBlockAccess, CarverBlockIds, CarvingContext, CarvingMask, SourceChunk,
+};
 use crate::surface::{
     MaterialSurfaceGrid, SurfaceBiomeAccess, SurfaceBlockAccess, SurfaceExtensions, SurfaceStage,
     SurfaceSystem,
 };
+use crate::surface_stage::FuzzedBiomeColumn;
 
 type Settings = <OverworldNoises as DimensionNoises>::Settings;
 
@@ -26,6 +30,7 @@ pub const MINECRAFT_VERSION: &str = "26.3";
 
 /// Reusable, seed-bound Overworld noise and material state.
 pub struct PortableOverworld {
+    seed: u64,
     noises: OverworldNoises,
     splitter: RandomSplitter,
     biomes: BiomeSourceKind,
@@ -55,6 +60,7 @@ impl PortableOverworld {
         );
         let ore = Settings::MATERIAL_ORE_VEINS_ENABLED.then(|| OreVeinifier::new(&splitter));
         Self {
+            seed,
             noises,
             splitter,
             biomes,
@@ -83,6 +89,8 @@ impl PortableOverworld {
             states: vec![vanilla_blocks::AIR.default_state(); 256 * Settings::HEIGHT as usize],
             heights: [Settings::MIN_Y; 256],
             material_values: Vec::new(),
+            aquifer: None,
+            fluid_updates: Vec::new(),
             // Keep the binding private so another seed cannot supply material values.
             stage: ChunkStage::Noise,
             seed_binding: self,
@@ -131,6 +139,7 @@ impl PortableOverworld {
             },
         );
         chunk.material_values = values;
+        chunk.aquifer = Some(aquifer);
         chunk.prime_world_surface_heightmap();
         Ok(chunk)
     }
@@ -166,7 +175,85 @@ impl PortableOverworld {
                 &material_surface,
                 self.ore.as_ref(),
             );
+        chunk.material_values = values;
         chunk.stage = ChunkStage::Material;
+        chunk.prime_world_surface_heightmap();
+        Ok(())
+    }
+
+    /// Applies source-defined cave and canyon masks after Material.
+    /// Retains Noise aquifer caches and pre-Material ore buffers for top material.
+    pub fn build_carvers(&self, chunk: &mut PortableChunk<'_>) -> Result<(), &'static str> {
+        if !std::ptr::eq(self, chunk.seed_binding) || chunk.stage != ChunkStage::Material {
+            return Err("carvers require this generator's Material output");
+        }
+        let mut biome_sampler = self.biomes.chunk_sampler();
+        let mut sources = Vec::new();
+        for dx in -8..=8 {
+            for dz in -8..=8 {
+                let x = chunk.min_x / 16 + dx;
+                let z = chunk.min_z / 16 + dz;
+                sources.push(SourceChunk {
+                    pos: ChunkPos::new(x, z),
+                    biome: biome_sampler.sample(x * 4, 0, z * 4),
+                });
+            }
+        }
+        let mut cache = <OverworldNoises as DimensionNoises>::ColumnCache::default();
+        let mut corner = |x, z| {
+            cache.ensure(x, z, &self.noises);
+            self.noises
+                .router_preliminary_surface_level(&mut cache, x, 0, z)
+        };
+        let material_surface = MaterialSurfaceGrid::from_corners(
+            corner(chunk.min_x, chunk.min_z),
+            corner(chunk.min_x + 16, chunk.min_z),
+            corner(chunk.min_x, chunk.min_z + 16),
+            corner(chunk.min_x + 16, chunk.min_z + 16),
+        );
+        let mut aquifer = chunk.aquifer.take().ok_or("Noise aquifer missing")?;
+        let values = std::mem::take(&mut chunk.material_values);
+        let mut context = CarvingContext {
+            noises: &self.noises,
+            min_y: Settings::MIN_Y,
+            gen_depth: Settings::HEIGHT,
+            sea_level: Settings::SEA_LEVEL,
+            surface_system: &self.surface,
+            aquifer: &mut aquifer,
+            material_surface: &material_surface,
+            chunk_min_x: chunk.min_x,
+            chunk_min_z: chunk.min_z,
+            material_ore_vein_values: &values,
+            ore_veinifier: self.ore.as_ref(),
+            material_cache: <OverworldNoises as DimensionNoises>::ColumnCache::default(),
+        };
+        let mut biomes = PortableBiomes(self.biomes.chunk_sampler());
+        let mut biome_getter = |pos: BlockPos| {
+            FuzzedBiomeColumn::new(self.biome_zoom_seed, pos.0.x, pos.0.z, &mut biomes).get(pos.0.y)
+        };
+        let mut mask = CarvingMask::for_worldgen_context(Settings::MIN_Y, Settings::HEIGHT);
+        let mut run = CarveRun {
+            ctx: &mut context,
+            noises: &self.noises,
+            chunk_min_x: chunk.min_x,
+            chunk_min_z: chunk.min_z,
+            chunk,
+            biome_getter: &mut biome_getter,
+            mask: &mut mask,
+            ids: CarverBlockIds::load(),
+        };
+        // Resolve all configured entries before modifying blocks.
+        let result = run.run_all(&sources, self.seed as i64);
+        if result.is_ok() && !run.mask.is_empty() {
+            run.apply_carving_mask();
+        }
+        if let Err(error) = result {
+            chunk.aquifer = Some(aquifer);
+            chunk.material_values = values;
+            return Err(error);
+        }
+        // No later decoration stage consumes Noise aquifer caches or ore buffers.
+        chunk.stage = ChunkStage::Carvers;
         chunk.prime_world_surface_heightmap();
         Ok(())
     }
@@ -176,9 +263,10 @@ impl PortableOverworld {
 enum ChunkStage {
     Noise,
     Material,
+    Carvers,
 }
 
-/// Owned pre-Carvers chunk. State order is increasing relative Y, Z, then X.
+/// Owned chunk at its completed Noise, Material or Carvers stage. State order is increasing relative Y, Z, then X.
 ///
 /// Material buffers and generator ownership cannot be changed by consumers.
 /// This prevents cross-seed material evaluation and applying the stage twice.
@@ -188,6 +276,8 @@ pub struct PortableChunk<'a> {
     states: Vec<BlockStateId>,
     heights: [i32; 256],
     material_values: Vec<f32>,
+    aquifer: Option<Aquifer<OverworldNoises>>,
+    fluid_updates: Vec<BlockPos>,
     stage: ChunkStage,
     seed_binding: &'a PortableOverworld,
 }
@@ -197,6 +287,12 @@ impl PortableChunk<'_> {
     #[must_use]
     pub fn states(&self) -> &[BlockStateId] {
         &self.states
+    }
+
+    /// Positions scheduled by the carver aquifer and top-material writes.
+    #[must_use]
+    pub fn fluid_updates(&self) -> &[BlockPos] {
+        &self.fluid_updates
     }
 
     /// First available Y above the highest non-air block, in local Z/X order.
@@ -268,5 +364,11 @@ impl SurfaceBlockAccess for PortableChunk<'_> {
                 .find(|&below| !self.states[(below * 16 + z) * 16 + x].is_air())
                 .map_or(Settings::MIN_Y, |below| Settings::MIN_Y + below as i32 + 1);
         }
+    }
+}
+
+impl CarverBlockAccess for PortableChunk<'_> {
+    fn mark_pos_for_postprocessing(&mut self, pos: BlockPos) {
+        self.fluid_updates.push(pos);
     }
 }

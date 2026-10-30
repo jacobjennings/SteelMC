@@ -12,6 +12,8 @@ pub mod biomes;
 pub mod density;
 /// Noise generation utilities for world generation.
 pub mod noise;
+/// Portable Java 26.3 cave and canyon stage.
+pub mod portable_carver;
 /// In-memory Java 26.3 Noise and Material stages.
 pub mod portable_terrain;
 /// `state_resolver`
