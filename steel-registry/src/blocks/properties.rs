@@ -34,6 +34,11 @@ pub trait Property: Debug + Sync + Send {
     fn get_possible_value_names(&self) -> Box<[&str]>;
     fn get_name(&self) -> &'static str;
 
+    /// Integer capability for provider dispatch through erased properties.
+    fn integer_range(&self) -> Option<std::ops::RangeInclusive<i32>> {
+        None
+    }
+
     /// Parses and compares two serialized values using Vanilla's `Comparable` order.
     fn compare_value_names(&self, left: &str, right: &str) -> Option<Ordering>;
 }
@@ -143,6 +148,10 @@ impl IntProperty {
 }
 
 impl Property for IntProperty {
+    fn integer_range(&self) -> Option<std::ops::RangeInclusive<i32>> {
+        Some(i32::from(self.min)..=i32::from(self.max))
+    }
+
     type Value = u8;
 
     fn value_count(&self) -> usize {
