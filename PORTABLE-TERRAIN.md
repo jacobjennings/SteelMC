@@ -250,3 +250,13 @@ Java 26.3 anchors, with all-height changed blocks and actual browser payloads.
 It includes both axes, negative origins, non-chunk-aligned crops, subdivision,
 reversed request order and a fresh generator with a smaller Terrain cache.
 Chunk replay sharing and complete FULL qualification remain separate work.
+
+## Decorated volume transport
+
+`decorated_volume_chunk` samples carved Terrain plus the all-height delta from
+the same fixed output-chunk replay used by Full tiles. It reuses the bounded
+changed-block cache from ca-4xcl8 with one output chunk per entry, preserving
+ca-qi22j source selection. State and material palettes share u16 voxel indices.
+The endpoint includes below-surface ore, air and fluid changes. It is a
+Features-stage transport, not FULL, lighting or postprocessing qualification.
+`noise_volume_chunk` remains byte-for-byte the base-noise contract.

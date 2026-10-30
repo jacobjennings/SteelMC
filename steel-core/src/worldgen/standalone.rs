@@ -2,9 +2,8 @@
 //!
 //! Browser builds and native comparison tools generate terrain with the same
 //! stage code as the server. Retained chunks stop after Terrain. A Full tile
-//! replays Features in a fixed neighborhood for each output chunk, in x-then-z
-//! source order. Cropping those chunks does not depend on tile alignment, size
-//! or request history.
+//! reads fixed output-chunk decoration regions. Each region replays Features
+//! over fresh Terrain copies in x-then-z order, independent of request history.
 
 use std::cell::OnceCell;
 use std::sync::{Arc, Weak};
@@ -52,6 +51,10 @@ const FEATURE_WRITE_RADIUS: i32 = 1;
 pub const DEFAULT_TERRAIN_CACHE_CAPACITY: usize = 256;
 /// Retained structure-start and biome entries per retained Terrain chunk.
 const STARTS_PER_TERRAIN_ENTRY: usize = 8;
+/// Fixed spatial ownership, independent of tile origin, size and request order.
+const DECORATED_REGION_CHUNKS: i32 = 1;
+/// Changed-block cache allowance per configured Terrain chunk (16 MiB by default).
+const DECORATED_BYTES_PER_TERRAIN_ENTRY: usize = 65_536;
 
 /// A dimension the standalone generator supports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,7 +127,7 @@ pub struct GeneratedBlock {
     pub y: i32,
     /// Absolute world Z.
     pub z: i32,
-    /// Final state after the output chunk's fixed source neighborhood decorated.
+    /// Final state after every source chunk of the tile decorated.
     pub state: BlockStateId,
 }
 
@@ -224,6 +227,18 @@ pub struct NoiseVolume {
     pub voxels: Vec<u8>,
 }
 
+/// Sampled Features-stage states, with X varying fastest.
+pub struct DecoratedVolume {
+    /// Clipped minimum Y.
+    pub min_y: i32,
+    /// Horizontal sample count.
+    pub cells_xz: u32,
+    /// Vertical sample count.
+    pub cells_y: u32,
+    /// Final sampled states, including changes below the surface.
+    pub states: Vec<BlockStateId>,
+}
+
 /// Retained-work counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StandaloneStats {
@@ -253,6 +268,22 @@ struct StartsEntry {
 struct TerrainEntry {
     surface: Box<[SurfaceColumn]>,
     carved: Option<Arc<Chunk>>,
+    last_used: u64,
+}
+
+struct DecoratedRegion {
+    all: Vec<GeneratedBlock>,
+    surface: Vec<GeneratedBlock>,
+}
+
+impl DecoratedRegion {
+    fn bytes(&self) -> usize {
+        (self.all.capacity() + self.surface.capacity()) * std::mem::size_of::<GeneratedBlock>()
+    }
+}
+
+struct DecoratedEntry {
+    region: Arc<DecoratedRegion>,
     last_used: u64,
 }
 
@@ -291,6 +322,8 @@ pub struct StandaloneWorldgen {
     starts: FxHashMap<(i32, i32), StartsEntry>,
     terrain: FxHashMap<(i32, i32), TerrainEntry>,
     terrain_capacity: usize,
+    decorated: FxHashMap<(i32, i32), DecoratedEntry>,
+    decorated_bytes: usize,
     stats: StandaloneStats,
 }
 
@@ -356,6 +389,8 @@ impl StandaloneWorldgen {
             starts: FxHashMap::default(),
             terrain: FxHashMap::default(),
             terrain_capacity: terrain_cache_capacity,
+            decorated: FxHashMap::default(),
+            decorated_bytes: 0,
             stats: StandaloneStats::default(),
         }
     }
@@ -447,6 +482,71 @@ impl StandaloneWorldgen {
                 cells_y,
                 voxels,
             })
+        })
+    }
+
+    /// Samples carved Terrain plus fixed-output-chunk Features changes.
+    /// FULL conversion, lighting and postprocessing ticks remain excluded.
+    ///
+    /// # Errors
+    /// Returns an error for invalid coordinates, bounds or LOD.
+    pub fn decorated_volume_chunk(
+        &mut self,
+        chunk_x: i32,
+        chunk_z: i32,
+        requested_min_y: i32,
+        requested_max_y: i32,
+        lod: u32,
+    ) -> Result<DecoratedVolume, String> {
+        if !matches!(lod, 1 | 4 | 16 | 64 | 256) {
+            return Err("LOD must be one of 1, 4, 16, 64, 256".to_owned());
+        }
+        // Decoration reads neighboring chunks and structure starts. Leave room
+        // for that existing bounded dependency footprint before any arithmetic.
+        for coordinate in [chunk_x, chunk_z] {
+            if coordinate
+                .checked_sub(32)
+                .and_then(|c| c.checked_mul(16))
+                .is_none()
+                || coordinate
+                    .checked_add(32)
+                    .and_then(|c| c.checked_mul(16))
+                    .is_none()
+            {
+                return Err("decoration neighborhood exceeds signed block coordinates".to_owned());
+            }
+        }
+        let min_y = requested_min_y.max(self.min_y);
+        let max_y = requested_max_y.min(self.min_y + self.generator.gen_depth());
+        if min_y >= max_y {
+            return Err("volume range is empty or outside this dimension".to_owned());
+        }
+        let mut snapshot = self.terrain_chunk_snapshot(chunk_x, chunk_z);
+        let pool = Arc::clone(&self.pool);
+        let changes = pool.install(|| self.decorated_region((chunk_x, chunk_z)));
+        for block in &changes.all {
+            let x = block.x.rem_euclid(16) as usize;
+            let z = block.z.rem_euclid(16) as usize;
+            let y = (block.y - self.min_y) as usize;
+            snapshot.states[y * 256 + z * 16 + x] = block.state;
+        }
+        let cells_xz = 16_u32.div_ceil(lod);
+        let cells_y = ((max_y - min_y) as u32).div_ceil(lod);
+        let mut states = Vec::with_capacity((cells_xz * cells_xz * cells_y) as usize);
+        for y in 0..cells_y {
+            for z in 0..cells_xz {
+                for x in 0..cells_xz {
+                    let sy = (min_y - self.min_y) as usize + (y * lod) as usize;
+                    states.push(snapshot.states[sy * 256 + (z * lod * 16 + x * lod) as usize]);
+                }
+            }
+        }
+        self.trim_caches();
+        Ok(DecoratedVolume {
+            min_y,
+            cells_xz,
+            cells_y,
+            states,
         })
     }
 
@@ -651,41 +751,113 @@ impl StandaloneWorldgen {
     ) -> Vec<GeneratedBlock> {
         let max_x = origin_x.saturating_add(size as i32 - 1);
         let max_z = origin_z.saturating_add(size as i32 - 1);
-        let tile_min = (origin_x.div_euclid(16), origin_z.div_euclid(16));
-        let tile_max = (max_x.div_euclid(16), max_z.div_euclid(16));
+        let region_blocks = DECORATED_REGION_CHUNKS * 16;
         let mut blocks = Vec::new();
-        for chunk_x in tile_min.0..=tile_max.0 {
-            for chunk_z in tile_min.1..=tile_max.1 {
-                // A request rectangle is a crop, never a decoration boundary.
-                // Use the same nine sources and fresh Terrain state for this
-                // output chunk even when another request also contains it.
-                // The wider replay below remains a native scheduling reference.
-                let key = (chunk_x, chunk_z);
-                let holders = self.decorate(key, key);
-                let Some(holder) = holders.get(&(chunk_x, chunk_z)) else {
-                    unreachable!("tile chunk holder was just created");
+        for region_x in origin_x.div_euclid(region_blocks)..=max_x.div_euclid(region_blocks) {
+            for region_z in origin_z.div_euclid(region_blocks)..=max_z.div_euclid(region_blocks) {
+                let region = self.decorated_region((region_x, region_z));
+                let changed = match filter {
+                    GeneratedBlockFilter::All => &region.all,
+                    GeneratedBlockFilter::AtOrAboveSurface => &region.surface,
                 };
-                let Some(decorated) = holder.try_chunk(ChunkStatus::Terrain) else {
-                    unreachable!("tile chunk holder was published at Terrain");
-                };
-                let Some(entry) = self.terrain.get(&(chunk_x, chunk_z)) else {
-                    unreachable!("tile terrain entry was just ensured");
-                };
-                let Some(carved) = entry.carved.as_deref() else {
-                    unreachable!("tile terrain entry was just carved");
-                };
-                self.append_changed_blocks(
-                    &mut blocks,
-                    carved,
-                    decorated,
-                    &entry.surface,
-                    (origin_x, origin_z, max_x, max_z),
-                    filter,
-                );
+                blocks.extend(changed.iter().copied().filter(|block| {
+                    (origin_x..=max_x).contains(&block.x) && (origin_z..=max_z).contains(&block.z)
+                }));
+                // Large requests must not retain every region's Terrain inputs.
+                self.trim_caches();
             }
         }
         blocks.sort_unstable_by_key(|block| (block.x, block.y, block.z));
         blocks
+    }
+
+    fn decorated_region(&mut self, key: (i32, i32)) -> Arc<DecoratedRegion> {
+        let now = self.tick();
+        if let Some(entry) = self.decorated.get_mut(&key) {
+            entry.last_used = now;
+            return Arc::clone(&entry.region);
+        }
+        let tile_min = (
+            key.0 * DECORATED_REGION_CHUNKS,
+            key.1 * DECORATED_REGION_CHUNKS,
+        );
+        let tile_max = (
+            tile_min.0 + DECORATED_REGION_CHUNKS - 1,
+            tile_min.1 + DECORATED_REGION_CHUNKS - 1,
+        );
+        let holders = self.decorate(tile_min, tile_max);
+        let mut region = DecoratedRegion {
+            all: Vec::new(),
+            surface: Vec::new(),
+        };
+        for chunk_x in tile_min.0..=tile_max.0 {
+            for chunk_z in tile_min.1..=tile_max.1 {
+                let Some(decorated) = holders
+                    .get(&(chunk_x, chunk_z))
+                    .and_then(|holder| holder.try_chunk(ChunkStatus::Terrain))
+                else {
+                    unreachable!("region chunk holder was just created");
+                };
+                let Some(entry) = self.terrain.get(&(chunk_x, chunk_z)) else {
+                    unreachable!("region terrain entry was just ensured");
+                };
+                let Some(carved) = entry.carved.as_deref() else {
+                    unreachable!("region terrain entry was just carved");
+                };
+                let first = region.all.len();
+                self.append_changed_blocks(
+                    &mut region.all,
+                    carved,
+                    decorated,
+                    &entry.surface,
+                    (
+                        tile_min.0 * 16,
+                        tile_min.1 * 16,
+                        tile_max.0 * 16 + 15,
+                        tile_max.1 * 16 + 15,
+                    ),
+                    GeneratedBlockFilter::All,
+                );
+                region
+                    .surface
+                    .extend(region.all[first..].iter().copied().filter(|block| {
+                        let column = entry.surface[column_index(block.x, block.z)];
+                        !column.exists || block.y >= i32::from(column.height)
+                    }));
+            }
+        }
+        let region = Arc::new(region);
+        let bytes = region.bytes();
+        let budget = self
+            .terrain_capacity
+            .saturating_mul(DECORATED_BYTES_PER_TERRAIN_ENTRY);
+        // Oversized regions remain usable for this request without entering the cache.
+        if bytes <= budget {
+            let capacity =
+                (self.terrain_capacity / (DECORATED_REGION_CHUNKS as usize).pow(2)).max(1);
+            while self.decorated_bytes > budget - bytes || self.decorated.len() >= capacity {
+                let Some(oldest) = self
+                    .decorated
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(key, _)| *key)
+                else {
+                    break;
+                };
+                if let Some(entry) = self.decorated.remove(&oldest) {
+                    self.decorated_bytes -= entry.region.bytes();
+                }
+            }
+            self.decorated_bytes += bytes;
+            self.decorated.insert(
+                key,
+                DecoratedEntry {
+                    region: Arc::clone(&region),
+                    last_used: now,
+                },
+            );
+        }
+        region
     }
 
     /// Decorates every chunk within `source_radius` of `center`, in X-then-Z
