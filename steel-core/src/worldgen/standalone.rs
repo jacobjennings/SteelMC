@@ -34,6 +34,7 @@ use crate::chunk::chunk_ticket_manager::ChunkTicketLevel;
 use crate::chunk::paletted_container::BiomePalette;
 use crate::chunk::section::{ChunkSection, Sections};
 use crate::chunk::status::ChunkStatus;
+use crate::poi::{PoiReplay, PoiTask, replay_poi_tasks};
 use crate::worldgen::generator::{ChunkGenerator, GenerationChunk, TerrainPhase};
 use crate::worldgen::stages::structures::collect_source_references;
 use crate::worldgen::stages::terrain::beardifier_from_starts;
@@ -164,6 +165,10 @@ pub struct ChunkSnapshot {
     pub states: Vec<BlockStateId>,
     /// Postprocessing marks as world positions, sorted, duplicates kept.
     pub postprocessing: Vec<(i32, i32, i32)>,
+    /// POI manager tasks this chunk's writes enqueued, in order.
+    pub poi_tasks: Vec<PoiTask>,
+    /// Records a server would save after running [`Self::poi_tasks`].
+    pub poi: PoiReplay,
 }
 
 impl ChunkSnapshot {
@@ -193,11 +198,15 @@ impl ChunkSnapshot {
             }
         }
         postprocessing.sort_unstable();
+        let poi_tasks = chunk.poi_tasks();
+        let poi = replay_poi_tasks(&poi_tasks);
         Self {
             chunk_x,
             chunk_z,
             states,
             postprocessing,
+            poi_tasks,
+            poi,
         }
     }
 }

@@ -529,6 +529,9 @@ impl<'a> WorldGenRegion<'a> {
                 state,
                 flags,
             );
+            if let Some(old_state) = old_state {
+                self.update_poi_on_block_state_change(chunk.chunk, pos, old_state, state);
+            }
             if state.has_block_entity() {
                 chunk.chunk.set_pending_block_entity_if_state(pos, state);
             } else if old_state.is_some_and(|old_state| old_state.has_block_entity()) {
@@ -545,6 +548,36 @@ impl<'a> WorldGenRegion<'a> {
             self.mark_pos_for_postprocessing(postprocess_pos);
         }
         true
+    }
+
+    /// Mirrors vanilla `ServerLevel.updatePOIOnBlockStateChange`, which
+    /// `WorldGenRegion.setBlock` calls whenever the chunk write returns an old state.
+    ///
+    /// Steel's generation write returns no old state only when it equals the new
+    /// state, whose POI type then cannot differ. A server applies the change to its
+    /// world POI storage. Vanilla defers it to the server executor, and nothing in
+    /// generation reads POI storage before those tasks run. Generation without a
+    /// live world records the same tasks in the written chunk.
+    fn update_poi_on_block_state_change(
+        &self,
+        chunk: &Chunk,
+        pos: BlockPos,
+        old_state: BlockStateId,
+        new_state: BlockStateId,
+    ) {
+        let poi_types = &REGISTRY.poi_types;
+        let old_type = poi_types.type_id_for_state(old_state);
+        let new_type = poi_types.type_id_for_state(new_state);
+        if old_type == new_type {
+            return;
+        }
+        match self.context.weak_world().upgrade() {
+            Some(world) => world
+                .poi_storage
+                .lock()
+                .on_block_state_change(pos, old_state, new_state),
+            None => chunk.record_poi_change(pos, old_type, new_type),
+        }
     }
 
     /// Mirrors the vanilla `Blocks` post-process hooks that can affect worldgen output.

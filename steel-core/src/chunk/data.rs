@@ -32,6 +32,7 @@ use crate::chunk::{
     status::ChunkStatus,
 };
 use crate::entity::{EntityStorage, EntityStorageAddResult, SharedEntity};
+use crate::poi::PoiTask;
 use crate::world::World;
 use crate::world::tick_scheduler::{
     BlockTickList, ChunkTickContainer, ChunkTickLists, FluidTickList, TickPriority,
@@ -98,6 +99,8 @@ pub struct Chunk {
     pub structure_references: SyncRwLock<StructureReferenceMap>,
     /// Section-indexed packed offsets that need vanilla postprocessing after promotion.
     pub postprocessing: SyncMutex<Box<[Vec<u16>]>>,
+    /// POI manager tasks in enqueue order, kept only by generation without a live world.
+    poi_tasks: SyncMutex<Vec<PoiTask>>,
     /// Stable block and fluid scheduled-tick storage retained through Full promotion.
     pub(crate) scheduled_ticks: Arc<ChunkTickContainer>,
     /// Vanilla skylight source edge cache for this chunk.
@@ -138,6 +141,7 @@ impl Chunk {
             structure_starts: SyncRwLock::new(FxHashMap::default()),
             structure_references: SyncRwLock::new(FxHashMap::default()),
             postprocessing: SyncMutex::new(empty_postprocessing(height)),
+            poi_tasks: SyncMutex::new(Vec::new()),
             scheduled_ticks: Arc::new(ChunkTickContainer::new_proto(ChunkTickLists::new(
                 BlockTickList::new_pending(),
                 FluidTickList::new_pending(),
@@ -197,6 +201,7 @@ impl Chunk {
             structure_starts: SyncRwLock::new(structure_starts),
             structure_references: SyncRwLock::new(structure_references),
             postprocessing: SyncMutex::new(postprocessing_from_disk(height, postprocessing)),
+            poi_tasks: SyncMutex::new(Vec::new()),
             scheduled_ticks: Arc::new(if status == ChunkStatus::Full {
                 ChunkTickContainer::new(ChunkTickLists::new(block_ticks, fluid_ticks))
             } else {
@@ -238,8 +243,8 @@ impl Chunk {
     /// Copies this chunk's generation state into a new chunk with no world.
     ///
     /// Standalone generation replays Features over copies of retained
-    /// Terrain chunks. Blocks, biomes, heightmaps, structure data and
-    /// postprocessing marks are copied. Block entities, entities, scheduled
+    /// Terrain chunks. Blocks, biomes, heightmaps, structure data,
+    /// postprocessing marks and recorded POI tasks are copied. Block entities, entities, scheduled
     /// ticks and light are not, because Terrain chunks have none that later
     /// stages read.
     #[must_use]
@@ -268,6 +273,7 @@ impl Chunk {
         copy.postprocessing
             .lock()
             .clone_from(&self.postprocessing.lock());
+        copy.poi_tasks.lock().clone_from(&self.poi_tasks.lock());
         copy
     }
 
@@ -611,6 +617,35 @@ impl Chunk {
         let packed = Self::pack_postprocessing_offset(pos);
         self.postprocessing.lock()[section_index].push(packed);
         self.mark_unsaved();
+    }
+
+    /// Keeps the POI manager tasks vanilla `ServerLevel.updatePOIOnBlockStateChange`
+    /// enqueues for one accepted generation write without a live world.
+    ///
+    /// Equal optional types enqueue nothing. Otherwise an old type enqueues a removal
+    /// before a new type enqueues an addition, as on the vanilla server executor.
+    pub(crate) fn record_poi_change(
+        &self,
+        pos: BlockPos,
+        old_type: Option<usize>,
+        new_type: Option<usize>,
+    ) {
+        if old_type == new_type {
+            return;
+        }
+        let mut tasks = self.poi_tasks.lock();
+        if old_type.is_some() {
+            tasks.push(PoiTask::Remove(pos));
+        }
+        if let Some(poi_type_id) = new_type {
+            tasks.push(PoiTask::Add(pos, poi_type_id));
+        }
+    }
+
+    /// POI manager tasks recorded by generation without a live world, in enqueue order.
+    #[must_use]
+    pub fn poi_tasks(&self) -> Vec<PoiTask> {
+        self.poi_tasks.lock().clone()
     }
 
     /// Gets the section index for a given Y coordinate.
