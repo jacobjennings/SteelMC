@@ -12,12 +12,16 @@ pub mod biomes;
 pub mod density;
 /// Noise generation utilities for world generation.
 pub mod noise;
+/// In-memory Java 26.3 Noise and Material stages.
+pub mod portable_terrain;
 /// `state_resolver`
 pub mod state_resolver;
 /// structure
 pub mod structure;
 /// Surface rule context types for generated code.
 pub mod surface;
+mod surface_stage;
+mod surface_system;
 /// utils
 pub mod utils;
 

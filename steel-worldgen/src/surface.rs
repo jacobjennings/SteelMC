@@ -247,3 +247,9 @@ pub trait SurfaceNoiseProvider {
         false_at_and_above: i32,
     ) -> bool;
 }
+
+// The runtime depends on portable hosts, never on server chunk storage.
+pub use crate::surface_stage::{
+    MaterialSurfaceGrid, SurfaceBiomeAccess, SurfaceBlockAccess, SurfaceExtensions, SurfaceStage,
+};
+pub use crate::surface_system::SurfaceSystem;
