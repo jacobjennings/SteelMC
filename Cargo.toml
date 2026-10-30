@@ -12,6 +12,7 @@ members = [
     "steel-core",
     "steel-crypto",
     "steel-math",
+    "steel-worldgen-wasm",
 ]
 
 [workspace.package]
@@ -33,17 +34,9 @@ steel-worldgen = { path = "steel-worldgen" }
 steel-math = { path = "steel-math" }
 
 # Async runtime
-tokio = { version = "1.53.1", features = [
-    "macros",
-    "net",
-    "rt-multi-thread",
-    "sync",
-    "io-std",
-    "fs",
-    "io-util",
-    "time",
-    "signal",
-] }
+# Features supported on every target. Native crates add server features under
+# their non-Wasm target sections, so native feature unification is unchanged.
+tokio = { version = "1.53.1", features = ["macros", "sync", "io-util", "time", "rt"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
 futures = "0.3.33"
 
@@ -139,6 +132,9 @@ heck = "0.5.0"
 # Build dependencies
 phf_codegen = "0.14.0"
 
+# Browser bindings
+wasm-bindgen = "0.2.126"
+
 # Dev/Bench dependencies
 criterion = "0.8.2"
 
@@ -208,3 +204,7 @@ debug = true
 [profile.samplydev]
 inherits = "dev"
 debug = true
+
+# simdnbt 0.10.0 rejects 32-bit pointer widths. This revision adds wasm32 support.
+[patch.crates-io]
+simdnbt = { git = "https://github.com/jacobjennings/simdnbt.git", rev = "60dcb53c01d46e62ac5c50f814d8e67f4142a893" }

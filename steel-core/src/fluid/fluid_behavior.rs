@@ -27,6 +27,11 @@ pub trait FluidBehavior: Send + Sync {
 
     /// Gets the number of ticks between fluid updates.
     fn tick_delay(&self, world: &Arc<World>) -> i32;
+    /// Gets the tick delay from the dimension's lava speed alone.
+    ///
+    /// World generation without a live world uses this. It must agree with
+    /// [`Self::tick_delay`] for the same dimension.
+    fn tick_delay_for_dimension(&self, fast_lava: bool) -> i32;
     /// Gets the amount of fluid level drop per horizontal block.
     /// Takes `world` because some fluids (lava) differ by dimension.
     fn drop_off(&self, world: &Arc<World>) -> u8;

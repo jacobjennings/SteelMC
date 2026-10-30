@@ -30,6 +30,9 @@ use text_components::custom::CustomData;
 use text_components::resolving::TextResolutor;
 use text_components::{Modifier, TextComponent, format::Color};
 use tokio::io::{BufReader, BufWriter};
+#[cfg(target_family = "wasm")]
+use tokio::io::{Empty as OwnedReadHalf, Sink as OwnedWriteHalf};
+#[cfg(not(target_family = "wasm"))]
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::select;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, error::TryRecvError};

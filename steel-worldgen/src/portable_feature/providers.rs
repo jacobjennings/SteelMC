@@ -4,6 +4,7 @@
 //! `Ok(None)`, distinct from unavailable world access or an unsupported provider.
 
 use steel_registry::Registry;
+use steel_registry::TaggedRegistryExt as _;
 use steel_registry::blocks::block_state_ext::BlockStateExt;
 use steel_registry::blocks::properties::BlockStateProperties;
 use steel_registry::feature::BlockHolderSet;

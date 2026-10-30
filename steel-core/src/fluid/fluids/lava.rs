@@ -59,7 +59,11 @@ impl FluidBehavior for LavaFluid {
     }
 
     fn tick_delay(&self, world: &Arc<World>) -> i32 {
-        if Self::is_fast_lava(world) { 10 } else { 30 }
+        self.tick_delay_for_dimension(Self::is_fast_lava(world))
+    }
+
+    fn tick_delay_for_dimension(&self, fast_lava: bool) -> i32 {
+        if fast_lava { 10 } else { 30 }
     }
 
     fn drop_off(&self, world: &Arc<World>) -> u8 {

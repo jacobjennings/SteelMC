@@ -32,6 +32,10 @@ impl FluidBehavior for WaterFluid {
     }
 
     fn tick_delay(&self, _world: &Arc<World>) -> i32 {
+        self.tick_delay_for_dimension(false)
+    }
+
+    fn tick_delay_for_dimension(&self, _fast_lava: bool) -> i32 {
         5
     }
 

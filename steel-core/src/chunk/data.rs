@@ -235,6 +235,42 @@ impl Chunk {
         self.pos
     }
 
+    /// Copies this chunk's generation state into a new chunk with no world.
+    ///
+    /// Standalone generation replays Features over copies of retained
+    /// Terrain chunks. Blocks, biomes, heightmaps, structure data and
+    /// postprocessing marks are copied. Block entities, entities, scheduled
+    /// ticks and light are not, because Terrain chunks have none that later
+    /// stages read.
+    #[must_use]
+    pub(crate) fn clone_generation_state(&self) -> Self {
+        let sections = self
+            .sections
+            .sections
+            .iter()
+            .map(|section| section.read().clone())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let copy = Self::new(
+            Sections::from_owned(sections),
+            self.pos,
+            self.min_y,
+            self.height,
+            Weak::new(),
+        );
+        copy.heightmaps.write().clone_from(&self.heightmaps.read());
+        copy.structure_starts
+            .write()
+            .clone_from(&self.structure_starts.read());
+        copy.structure_references
+            .write()
+            .clone_from(&self.structure_references.read());
+        copy.postprocessing
+            .lock()
+            .clone_from(&self.postprocessing.lock());
+        copy
+    }
+
     /// Returns the stable section storage.
     #[must_use]
     pub const fn sections(&self) -> &Sections {

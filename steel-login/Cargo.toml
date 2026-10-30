@@ -44,5 +44,8 @@ thiserror.workspace = true
 # Texts components
 text_components.workspace = true
 
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "io-std", "fs", "signal"] }
+
 [lints]
 workspace = true

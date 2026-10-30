@@ -1,0 +1,30 @@
+[package]
+name = "steel-worldgen-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+steel-core.workspace = true
+steel-registry.workspace = true
+steel-utils.workspace = true
+steel-worldgen.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen.workspace = true
+
+# Browser entropy backends for every getrandom major version in the graph.
+# World generation itself never draws entropy.
+[target.'cfg(target_family = "wasm")'.dependencies]
+getrandom_02 = { package = "getrandom", version = "0.2.17", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3.4", features = ["wasm_js"] }
+getrandom = { version = "0.4.3", features = ["wasm_js"] }
+uuid = { workspace = true, features = ["js"] }
+
+[lints]
+workspace = true

@@ -243,6 +243,11 @@ impl<N: DimensionNoises> VanillaGenerator<N> {
         }
     }
 
+    /// Returns the seed-bound density noises.
+    pub(crate) fn noises(&self) -> &N {
+        &self.noises
+    }
+
     fn uniform_carver_biome(possible_biomes: &FxHashSet<Identifier>) -> Option<BiomeRef> {
         let mut possible_biomes = possible_biomes.iter();
         let first_key = possible_biomes.next()?;

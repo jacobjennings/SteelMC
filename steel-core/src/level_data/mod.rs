@@ -16,7 +16,7 @@ use steel_registry::REGISTRY;
 use steel_registry::game_rules::GameRuleValues;
 use steel_utils::types::Difficulty;
 use steel_utils::{BlockPos, GlobalPos, Identifier};
-use tokio::fs;
+use steel_utils::async_fs as fs;
 
 use crate::world::{MAX_SIZE, clock::WorldClockManager};
 

@@ -384,6 +384,59 @@ impl StructureLocatePlan {
 
         candidates
     }
+
+    /// Random-spread candidates in every placement cell that can hold a chunk
+    /// within `radius_blocks` horizontally of `origin`.
+    ///
+    /// Each placement scans its own cells once, so small-spacing placements do
+    /// not set the scan size of large-spacing ones. Callers filter the returned
+    /// locate positions by distance.
+    #[must_use]
+    pub fn random_spread_candidates_in_block_radius(
+        &self,
+        origin: BlockPos,
+        radius_blocks: i32,
+    ) -> Vec<StructureLocateCandidate> {
+        if radius_blocks < 0 {
+            return Vec::new();
+        }
+        let min_chunk_x = origin.0.x.saturating_sub(radius_blocks) >> 4;
+        let max_chunk_x = origin.0.x.saturating_add(radius_blocks) >> 4;
+        let min_chunk_z = origin.0.z.saturating_sub(radius_blocks) >> 4;
+        let max_chunk_z = origin.0.z.saturating_add(radius_blocks) >> 4;
+        let mut candidates = Vec::new();
+
+        for (scan_id, locate_placement) in self.placements.iter().enumerate() {
+            let PlacementKind::RandomSpread {
+                spacing,
+                separation,
+                spread_type,
+            } = &locate_placement.placement.kind
+            else {
+                continue;
+            };
+            for cell_x in min_chunk_x.div_euclid(*spacing)..=max_chunk_x.div_euclid(*spacing) {
+                for cell_z in min_chunk_z.div_euclid(*spacing)..=max_chunk_z.div_euclid(*spacing) {
+                    let chunk_pos = StructurePlacement::get_potential_structure_chunk(
+                        self.seed,
+                        locate_placement.placement.salt,
+                        cell_x * *spacing,
+                        cell_z * *spacing,
+                        *spacing,
+                        *separation,
+                        *spread_type,
+                    );
+                    candidates.push(StructureLocateCandidate::new(
+                        scan_id,
+                        locate_placement.placement.locate_pos(chunk_pos),
+                        chunk_pos,
+                    ));
+                }
+            }
+        }
+
+        candidates
+    }
 }
 
 impl StructureLocateCandidate {

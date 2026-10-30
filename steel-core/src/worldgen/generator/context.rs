@@ -3,6 +3,7 @@
 use std::sync::{Arc, Weak};
 
 use enum_dispatch::enum_dispatch;
+use steel_registry::dimension_type::DimensionTypeRef;
 use steel_worldgen::density_functions::{
     end::EndNoises, nether::NetherNoises, overworld::OverworldNoises,
 };
@@ -53,6 +54,16 @@ pub struct WorldGenContext {
     /// cached here so it avoids a `Weak<World>::upgrade` (cross-thread atomic
     /// on the shared `Arc<World>`) on every column. See [`Self::min_y`].
     sea_level: i32,
+    /// World facts for generation without a live world, such as the browser
+    /// module. Server contexts read them from the world instead.
+    standalone: Option<StandaloneWorldFacts>,
+}
+
+/// World facts that generation reads when no live world exists.
+#[derive(Clone, Copy)]
+struct StandaloneWorldFacts {
+    seed: i64,
+    dimension_type: DimensionTypeRef,
 }
 
 impl WorldGenContext {
@@ -74,6 +85,68 @@ impl WorldGenContext {
             min_y,
             height,
             sea_level,
+            standalone: None,
+        }
+    }
+
+    /// Creates a context for generation without a live world.
+    ///
+    /// Generated chunks carry no world reference. Stages that need world
+    /// state read the seed and dimension type given here.
+    #[must_use]
+    pub fn new_standalone(
+        generator: Arc<ChunkGeneratorType>,
+        seed: i64,
+        dimension_type: DimensionTypeRef,
+        sea_level: i32,
+    ) -> Self {
+        Self {
+            generator,
+            world: Weak::new(),
+            min_y: dimension_type.min_y,
+            height: dimension_type.height,
+            sea_level,
+            standalone: Some(StandaloneWorldFacts {
+                seed,
+                dimension_type,
+            }),
+        }
+    }
+
+    /// Returns the world seed.
+    ///
+    /// # Panics
+    /// Panics if a server context's world has been dropped.
+    #[must_use]
+    pub fn seed(&self) -> i64 {
+        match self.standalone {
+            Some(facts) => facts.seed,
+            None => self.world().seed(),
+        }
+    }
+
+    /// Returns the dimension type being generated.
+    ///
+    /// # Panics
+    /// Panics if a server context's world has been dropped.
+    #[must_use]
+    pub fn dimension_type(&self) -> DimensionTypeRef {
+        match self.standalone {
+            Some(facts) => facts.dimension_type,
+            None => self.world().dimension_type,
+        }
+    }
+
+    /// Returns the scheduled-tick delay of a fluid in this dimension.
+    ///
+    /// # Panics
+    /// Panics if a server context's world has been dropped.
+    #[must_use]
+    pub fn fluid_tick_delay(&self, fluid: steel_registry::fluid::FluidRef) -> i32 {
+        let behavior = crate::behavior::FLUID_BEHAVIORS.get_behavior(fluid);
+        match self.standalone {
+            Some(facts) => behavior.tick_delay_for_dimension(facts.dimension_type.fast_lava),
+            None => behavior.tick_delay(&self.world()),
         }
     }
 

@@ -25,7 +25,7 @@ use steel_utils::{
 };
 use steel_worldgen::structure::{StructureReferenceMap, StructureStartMap};
 
-use crate::behavior::{BLOCK_BEHAVIORS, FLUID_BEHAVIORS};
+use crate::behavior::BLOCK_BEHAVIORS;
 use crate::block_entity::{BLOCK_ENTITIES, SharedBlockEntity};
 use crate::chunk::{
     Chunk,
@@ -279,7 +279,7 @@ impl<'a> WorldGenRegion<'a> {
     /// Returns the world seed.
     #[must_use]
     pub fn seed(&self) -> i64 {
-        self.context.world().seed()
+        self.context.seed()
     }
 
     /// Returns the weak world reference used by generated chunks and entities.
@@ -1436,7 +1436,7 @@ impl LevelReader for WorldGenRegion<'_> {
     }
 
     fn raw_brightness(&self, pos: BlockPos, sky_darkening: u8) -> u8 {
-        let sky_light = if self.context.world().dimension_type.has_skylight {
+        let sky_light = if self.context.dimension_type().has_skylight {
             15_u8.saturating_sub(sky_darkening)
         } else {
             0
@@ -1446,7 +1446,7 @@ impl LevelReader for WorldGenRegion<'_> {
     }
 
     fn can_see_sky(&self, pos: BlockPos) -> bool {
-        if !self.context.world().dimension_type.has_skylight {
+        if !self.context.dimension_type().has_skylight {
             return false;
         }
 
@@ -1454,7 +1454,7 @@ impl LevelReader for WorldGenRegion<'_> {
     }
 
     fn ambient_light(&self) -> f32 {
-        self.context.world().dimension_type.ambient_light
+        self.context.dimension_type().ambient_light
     }
 
     fn height_at(&self, heightmap_type: HeightmapType, x: i32, z: i32) -> i32 {
@@ -1476,9 +1476,7 @@ impl LevelReader for WorldGenRegion<'_> {
 
 impl ScheduledTickAccess for WorldGenRegion<'_> {
     fn fluid_tick_delay(&self, fluid: FluidRef) -> i32 {
-        FLUID_BEHAVIORS
-            .get_behavior(fluid)
-            .tick_delay(&self.context.world())
+        self.context.fluid_tick_delay(fluid)
     }
 
     fn schedule_block_tick_default(&self, pos: BlockPos, block: BlockRef, delay: i32) -> bool {

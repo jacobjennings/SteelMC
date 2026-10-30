@@ -489,7 +489,7 @@ impl Sections {
 ///
 /// Contains a 16x16x16 cube of block states and biomes, along with cached
 /// counts for optimization (similar to vanilla's `LevelChunkSection`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ChunkSection {
     /// The block states in the section.
     pub states: BlockPalette,

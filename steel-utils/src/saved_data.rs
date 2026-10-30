@@ -11,7 +11,7 @@ use std::{
 };
 
 use serde::{Serialize, de::DeserializeOwned};
-use tokio::fs;
+use crate::async_fs as fs;
 use wincode::{SchemaRead, SchemaWrite, config::DefaultConfig};
 
 /// Built-in saved data entry names.

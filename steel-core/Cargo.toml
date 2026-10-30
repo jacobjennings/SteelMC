@@ -78,6 +78,14 @@ text_components.workspace = true
 simdnbt.workspace = true
 tracing.workspace = true
 
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "io-std", "fs", "signal"] }
+
+# Server storage compiles in browser builds and reports `Unsupported` there.
+# Requires `--cfg tokio_unstable` on wasm targets.
+[target.'cfg(target_family = "wasm")'.dependencies]
+tokio = { workspace = true, features = ["fs"] }
+
 [build-dependencies]
 serde.workspace = true
 serde_json.workspace = true

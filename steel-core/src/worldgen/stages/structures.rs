@@ -6,7 +6,8 @@ use crate::chunk::{
 };
 use crate::worldgen::generator::ChunkGenerator;
 use crate::worldgen::generator::context::WorldGenContext;
-use steel_worldgen::structure::StructureReferenceMap;
+use steel_utils::ChunkPos;
+use steel_worldgen::structure::{StructureReferenceMap, StructureStartMap};
 
 /// Generates structure starts.
 ///
@@ -41,8 +42,6 @@ pub(crate) fn generate_references(
     let target_pos = chunk.pos();
     let target_x = target_pos.0.x;
     let target_z = target_pos.0.y;
-    let target_block_x = target_x * 16;
-    let target_block_z = target_z * 16;
     let mut references = StructureReferenceMap::default();
 
     // Radius-8 scan for starts whose BB intersects this chunk.
@@ -52,25 +51,12 @@ pub(crate) fn generate_references(
             let Some(source_chunk) = source_holder.try_chunk(ChunkStatus::StructureStarts) else {
                 continue;
             };
-
-            for (structure_id, start) in source_chunk.structure_starts().iter() {
-                // Empty-pieces starts have no BB and are not valid. `start.bounding_box`
-                // is already inflated by `bb_inflate`.
-                let Some(bb) = start.bounding_box else {
-                    continue;
-                };
-                if bb.intersects_xz(
-                    target_block_x,
-                    target_block_z,
-                    target_block_x + 15,
-                    target_block_z + 15,
-                ) {
-                    references
-                        .entry(structure_id.clone())
-                        .or_default()
-                        .insert(steel_utils::ChunkPos::new(source_x, source_z));
-                }
-            }
+            collect_source_references(
+                &mut references,
+                target_pos,
+                ChunkPos::new(source_x, source_z),
+                &source_chunk.structure_starts(),
+            );
         }
     }
 
@@ -86,6 +72,35 @@ pub(crate) fn generate_references(
                 .extend(source_chunks);
         }
         target_chunk.mark_dirty();
+    }
+}
+
+/// Records the starts in one source chunk whose bounds reach `target`.
+pub(crate) fn collect_source_references(
+    references: &mut StructureReferenceMap,
+    target: ChunkPos,
+    source: ChunkPos,
+    starts: &StructureStartMap,
+) {
+    let target_block_x = target.0.x * 16;
+    let target_block_z = target.0.y * 16;
+    for (structure_id, start) in starts {
+        // Empty-pieces starts have no BB and are not valid. `start.bounding_box`
+        // is already inflated by `bb_inflate`.
+        let Some(bb) = start.bounding_box else {
+            continue;
+        };
+        if bb.intersects_xz(
+            target_block_x,
+            target_block_z,
+            target_block_x + 15,
+            target_block_z + 15,
+        ) {
+            references
+                .entry(structure_id.clone())
+                .or_default()
+                .insert(source);
+        }
     }
 }
 

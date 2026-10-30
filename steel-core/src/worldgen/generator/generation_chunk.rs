@@ -52,6 +52,14 @@ impl<'a, Phase> GenerationChunk<'a, Phase> {
         Self::from_chunk(chunk)
     }
 
+    /// Grants stage access to a chunk owned by standalone generation.
+    ///
+    /// Standalone generation has no scheduler. It runs each stage once per
+    /// chunk in pyramid order before granting the next.
+    pub(crate) const fn for_standalone(chunk: &'a Chunk) -> Self {
+        Self::from_chunk(chunk)
+    }
+
     fn acquire_input(holder: &'a ChunkHolder, input_status: ChunkStatus) -> Self {
         assert_eq!(
             holder.published_status(),

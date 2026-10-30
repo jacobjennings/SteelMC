@@ -9,7 +9,9 @@ use tokio::{sync::oneshot, time::sleep};
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_SERVICES_SERVER: &str = "https://api.minecraftservices.com/publickeys";
+#[cfg(not(target_family = "wasm"))]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(target_family = "wasm"))]
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const DAILY_REFRESH_INTERVAL: Duration = Duration::from_hours(24);
 const BASE_FAILURE_INTERVAL: Duration = Duration::from_mins(5);
@@ -29,6 +31,10 @@ pub(super) enum ServiceKeyError {
     PublicKey(#[from] CryptError),
 }
 
+#[cfg_attr(
+    target_family = "wasm",
+    expect(dead_code, reason = "browser builds have no service-key network")
+)]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ServiceKeyResponse {
@@ -36,6 +42,10 @@ struct ServiceKeyResponse {
     player_certificate_keys: Option<Vec<ServiceKeyData>>,
 }
 
+#[cfg_attr(
+    target_family = "wasm",
+    expect(dead_code, reason = "browser builds have no service-key network")
+)]
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ServiceKeyData {
@@ -44,6 +54,10 @@ struct ServiceKeyData {
 
 /// Cached Mojang service keys used to validate player-key certificates.
 pub(super) struct ServiceKeyStore {
+    #[cfg_attr(
+        target_family = "wasm",
+        expect(dead_code, reason = "browser builds have no service-key network")
+    )]
     client: reqwest::Client,
     endpoint: reqwest::Url,
     profile_key_validator: ArcSwapOption<ProfileKeyValidator>,
@@ -63,9 +77,14 @@ impl ServiceKeyStore {
                 reason: "expected http or https".to_owned(),
             });
         }
+        #[cfg(not(target_family = "wasm"))]
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .read_timeout(READ_TIMEOUT)
+            .build()
+            .map_err(ServiceKeyError::Client)?;
+        #[cfg(target_family = "wasm")]
+        let client = reqwest::Client::builder()
             .build()
             .map_err(ServiceKeyError::Client)?;
 
@@ -126,6 +145,19 @@ impl ServiceKeyStore {
         ready_rx
     }
 
+    #[cfg(target_family = "wasm")]
+    #[expect(
+        clippy::unused_async,
+        reason = "matches the server signature so callers stay unchanged"
+    )]
+    async fn refresh(&self) -> Result<(), ServiceKeyError> {
+        Err(ServiceKeyError::InvalidEndpoint {
+            endpoint: self.endpoint.to_string(),
+            reason: "service keys are unavailable in browser builds".to_owned(),
+        })
+    }
+
+    #[cfg(not(target_family = "wasm"))]
     async fn refresh(&self) -> Result<(), ServiceKeyError> {
         let response = self
             .client
@@ -141,6 +173,10 @@ impl ServiceKeyStore {
     }
 }
 
+#[cfg_attr(
+    target_family = "wasm",
+    expect(dead_code, reason = "browser builds have no service-key network")
+)]
 fn profile_key_validator(
     response: ServiceKeyResponse,
 ) -> Result<Option<ProfileKeyValidator>, ServiceKeyError> {
@@ -150,6 +186,10 @@ fn profile_key_validator(
     Ok(ProfileKeyValidator::new(keys))
 }
 
+#[cfg_attr(
+    target_family = "wasm",
+    expect(dead_code, reason = "browser builds have no service-key network")
+)]
 fn parse_keys(
     keys: Option<Vec<ServiceKeyData>>,
 ) -> Result<Vec<rsa::RsaPublicKey>, ServiceKeyError> {

@@ -48,8 +48,15 @@ pub enum ProfileLookupError {
         /// Response validation failure.
         reason: String,
     },
+    /// This build has no server networking.
+    #[error("Profile lookup is unavailable in browser builds")]
+    Unavailable,
 }
 
+#[cfg_attr(
+    target_family = "wasm",
+    expect(dead_code, reason = "browser builds have no profile lookup network")
+)]
 #[derive(Deserialize)]
 struct ProfileLookupResponse {
     id: String,
@@ -80,6 +87,21 @@ pub async fn lookup_online_profile(
     unreachable!("the profile lookup attempt range is non-empty")
 }
 
+#[cfg(target_family = "wasm")]
+#[expect(
+    clippy::unused_async,
+    reason = "matches the server signature so callers stay unchanged"
+)]
+async fn lookup_online_profile_once(
+    _client: &reqwest::Client,
+    _url: &str,
+    _name: &str,
+    _request_timeout: Duration,
+) -> Result<KnownPlayer, ProfileLookupError> {
+    Err(ProfileLookupError::Unavailable)
+}
+
+#[cfg(not(target_family = "wasm"))]
 async fn lookup_online_profile_once(
     client: &reqwest::Client,
     url: &str,
@@ -117,6 +139,10 @@ fn profile_lookup_url(
     Url::parse(&endpoint).map_err(|_| ProfileLookupError::InvalidProfileServer(endpoint))
 }
 
+#[cfg_attr(
+    target_family = "wasm",
+    expect(dead_code, reason = "browser builds have no profile lookup network")
+)]
 async fn parse_profile_response(
     response: reqwest::Response,
     requested_name: &str,

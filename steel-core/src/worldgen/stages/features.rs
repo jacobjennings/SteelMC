@@ -21,7 +21,7 @@ pub(crate) fn generate(
     };
     chunk.prime_final_heightmaps();
 
-    let world_seed = context.world().seed();
+    let world_seed = context.seed();
     let region_random = context
         .generator
         .create_worldgen_region_random(world_seed, center);

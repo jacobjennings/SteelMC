@@ -5,7 +5,7 @@ use rustc_hash::FxHashMap;
 use steel_registry::structure::TerrainAdjustment;
 use steel_utils::{ChunkPos, Identifier};
 use steel_worldgen::noise::Beardifier;
-use steel_worldgen::structure::StructureStart;
+use steel_worldgen::structure::{StructureStart, StructureStartMap};
 
 use crate::chunk::{
     chunk_generation_task::StaticCache2D, chunk_holder::ChunkHolder, chunk_pyramid::ChunkStep,
@@ -14,7 +14,7 @@ use crate::chunk::{
 use crate::worldgen::generator::context::WorldGenContext;
 use crate::worldgen::generator::{ChunkGenerator, GenerationChunk, TerrainPhase};
 
-type StructureReferencesForTerrain = Vec<(Identifier, Vec<ChunkPos>)>;
+pub(crate) type StructureReferencesForTerrain = Vec<(Identifier, Vec<ChunkPos>)>;
 
 pub(crate) fn generate(
     context: Arc<WorldGenContext>,
@@ -104,14 +104,32 @@ fn build_beardifier(
         starts_guards.push(source_chunk.structure_starts());
     }
 
+    beardifier_from_starts(
+        references,
+        |source_pos| {
+            source_indices
+                .get(&source_pos)
+                .map(|&guard_index| &*starts_guards[guard_index])
+        },
+        chunk_x,
+        chunk_z,
+    )
+}
+
+/// Builds the terrain adaptation for one chunk from its referenced starts.
+pub(crate) fn beardifier_from_starts<'s>(
+    references: &[(Identifier, Vec<ChunkPos>)],
+    starts_at: impl Fn(ChunkPos) -> Option<&'s StructureStartMap>,
+    chunk_x: i32,
+    chunk_z: i32,
+) -> Option<Beardifier> {
     let mut starts = Vec::<&StructureStart>::new();
     for (structure_id, source_chunks) in references {
         for source_pos in source_chunks {
-            let Some(&guard_index) = source_indices.get(source_pos) else {
+            let Some(source_starts) = starts_at(*source_pos) else {
                 continue;
             };
-            let guard = &starts_guards[guard_index];
-            if let Some(start) = guard.get(structure_id)
+            if let Some(start) = source_starts.get(structure_id)
                 && start.chunk_pos == *source_pos
                 && start.terrain_adjustment != TerrainAdjustment::None
             {

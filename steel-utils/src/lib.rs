@@ -4,6 +4,7 @@
 
 #![feature(const_trait_impl, const_cmp, derive_const, array_try_from_fn)]
 
+pub mod async_fs;
 pub mod axis;
 /// Vanilla `BlockUtil` helpers.
 pub mod block_util;
