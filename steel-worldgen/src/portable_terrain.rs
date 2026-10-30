@@ -125,7 +125,7 @@ impl PortableOverworld {
                         &mut values[index * value_count..(index + 1) * value_count],
                     );
                 }
-                chunk.states[index] = match aquifer.compute_substance(
+                let state = match aquifer.compute_substance(
                     &self.noises,
                     min_x + lx as i32,
                     y,
@@ -136,6 +136,14 @@ impl PortableOverworld {
                     AquiferResult::Fluid(state) => state,
                     AquiferResult::Air => vanilla_blocks::AIR.default_state(),
                 };
+                chunk.states[index] = state;
+                if aquifer.should_schedule_fluid_update() && state.has_fluid() {
+                    chunk.fluid_updates.push(BlockPos::new(
+                        min_x + lx as i32,
+                        y,
+                        min_z + lz as i32,
+                    ));
+                }
             },
         );
         chunk.material_values = values;
@@ -289,7 +297,8 @@ impl PortableChunk<'_> {
         &self.states
     }
 
-    /// Positions scheduled by the carver aquifer and top-material writes.
+    /// Positions scheduled by Noise, the carver aquifer and top-material writes.
+    /// Earlier marks survive later block replacement, as in native ProtoChunk.
     #[must_use]
     pub fn fluid_updates(&self) -> &[BlockPos] {
         &self.fluid_updates

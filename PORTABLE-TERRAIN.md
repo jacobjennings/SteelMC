@@ -53,7 +53,8 @@ indices and 256 first-available heights for each of Noise, Material and Carvers 
 ChunkAtlas's `NativePortableTerrain.java` uses the original 26.3 noise, aquifer,
 material and carver machinery without starting a server. `compare-port.py` retains
 input hashes and every disagreement. These are cursory comparisons. They cover block identifiers and properties at those anchors. They do not
-qualify vegetation, Full terrain, fluid-update equivalence or rendered cameras.
+qualify vegetation, Full terrain or rendered cameras. Fluid-update position
+comparisons are recorded separately below.
 No test suite is run by the build or comparison entry points.
 
 ## Remaining implementation
@@ -90,3 +91,23 @@ values as Material, with fuzzed biome access and live world-surface gradients.
 ChunkAtlas's `collect-carver-source.py` retains the eight source classes and
 17 class hashes from the same pinned 26.3 runtime. No extracted registry data
 was hand-authored. The existing server's carver entry points are unchanged.
+
+
+## Retained fluid postprocessing positions
+
+Noise retains each fluid position marked by the aquifer after its substance
+lookup, matching `NoiseBasedChunkGenerator.doFill`. Carvers appends its own
+marks. Later block replacements do not remove earlier marks. The API keeps
+repeated marks because `ProtoChunk.markPosForPostProcessing` appends to a
+section list without deduplication.
+
+The snapshot example adds `sorted-world-positions-v1` fluid positions at Noise,
+Material and Carvers. The native collector calls the actual `doFill` method and
+unpacks `ProtoChunk` section lists with `unpackOffsetCoordinates`. Comparison
+uses multisets, including duplicate counts, rather than insertion order.
+
+The two fixed chunks retain 0 and 203 Noise marks respectively. After Carvers
+they retain 0 and 274 marks. Native and Rust positions agree at all three stages.
+This qualifies retained positions at these anchors only. It does not execute
+fluid ticks or prove update order, Features, complete camera footprints or
+rendered acceptance. Viewer module promotion remains unavailable.

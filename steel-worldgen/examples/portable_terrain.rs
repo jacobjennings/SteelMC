@@ -42,10 +42,17 @@ fn snapshot(
         });
         indices.push(index);
     }
+    let mut fluid_updates: Vec<_> = chunk
+        .fluid_updates()
+        .iter()
+        .map(|pos| [pos.0.x, pos.0.y, pos.0.z])
+        .collect();
+    fluid_updates.sort_unstable();
     let record = json!({
         "release": MINECRAFT_VERSION, "seed": seed.to_string(), "chunk": [x, z],
         "stage": stage, "stateEncoding": "sorted-properties-v1", "minY": -64, "height": 384,
         "palette": palette, "indices": indices, "heights": chunk.heights().as_slice(),
+        "fluidUpdateEncoding": "sorted-world-positions-v1", "fluidUpdates": fluid_updates,
     });
     fs::write(
         output.join(format!("{seed}-{x}-{z}-{stage}.json")),
