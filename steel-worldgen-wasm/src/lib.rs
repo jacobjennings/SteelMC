@@ -85,6 +85,24 @@ impl SteelWorldgen {
             .map_err(|error| JsValue::from_str(&error))
     }
 
+    /// Selects the producer for future Coarse cache misses.
+    /// Bounded material scanning is available only in the Overworld.
+    /// Retained entries survive a change of selection. Full regenerates them.
+    ///
+    /// # Errors
+    /// Rejects unknown sources and bounded requests in other dimensions.
+    pub fn set_coarse_surface_source(&mut self, source: &str) -> Result<(), JsValue> {
+        self.inner
+            .set_coarse_surface_source(source)
+            .map_err(|error| JsValue::from_str(&error))
+    }
+
+    /// Reports the selected producer for future cache misses.
+    #[wasm_bindgen(getter)]
+    pub fn coarse_surface_source(&self) -> String {
+        self.inner.coarse_surface_source().to_owned()
+    }
+
     /// Generates a Full tile: surface plus every block Features and
     /// structures change at or above it.
     ///
@@ -221,6 +239,31 @@ impl Generator {
             seed: seed.to_owned(),
             dimension: name,
         })
+    }
+
+    /// Selects the producer for future Coarse cache misses.
+    ///
+    /// # Errors
+    /// Rejects unknown sources and bounded requests outside the Overworld.
+    pub fn set_coarse_surface_source(&mut self, source: &str) -> Result<(), String> {
+        let bounded = match source {
+            "generated" => false,
+            "bounded" if self.dimension == "overworld" => true,
+            "bounded" => return Err("bounded Coarse surface requires overworld".to_owned()),
+            _ => return Err("unknown Coarse surface source".to_owned()),
+        };
+        self.worldgen.set_bounded_coarse_surface(bounded);
+        Ok(())
+    }
+
+    /// Producer used for future Coarse misses, not provenance of retained entries.
+    #[must_use]
+    pub const fn coarse_surface_source(&self) -> &'static str {
+        if self.worldgen.bounded_coarse_surface() {
+            "bounded"
+        } else {
+            "generated"
+        }
     }
 
     /// Returns the underlying generator.
