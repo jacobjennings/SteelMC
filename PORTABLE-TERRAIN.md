@@ -227,3 +227,36 @@ server's provider dispatch. Survival, native placement/order, remaining provider
 families, complete setBlock side effects, structures, browser ABI and Wasm,
 artifact promotion and rendered scene qualification remain unfinished. No
 viewer package is qualified by these provider comparisons.
+
+## Request-independent viewer decoration
+
+Full tile output now crops fixed per-chunk Features replays. Each output chunk
+starts from fresh retained Terrain, decorates its nine possible writing sources
+in ascending X then Z, and returns only that output chunk. Each source keeps
+its native radius-one Terrain dependencies and radius-eight structure-start
+dependencies. Negative coordinates use floor division. The output chunk and
+seed determine the replay, not the request bounds, cache capacity or history.
+
+This is a deterministic bounded scheduling policy for the standalone viewer.
+It does not reproduce the native server's load schedule or establish that a
+feature crossing output chunks has the same survival in both neighborhoods.
+Native feature algorithms, predicates, RNG and writes are unchanged. The
+`decorated_chunk_snapshots` method retains the wider shared replay for native
+comparisons and is explicitly a different scheduling policy. It must not be
+used as an oracle for the viewer's changed-block payload.
+
+The `tile_alignment` example records overlapping Full requests at the two fixed
+Java 26.3 anchors, with all-height changed blocks and actual browser payloads.
+It includes both axes, negative origins, non-chunk-aligned crops, subdivision,
+reversed request order and a fresh generator with a smaller Terrain cache.
+Chunk replay sharing and complete FULL qualification remain separate work.
+
+## Decorated volume transport
+
+`decorated_volume_chunk` samples carved Terrain plus the all-height delta from
+the same fixed output-chunk replay used by Full tiles. It reuses the bounded
+changed-block cache from ca-4xcl8 with one output chunk per entry, preserving
+ca-qi22j source selection. State and material palettes share u16 voxel indices.
+The endpoint includes below-surface ore, air and fluid changes. It is a
+Features-stage transport, not FULL, lighting or postprocessing qualification.
+`noise_volume_chunk` remains byte-for-byte the base-noise contract.

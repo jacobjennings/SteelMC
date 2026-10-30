@@ -11,6 +11,7 @@ use steel_core::worldgen::standalone::{
     StandaloneWorldgen, StructureMarker, TileDetail,
 };
 use steel_registry::REGISTRY;
+use steel_registry::blocks::block_state_ext::BlockStateExt;
 use steel_utils::BlockStateId;
 use steel_worldgen::structure::StructureStart;
 use wasm_bindgen::prelude::*;
@@ -198,6 +199,22 @@ impl SteelWorldgen {
             .map_err(|error| JsValue::from_str(&error))
     }
 
+    /// Samples Features-stage whole-chunk blocks. This is not FULL output.
+    /// # Errors
+    /// Returns an error for invalid requests or serialization failures.
+    pub fn decorated_volume_chunk(
+        &mut self,
+        chunk_x: i32,
+        chunk_z: i32,
+        min_y: i32,
+        max_y: i32,
+        lod: u32,
+    ) -> Result<String, JsValue> {
+        self.inner
+            .decorated_volume_json(chunk_x, chunk_z, min_y, max_y, lod)
+            .map_err(|error| JsValue::from_str(&error))
+    }
+
     /// Generator release.
     #[wasm_bindgen(getter)]
     #[must_use]
@@ -273,6 +290,60 @@ impl Generator {
                 "minecraft:lava",
             ],
             voxels: volume.voxels,
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    /// Serializes a separate Features-stage volume with an unrestricted state palette.
+    /// # Errors
+    /// Returns an error for invalid requests or serialization failures.
+    pub fn decorated_volume_json(
+        &mut self,
+        chunk_x: i32,
+        chunk_z: i32,
+        min_y: i32,
+        max_y: i32,
+        lod: u32,
+    ) -> Result<String, String> {
+        let volume = self
+            .worldgen
+            .decorated_volume_chunk(chunk_x, chunk_z, min_y, max_y, lod)?;
+        let mut palette = FxHashMap::default();
+        let mut material_keys = Vec::new();
+        let mut state_keys = Vec::new();
+        let mut voxels = Vec::with_capacity(volume.states.len());
+        for state in volume.states {
+            let index = if let Some(index) = palette.get(&state) {
+                *index
+            } else {
+                let index =
+                    u16::try_from(material_keys.len()).map_err(|_| "volume palette exceeds u16")?;
+                material_keys.push(if state.is_air() {
+                    "minecraft:air".to_owned()
+                } else {
+                    canonical_block_key(state)
+                });
+                state_keys.push(canonical_block_state_key(state));
+                palette.insert(state, index);
+                index
+            };
+            voxels.push(index);
+        }
+        serde_json::to_string(&DecoratedVolumeResponse {
+            generator: GENERATOR,
+            version: RELEASE,
+            seed: &self.seed,
+            dimension: self.dimension,
+            chunk_x,
+            chunk_z,
+            min_y: volume.min_y,
+            cells_xz: volume.cells_xz,
+            cells_y: volume.cells_y,
+            lod,
+            stage: "features",
+            material_keys,
+            state_keys,
+            voxels,
         })
         .map_err(|error| error.to_string())
     }
@@ -608,4 +679,24 @@ struct VolumeResponse<'a> {
     lod: u32,
     material_keys: [&'static str; 4],
     voxels: Vec<u8>,
+}
+
+/// Separate decorated transport. State properties retain the same palette index.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DecoratedVolumeResponse<'a> {
+    generator: &'static str,
+    version: &'static str,
+    seed: &'a str,
+    dimension: &'static str,
+    chunk_x: i32,
+    chunk_z: i32,
+    min_y: i32,
+    cells_xz: u32,
+    cells_y: u32,
+    lod: u32,
+    stage: &'static str,
+    material_keys: Vec<String>,
+    state_keys: Vec<String>,
+    voxels: Vec<u16>,
 }
