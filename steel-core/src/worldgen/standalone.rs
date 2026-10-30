@@ -2,8 +2,8 @@
 //!
 //! Browser builds and native comparison tools generate terrain with the same
 //! stage code as the server. Retained chunks stop after Terrain. A Full tile
-//! replays Features over copies of them, in x-then-z chunk order. Its result
-//! therefore does not depend on which tiles were requested before it.
+//! reads fixed 8-by-8-chunk decoration regions. Each region replays Features
+//! over fresh Terrain copies in x-then-z order, independent of request history.
 
 use std::cell::OnceCell;
 use std::sync::{Arc, Weak};
@@ -50,6 +50,10 @@ const FEATURE_WRITE_RADIUS: i32 = 1;
 pub const DEFAULT_TERRAIN_CACHE_CAPACITY: usize = 256;
 /// Retained structure-start and biome entries per retained Terrain chunk.
 const STARTS_PER_TERRAIN_ENTRY: usize = 8;
+/// Fixed spatial ownership, independent of tile origin, size and request order.
+const DECORATED_REGION_CHUNKS: i32 = 8;
+/// Changed-block cache allowance per configured Terrain chunk (16 MiB by default).
+const DECORATED_BYTES_PER_TERRAIN_ENTRY: usize = 65_536;
 
 /// A dimension the standalone generator supports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,6 +238,22 @@ struct TerrainEntry {
     last_used: u64,
 }
 
+struct DecoratedRegion {
+    all: Vec<GeneratedBlock>,
+    surface: Vec<GeneratedBlock>,
+}
+
+impl DecoratedRegion {
+    fn bytes(&self) -> usize {
+        (self.all.capacity() + self.surface.capacity()) * std::mem::size_of::<GeneratedBlock>()
+    }
+}
+
+struct DecoratedEntry {
+    region: Arc<DecoratedRegion>,
+    last_used: u64,
+}
+
 thread_local! {
     /// One generation pool per thread. Browser workers cannot spawn threads,
     /// so the pool runs on the calling thread, which rayon then keeps.
@@ -269,6 +289,8 @@ pub struct StandaloneWorldgen {
     starts: FxHashMap<(i32, i32), StartsEntry>,
     terrain: FxHashMap<(i32, i32), TerrainEntry>,
     terrain_capacity: usize,
+    decorated: FxHashMap<(i32, i32), DecoratedEntry>,
+    decorated_bytes: usize,
     stats: StandaloneStats,
 }
 
@@ -334,6 +356,8 @@ impl StandaloneWorldgen {
             starts: FxHashMap::default(),
             terrain: FxHashMap::default(),
             terrain_capacity: terrain_cache_capacity,
+            decorated: FxHashMap::default(),
+            decorated_bytes: 0,
             stats: StandaloneStats::default(),
         }
     }
@@ -551,36 +575,113 @@ impl StandaloneWorldgen {
     ) -> Vec<GeneratedBlock> {
         let max_x = origin_x.saturating_add(size as i32 - 1);
         let max_z = origin_z.saturating_add(size as i32 - 1);
-        let tile_min = (origin_x.div_euclid(16), origin_z.div_euclid(16));
-        let tile_max = (max_x.div_euclid(16), max_z.div_euclid(16));
-        let holders = self.decorate(tile_min, tile_max);
+        let region_blocks = DECORATED_REGION_CHUNKS * 16;
         let mut blocks = Vec::new();
-        for chunk_x in tile_min.0..=tile_max.0 {
-            for chunk_z in tile_min.1..=tile_max.1 {
-                let Some(holder) = holders.get(&(chunk_x, chunk_z)) else {
-                    unreachable!("tile chunk holder was just created");
+        for region_x in origin_x.div_euclid(region_blocks)..=max_x.div_euclid(region_blocks) {
+            for region_z in origin_z.div_euclid(region_blocks)..=max_z.div_euclid(region_blocks) {
+                let region = self.decorated_region((region_x, region_z));
+                let changed = match filter {
+                    GeneratedBlockFilter::All => &region.all,
+                    GeneratedBlockFilter::AtOrAboveSurface => &region.surface,
                 };
-                let Some(decorated) = holder.try_chunk(ChunkStatus::Terrain) else {
-                    unreachable!("tile chunk holder was published at Terrain");
-                };
-                let Some(entry) = self.terrain.get(&(chunk_x, chunk_z)) else {
-                    unreachable!("tile terrain entry was just ensured");
-                };
-                let Some(carved) = entry.carved.as_deref() else {
-                    unreachable!("tile terrain entry was just carved");
-                };
-                self.append_changed_blocks(
-                    &mut blocks,
-                    carved,
-                    decorated,
-                    &entry.surface,
-                    (origin_x, origin_z, max_x, max_z),
-                    filter,
-                );
+                blocks.extend(changed.iter().copied().filter(|block| {
+                    (origin_x..=max_x).contains(&block.x) && (origin_z..=max_z).contains(&block.z)
+                }));
+                // Large requests must not retain every region's Terrain inputs.
+                self.trim_caches();
             }
         }
         blocks.sort_unstable_by_key(|block| (block.x, block.y, block.z));
         blocks
+    }
+
+    fn decorated_region(&mut self, key: (i32, i32)) -> Arc<DecoratedRegion> {
+        let now = self.tick();
+        if let Some(entry) = self.decorated.get_mut(&key) {
+            entry.last_used = now;
+            return Arc::clone(&entry.region);
+        }
+        let tile_min = (
+            key.0 * DECORATED_REGION_CHUNKS,
+            key.1 * DECORATED_REGION_CHUNKS,
+        );
+        let tile_max = (
+            tile_min.0 + DECORATED_REGION_CHUNKS - 1,
+            tile_min.1 + DECORATED_REGION_CHUNKS - 1,
+        );
+        let holders = self.decorate(tile_min, tile_max);
+        let mut region = DecoratedRegion {
+            all: Vec::new(),
+            surface: Vec::new(),
+        };
+        for chunk_x in tile_min.0..=tile_max.0 {
+            for chunk_z in tile_min.1..=tile_max.1 {
+                let Some(decorated) = holders
+                    .get(&(chunk_x, chunk_z))
+                    .and_then(|holder| holder.try_chunk(ChunkStatus::Terrain))
+                else {
+                    unreachable!("region chunk holder was just created");
+                };
+                let Some(entry) = self.terrain.get(&(chunk_x, chunk_z)) else {
+                    unreachable!("region terrain entry was just ensured");
+                };
+                let Some(carved) = entry.carved.as_deref() else {
+                    unreachable!("region terrain entry was just carved");
+                };
+                let first = region.all.len();
+                self.append_changed_blocks(
+                    &mut region.all,
+                    carved,
+                    decorated,
+                    &entry.surface,
+                    (
+                        tile_min.0 * 16,
+                        tile_min.1 * 16,
+                        tile_max.0 * 16 + 15,
+                        tile_max.1 * 16 + 15,
+                    ),
+                    GeneratedBlockFilter::All,
+                );
+                region
+                    .surface
+                    .extend(region.all[first..].iter().copied().filter(|block| {
+                        let column = entry.surface[column_index(block.x, block.z)];
+                        !column.exists || block.y >= i32::from(column.height)
+                    }));
+            }
+        }
+        let region = Arc::new(region);
+        let bytes = region.bytes();
+        let budget = self
+            .terrain_capacity
+            .saturating_mul(DECORATED_BYTES_PER_TERRAIN_ENTRY);
+        // Oversized regions remain usable for this request without entering the cache.
+        if bytes <= budget {
+            let capacity =
+                (self.terrain_capacity / (DECORATED_REGION_CHUNKS as usize).pow(2)).max(1);
+            while self.decorated_bytes > budget - bytes || self.decorated.len() >= capacity {
+                let Some(oldest) = self
+                    .decorated
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(key, _)| *key)
+                else {
+                    break;
+                };
+                if let Some(entry) = self.decorated.remove(&oldest) {
+                    self.decorated_bytes -= entry.region.bytes();
+                }
+            }
+            self.decorated_bytes += bytes;
+            self.decorated.insert(
+                key,
+                DecoratedEntry {
+                    region: Arc::clone(&region),
+                    last_used: now,
+                },
+            );
+        }
+        region
     }
 
     /// Decorates every chunk within `source_radius` of `center`, in X-then-Z
