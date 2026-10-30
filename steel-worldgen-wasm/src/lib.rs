@@ -181,6 +181,23 @@ impl SteelWorldgen {
             .map_err(|error| JsValue::from_str(&error))
     }
 
+    /// Returns base-noise occupancy with an exclusive maximum Y.
+    ///
+    /// # Errors
+    /// Returns an error for invalid bounds, coordinates, LOD or serialization.
+    pub fn noise_volume_chunk(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+        min_y: i32,
+        max_y: i32,
+        lod: u32,
+    ) -> Result<String, JsValue> {
+        self.inner
+            .noise_volume_json(chunk_x, chunk_z, min_y, max_y, lod)
+            .map_err(|error| JsValue::from_str(&error))
+    }
+
     /// Generator release.
     #[wasm_bindgen(getter)]
     #[must_use]
@@ -221,6 +238,43 @@ impl Generator {
             seed: seed.to_owned(),
             dimension: name,
         })
+    }
+
+    /// Serializes the standalone base-noise grid using the viewer contract.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid request or serialization failure.
+    pub fn noise_volume_json(
+        &self,
+        chunk_x: i32,
+        chunk_z: i32,
+        min_y: i32,
+        max_y: i32,
+        lod: u32,
+    ) -> Result<String, String> {
+        let volume = self
+            .worldgen
+            .noise_volume_chunk(chunk_x, chunk_z, min_y, max_y, lod)?;
+        serde_json::to_string(&VolumeResponse {
+            generator: GENERATOR,
+            version: RELEASE,
+            seed: &self.seed,
+            dimension: self.dimension,
+            chunk_x,
+            chunk_z,
+            min_y: volume.min_y,
+            cells_xz: volume.cells_xz,
+            cells_y: volume.cells_y,
+            lod,
+            material_keys: [
+                "minecraft:air",
+                "steel:noise_default_solid",
+                "minecraft:water",
+                "minecraft:lava",
+            ],
+            voxels: volume.voxels,
+        })
+        .map_err(|error| error.to_string())
     }
 
     /// Returns the underlying generator.
@@ -536,4 +590,22 @@ struct StructureBounds {
     max_x: i32,
     max_y: i32,
     max_z: i32,
+}
+
+/// Existing browser volume transport, with X varying fastest.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VolumeResponse<'a> {
+    generator: &'static str,
+    version: &'static str,
+    seed: &'a str,
+    dimension: &'static str,
+    chunk_x: i32,
+    chunk_z: i32,
+    min_y: i32,
+    cells_xz: u32,
+    cells_y: u32,
+    lod: u32,
+    material_keys: [&'static str; 4],
+    voxels: Vec<u8>,
 }
