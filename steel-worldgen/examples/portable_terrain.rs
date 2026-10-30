@@ -1,5 +1,8 @@
 //! Fixed anchor chunks for a cursory source-port comparison, not a benchmark.
 
+#[path = "support/ground_cover.rs"]
+mod ground_cover;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -73,6 +76,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         snapshot(output, seed, x, z, "material", &chunk)?;
         sampler.build_carvers(&mut chunk)?;
         snapshot(output, seed, x, z, "carvers", &chunk)?;
+        if std::env::args().nth(2).as_deref() == Some("ground-cover") {
+            use steel_utils::BlockPos;
+            use steel_utils::random::{Random as _, worldgen_random::WorldgenRandom};
+            let origin = BlockPos::new(x * 16 + 8, chunk.heights()[8 * 16 + 8] + 3, z * 16 + 8);
+            let mut random = WorldgenRandom::from_seed(seed);
+            ground_cover::projected(
+                &mut ground_cover::ChunkAccess(&mut chunk),
+                &mut random,
+                origin,
+            );
+            snapshot(output, seed, x, z, "projected", &chunk)?;
+            ground_cover::spread(
+                &mut ground_cover::ChunkAccess(&mut chunk),
+                &mut random,
+                origin,
+            );
+            snapshot(output, seed, x, z, "spread", &chunk)?;
+            fs::write(
+                output.join(format!("{seed}-{x}-{z}-rng.json")),
+                serde_json::to_vec(&json!({
+                    "nextInt": random.next_i32(), "origin": [origin.x(), origin.y(), origin.z()],
+                }))?,
+            )?;
+        }
     }
     Ok(())
 }

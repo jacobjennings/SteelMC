@@ -59,7 +59,7 @@ No test suite is run by the build or comparison entry points.
 
 ## Remaining implementation
 
-Continue with [the dependent implementation task](https://beads.thejenningshome.com/#/board/ca-7krkd).
+Continue with [the dependent implementation task](https://beads.thejenningshome.com/#/board/ca-w2zye).
 Port the selected vegetation paths from 26.3 source,
 connect the browser surface/tile ABI, build actual Wasm, and qualify the camera
 terrain. Publish that module before updating the viewer artifact, runtime,
@@ -111,3 +111,43 @@ they retain 0 and 274 marks. Native and Rust positions agree at all three stages
 This qualifies retained positions at these anchors only. It does not execute
 fluid ticks or prove update order, Features, complete camera footprints or
 rendered acceptance. Viewer module promotion remains unavailable.
+
+## Portable ground-cover kernels
+
+`portable_feature` implements the Java 26.3 `ProjectedRandomPatchySquare` and
+`RandomNeighborSpreadFeature` loops independently of server region storage.
+The server calls these same kernels through `GroundCoverRegion`. That binding
+retains its existing predicate, state-provider, holder-set and block-write
+implementations. `GroundCoverAccess` requires each of these operations from
+its host. It supplies no missing-world or missing-provider fallback.
+
+Projection preserves X/Z traversal, the per-cell probability draw, projection
+through the block below and optional provider sampling. Native bytecode confirms
+that projection decrements its budget after moving. A zero budget can therefore
+move down once. Neighbor spread writes its origin before sampling attempts,
+consumes X/Y/Z offset draws in order and accepts exactly one of six neighbors.
+Later attempts see earlier writes. Both algorithms preserve the native true
+return value independently of individual write acceptance.
+
+The snapshot example accepts an optional `ground-cover` argument. After the
+ordinary Noise/Material/Carvers snapshots, it makes two isolated feature calls
+on each retained chunk, then records the next RNG integer. Its explicit
+comparison configurations use a size-two short-grass projection with maximum
+height three, then 64 oak-leaf neighbor-spread attempts with horizontal offsets
+-2..2 and vertical offsets -1..1. The Java collector invokes the actual pinned
+native feature classes with those same configurations. These configurations
+are comparison inputs only. They are not extracted biome feature definitions
+and never run in the portable generator's stage pipeline.
+
+At seed 3860052, projection changes 18 states and spread changes 13. At seed
+12345, they change 17 and 10. All five stages agree in block identifiers,
+sorted properties, heights and retained fluid-position multisets at both
+chunks. The next RNG integers agree at 749985977 and 1920669674. This comparison
+covers simple providers, air predicates and direct neighbor sets. It does not
+cover optional provider refusal, weighted providers, write refusal, natural
+biome decoration, cross-chunk feature ordering or selected native plants.
+
+The complete decoration region, selected vegetation, structure density,
+structure/feature interactions, browser ABI, dependency Wasm portability,
+artifact publication and full camera qualification remain on the linked
+continuation. The current source increment does not admit a viewer release.

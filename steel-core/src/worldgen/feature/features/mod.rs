@@ -22,6 +22,7 @@ mod fossil;
 mod freeze_top_layer;
 mod geode;
 mod glowstone_blob;
+mod ground_cover;
 mod huge_fungus;
 mod huge_mushroom;
 mod iceberg;

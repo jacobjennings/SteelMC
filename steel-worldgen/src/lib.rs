@@ -14,6 +14,8 @@ pub mod density;
 pub mod noise;
 /// Portable Java 26.3 cave and canyon stage.
 pub mod portable_carver;
+/// Server-independent Java 26.3 ground-cover feature kernels.
+pub mod portable_feature;
 /// In-memory Java 26.3 Noise and Material stages.
 pub mod portable_terrain;
 /// `state_resolver`
