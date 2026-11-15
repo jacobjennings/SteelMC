@@ -10,8 +10,8 @@ use generation::{GenerationCapabilities, OperationCapability};
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 use steel_core::worldgen::standalone::{
-    DEFAULT_TERRAIN_CACHE_CAPACITY, GeneratedBlockFilter, StandaloneDimension, StandaloneTile,
-    StandaloneWorldgen, StructureMarker, TileDetail,
+    DEFAULT_TERRAIN_CACHE_CAPACITY, GeneratedBlockFilter, StandaloneDimension, StandaloneStats,
+    StandaloneTile, StandaloneWorldgen, StructureMarker, TileDetail,
 };
 use steel_registry::REGISTRY;
 use steel_registry::blocks::block_state_ext::BlockStateExt;
@@ -258,6 +258,46 @@ impl SteelWorldgen {
             .map_err(|error| JsValue::from_str(&error))
     }
 
+    /// Generates a binary tile payload without JSON serialization.
+    ///
+    /// `detail` is `"biome"`, `"coarse"` or `"full"`.
+    pub fn terrain_tile_binary(
+        &mut self,
+        x: i32,
+        z: i32,
+        size: u32,
+        resolution: u32,
+        detail: &str,
+    ) -> Result<Vec<u8>, JsValue> {
+        let tile_detail = parse_tile_detail(detail).map_err(|error| JsValue::from_str(&error))?;
+        self.inner
+            .terrain_binary(x, z, size, resolution, tile_detail)
+            .map_err(|error| JsValue::from_str(&error))
+    }
+
+    /// Returns retained-work and cache-hit counters as ten 64-bit integer counts.
+    #[must_use]
+    pub fn cache_stats(&self) -> Vec<f64> {
+        let stats = self.inner.stats();
+        vec![
+            stats.starts_generated as f64,
+            stats.starts_hits as f64,
+            stats.biomes_generated as f64,
+            stats.biomes_hits as f64,
+            stats.terrain_generated as f64,
+            stats.terrain_hits as f64,
+            stats.terrain_carve_upgrades as f64,
+            stats.decorated_generated as f64,
+            stats.decorated_hits as f64,
+            stats.feature_regions as f64,
+        ]
+    }
+
+    /// Resets retained-work and cache-hit counters without clearing chunk caches.
+    pub fn reset_cache_stats(&mut self) {
+        self.inner.reset_stats();
+    }
+
     /// Generator release.
     #[wasm_bindgen(getter)]
     #[must_use]
@@ -419,6 +459,38 @@ impl Generator {
     /// Returns the underlying generator.
     pub const fn worldgen(&mut self) -> &mut StandaloneWorldgen {
         &mut self.worldgen
+    }
+
+    /// Returns retained-work and cache-hit counters.
+    #[must_use]
+    pub const fn stats(&self) -> StandaloneStats {
+        self.worldgen.stats()
+    }
+
+    /// Resets retained-work and cache-hit counters without clearing chunk caches.
+    pub const fn reset_stats(&mut self) {
+        self.worldgen.reset_stats();
+    }
+
+    /// Generates one tile as a flat little-endian binary buffer (`CATB` v1).
+    pub fn terrain_binary(
+        &mut self,
+        x: i32,
+        z: i32,
+        size: u32,
+        resolution: u32,
+        detail: TileDetail,
+    ) -> Result<Vec<u8>, String> {
+        validate_terrain_grid(size, resolution)?;
+        let tile = self.worldgen.tile(
+            x,
+            z,
+            size,
+            resolution,
+            detail,
+            GeneratedBlockFilter::AtOrAboveSurface,
+        );
+        encode_terrain_binary(tile, detail)
     }
 
     /// Generates one tile as viewer JSON.
@@ -777,4 +849,195 @@ struct DecoratedVolumeResponse<'a> {
     material_keys: Vec<String>,
     state_keys: Vec<String>,
     voxels: Vec<u16>,
+}
+
+/// Magic word for binary terrain tile payloads (`"CATB"` in little-endian).
+pub const BINARY_TILE_MAGIC: u32 = 0x4254_4143;
+/// Binary terrain tile format version.
+pub const BINARY_TILE_VERSION: u32 = 1;
+
+/// Parses a fidelity name into a [`TileDetail`].
+pub fn parse_tile_detail(detail: &str) -> Result<TileDetail, String> {
+    match detail {
+        "biome" => Ok(TileDetail::Biome),
+        "coarse" => Ok(TileDetail::Coarse),
+        "full" => Ok(TileDetail::Full),
+        _ => Err("unknown tile detail".to_owned()),
+    }
+}
+
+fn push_u16_le(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u32_le(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_i32_le(out: &mut Vec<u8>, value: i32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_len_str(out: &mut Vec<u8>, text: &str) -> Result<(), String> {
+    let len = u16::try_from(text.len()).map_err(|_| "palette string exceeds u16".to_owned())?;
+    push_u16_le(out, len);
+    out.extend_from_slice(text.as_bytes());
+    Ok(())
+}
+
+fn encode_terrain_binary(tile: StandaloneTile, detail: TileDetail) -> Result<Vec<u8>, String> {
+    let sample_count = tile.heights.len();
+    let mut terrain_heights = tile
+        .heights
+        .iter()
+        .zip(&tile.present)
+        .filter_map(|(height, present)| present.then_some(*height));
+    let first = terrain_heights.next().unwrap_or(tile.min_y);
+    let (min_height, max_height) = terrain_heights
+        .fold((first, first), |(minimum, maximum), height| {
+            (minimum.min(height), maximum.max(height))
+        });
+
+    let mut biome_ptr_lookup: FxHashMap<usize, u16> = FxHashMap::default();
+    let mut biome_names: Vec<String> = Vec::new();
+    let mut colors = Vec::with_capacity(sample_count * 3);
+    let mut biome_indices: Vec<u16> = Vec::with_capacity(sample_count);
+    for biome in &tile.biomes {
+        let ptr_key = (*biome as *const _) as usize;
+        let idx = if let Some(existing) = biome_ptr_lookup.get(&ptr_key) {
+            *existing
+        } else {
+            let created = u16::try_from(biome_names.len())
+                .map_err(|_| "biome palette exceeds u16".to_owned())?;
+            biome_names.push(biome.key.to_string());
+            biome_ptr_lookup.insert(ptr_key, created);
+            created
+        };
+        biome_indices.push(idx);
+        let color = biome.effects.grass_color.unwrap_or(DEFAULT_GRASS_COLOR) as u32;
+        colors.extend_from_slice(&[(color >> 16) as u8, (color >> 8) as u8, color as u8]);
+    }
+
+    let has_surface_blocks = !tile.surface_states.is_empty();
+    let mut surface_state_lookup: FxHashMap<BlockStateId, u16> = FxHashMap::default();
+    let mut surface_blocks = Palette::default();
+    let mut surface_block_indices: Vec<u16> =
+        Vec::with_capacity(if has_surface_blocks { sample_count } else { 0 });
+    for state in &tile.surface_states {
+        let idx = if let Some(existing) = surface_state_lookup.get(state) {
+            *existing
+        } else {
+            let created = surface_blocks.index(canonical_block_key(*state));
+            surface_state_lookup.insert(*state, created);
+            created
+        };
+        surface_block_indices.push(idx);
+    }
+
+    // Deduplicate identical (x, y, z) keeping the last state, matching viewer normalization.
+    let mut deduped_blocks = tile.generated_blocks;
+    if deduped_blocks.len() > 1 {
+        let mut write = 0_usize;
+        for read in 0..deduped_blocks.len() {
+            let current = deduped_blocks[read];
+            if write > 0 {
+                let prev = deduped_blocks[write - 1];
+                if prev.x == current.x && prev.y == current.y && prev.z == current.z {
+                    deduped_blocks[write - 1] = current;
+                    continue;
+                }
+            }
+            deduped_blocks[write] = current;
+            write += 1;
+        }
+        deduped_blocks.truncate(write);
+    }
+
+    let mut state_lookup: FxHashMap<BlockStateId, u16> = FxHashMap::default();
+    let mut generated_palette: Vec<(String, String)> = Vec::new();
+    let mut generated_indices: Vec<u16> = Vec::with_capacity(deduped_blocks.len());
+    for block in &deduped_blocks {
+        let idx = if let Some(existing) = state_lookup.get(&block.state) {
+            *existing
+        } else {
+            let created = u16::try_from(generated_palette.len())
+                .map_err(|_| "generated block palette exceeds u16".to_owned())?;
+            generated_palette.push((
+                canonical_block_key(block.state),
+                canonical_block_state_key(block.state),
+            ));
+            state_lookup.insert(block.state, created);
+            created
+        };
+        generated_indices.push(idx);
+    }
+
+    let stage_bits: u32 = match detail {
+        TileDetail::Biome => 0,
+        TileDetail::Coarse => 1,
+        TileDetail::Full => 2,
+    };
+    let flags: u32 = u32::from(has_surface_blocks)
+        | (u32::from(tile.heights_estimated) << 1)
+        | (stage_bits << 8);
+
+    let biomes_count =
+        u32::try_from(biome_names.len()).map_err(|_| "biome count exceeds u32".to_owned())?;
+    let surface_blocks_count = u32::try_from(surface_blocks.entries.len())
+        .map_err(|_| "surface block count exceeds u32".to_owned())?;
+    let generated_palette_count = u32::try_from(generated_palette.len())
+        .map_err(|_| "generated palette count exceeds u32".to_owned())?;
+    let generated_blocks_count = u32::try_from(deduped_blocks.len())
+        .map_err(|_| "generated block count exceeds u32".to_owned())?;
+
+    let approx_bytes = 44
+        + sample_count * 10
+        + surface_block_indices.len() * 2
+        + deduped_blocks.len() * 14
+        + 512;
+    let mut out = Vec::with_capacity(approx_bytes);
+    push_u32_le(&mut out, BINARY_TILE_MAGIC);
+    push_u32_le(&mut out, BINARY_TILE_VERSION);
+    push_u32_le(&mut out, flags);
+    push_u32_le(&mut out, tile.samples_per_side);
+    push_i32_le(&mut out, i32::from(min_height));
+    push_i32_le(&mut out, i32::from(max_height));
+    push_i32_le(&mut out, i32::from(tile.min_y));
+    push_u32_le(&mut out, biomes_count);
+    push_u32_le(&mut out, surface_blocks_count);
+    push_u32_le(&mut out, generated_palette_count);
+    push_u32_le(&mut out, generated_blocks_count);
+
+    for height in &tile.heights {
+        out.extend_from_slice(&f32::from(*height).to_le_bytes());
+    }
+    for block in &deduped_blocks {
+        push_i32_le(&mut out, block.x);
+        push_i32_le(&mut out, block.y);
+        push_i32_le(&mut out, block.z);
+    }
+    for idx in &biome_indices {
+        push_u16_le(&mut out, *idx);
+    }
+    for idx in &surface_block_indices {
+        push_u16_le(&mut out, *idx);
+    }
+    for idx in &generated_indices {
+        push_u16_le(&mut out, *idx);
+    }
+    out.extend_from_slice(&colors);
+    for present in &tile.present {
+        out.push(u8::from(*present));
+    }
+    for name in &biome_names {
+        push_len_str(&mut out, name)?;
+    }
+    for name in &surface_blocks.entries {
+        push_len_str(&mut out, name)?;
+    }
+    for (block_name, state_name) in &generated_palette {
+        push_len_str(&mut out, block_name)?;
+        push_len_str(&mut out, state_name)?;
+    }
+    Ok(out)
 }

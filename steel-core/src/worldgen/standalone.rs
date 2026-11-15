@@ -237,15 +237,27 @@ pub struct DecoratedVolume {
     pub states: Vec<BlockStateId>,
 }
 
-/// Retained-work counters.
+/// Retained-work and cache-hit counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StandaloneStats {
     /// Chunks whose structure starts were generated.
     pub starts_generated: u64,
+    /// Chunks whose structure starts were served from cache.
+    pub starts_hits: u64,
     /// Chunks whose biomes were generated.
     pub biomes_generated: u64,
+    /// Chunks whose biomes were served from cache.
+    pub biomes_hits: u64,
     /// Chunks whose noise and surface were generated.
     pub terrain_generated: u64,
+    /// Chunks whose noise and surface were served from cache.
+    pub terrain_hits: u64,
+    /// Cached Coarse terrain entries upgraded with carvers for Full.
+    pub terrain_carve_upgrades: u64,
+    /// Output chunks decorated from scratch.
+    pub decorated_generated: u64,
+    /// Output chunks served from the decorated-chunk cache.
+    pub decorated_hits: u64,
     /// Feature regions decorated.
     pub feature_regions: u64,
 }
@@ -417,6 +429,22 @@ impl StandaloneWorldgen {
     #[must_use]
     pub const fn stats(&self) -> StandaloneStats {
         self.stats
+    }
+
+    /// Resets retained-work and cache-hit counters without clearing caches.
+    pub const fn reset_stats(&mut self) {
+        self.stats = StandaloneStats {
+            starts_generated: 0,
+            starts_hits: 0,
+            biomes_generated: 0,
+            biomes_hits: 0,
+            terrain_generated: 0,
+            terrain_hits: 0,
+            terrain_carve_upgrades: 0,
+            decorated_generated: 0,
+            decorated_hits: 0,
+            feature_regions: 0,
+        };
     }
 
     /// Samples Java 26.3 noise before surface, carvers or decoration.
@@ -787,8 +815,10 @@ impl StandaloneWorldgen {
         let now = self.tick();
         if let Some(entry) = self.decorated.get_mut(&key) {
             entry.last_used = now;
+            self.stats.decorated_hits += 1;
             return Arc::clone(&entry.chunk);
         }
+        self.stats.decorated_generated += 1;
         // Preserve the accepted fixed output-chunk replay exactly. A miss
         // always starts with fresh Terrain and the same nine sources.
         let holders = self.decorate(key, key);
@@ -1087,6 +1117,7 @@ impl StandaloneWorldgen {
         let now = self.tick();
         if let Some(entry) = self.starts.get_mut(&key) {
             entry.last_used = now;
+            self.stats.starts_hits += 1;
             return;
         }
         let chunk = self.empty_chunk(ChunkPos::new(key.0, key.1));
@@ -1111,6 +1142,7 @@ impl StandaloneWorldgen {
         let now = self.tick();
         if let Some(entry) = self.starts.get_mut(&key) {
             entry.last_used = now;
+            self.stats.starts_hits += 1;
             return entry.starts.clone();
         }
         let chunk = self.empty_chunk(ChunkPos::new(key.0, key.1));
@@ -1137,6 +1169,7 @@ impl StandaloneWorldgen {
             .get(&key)
             .is_some_and(|entry| entry.biomes.is_some())
         {
+            self.stats.biomes_hits += 1;
             return;
         }
         let chunk = self.empty_chunk(ChunkPos::new(key.0, key.1));
@@ -1159,8 +1192,10 @@ impl StandaloneWorldgen {
         if let Some(entry) = self.terrain.get_mut(&key) {
             entry.last_used = now;
             if !carve || entry.carved.is_some() {
+                self.stats.terrain_hits += 1;
                 return;
             }
+            self.stats.terrain_carve_upgrades += 1;
         }
         for dx in -STRUCTURE_RADIUS..=STRUCTURE_RADIUS {
             for dz in -STRUCTURE_RADIUS..=STRUCTURE_RADIUS {
