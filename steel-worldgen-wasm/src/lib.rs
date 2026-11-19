@@ -129,6 +129,24 @@ impl SteelWorldgen {
         self.inner.coarse_surface_source().to_owned()
     }
 
+    /// Selects the side, in chunks, of the floor-aligned square that shares
+    /// one Features replay. One keeps the nine-source replay per output chunk.
+    ///
+    /// # Errors
+    /// Rejects sides other than 1, 2, 4 and 8.
+    pub fn set_decoration_batch_chunks(&mut self, side: u32) -> Result<(), JsValue> {
+        self.inner
+            .set_decoration_batch_chunks(side)
+            .map_err(|error| JsValue::from_str(&error))
+    }
+
+    /// Side, in chunks, of the square sharing one Features replay.
+    #[wasm_bindgen(getter)]
+    #[must_use]
+    pub fn decoration_batch_chunks(&self) -> u32 {
+        self.inner.decoration_batch_chunks()
+    }
+
     /// Generates a Full tile: surface plus every block Features and
     /// structures change at or above it.
     ///
@@ -454,6 +472,22 @@ impl Generator {
         } else {
             "generated"
         }
+    }
+
+    /// Selects the side, in chunks, of the square sharing one Features replay.
+    ///
+    /// # Errors
+    /// Rejects sides other than 1, 2, 4 and 8.
+    pub fn set_decoration_batch_chunks(&mut self, side: u32) -> Result<(), String> {
+        self.worldgen
+            .set_decoration_batch_chunks(side)
+            .map_err(str::to_owned)
+    }
+
+    /// Side, in chunks, of the square sharing one Features replay.
+    #[must_use]
+    pub const fn decoration_batch_chunks(&self) -> u32 {
+        self.worldgen.decoration_batch_chunks()
     }
 
     /// Returns the underlying generator.

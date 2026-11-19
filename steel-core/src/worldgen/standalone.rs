@@ -260,6 +260,49 @@ pub struct StandaloneStats {
     pub decorated_hits: u64,
     /// Feature regions decorated.
     pub feature_regions: u64,
+    /// Native wall time generating structure starts, in nanoseconds. Zero in browsers.
+    pub starts_nanos: u64,
+    /// Native wall time generating biomes, in nanoseconds. Zero in browsers.
+    pub biomes_nanos: u64,
+    /// Native wall time in noise, surface and carvers, in nanoseconds. Zero in browsers.
+    pub terrain_nanos: u64,
+    /// Native wall time preparing decoration holders, in nanoseconds. Zero in browsers.
+    pub holders_nanos: u64,
+    /// Native wall time applying biome decorations, in nanoseconds. Zero in browsers.
+    pub features_nanos: u64,
+    /// Native wall time extracting changed blocks, in nanoseconds. Zero in browsers.
+    pub changes_nanos: u64,
+}
+
+/// Stage clock for native measurements. Browser builds have no clock.
+#[derive(Clone, Copy)]
+struct StageClock {
+    #[cfg(not(target_family = "wasm"))]
+    started: std::time::Instant,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl StageClock {
+    fn start() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+        }
+    }
+
+    fn nanos(self) -> u64 {
+        u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+}
+
+#[cfg(target_family = "wasm")]
+impl StageClock {
+    const fn start() -> Self {
+        Self {}
+    }
+
+    const fn nanos(self) -> u64 {
+        0
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -336,6 +379,7 @@ pub struct StandaloneWorldgen {
     decorated_bytes: usize,
     stats: StandaloneStats,
     bounded_coarse_surface: bool,
+    decoration_batch: i32,
 }
 
 impl StandaloneWorldgen {
@@ -416,7 +460,40 @@ impl StandaloneWorldgen {
             decorated_bytes: 0,
             stats: StandaloneStats::default(),
             bounded_coarse_surface: false,
+            decoration_batch: 1,
         }
+    }
+
+    /// Selects how many output chunks share one Features replay.
+    ///
+    /// A side of one keeps the fixed nine-source replay per output chunk. A
+    /// larger side decorates each floor-aligned square of that many chunks
+    /// once, with every source that can write into it, and retains all of its
+    /// output chunks. Chunk coordinates alone fix the square, so output still
+    /// depends only on the seed and the output chunk, never on request bounds,
+    /// cache capacity or history. It is a different scheduling policy. A
+    /// feature that crosses output chunks can survive differently than under
+    /// the nine-source replay.
+    ///
+    /// # Errors
+    /// Rejects sides other than 1, 2, 4 and 8.
+    pub fn set_decoration_batch_chunks(&mut self, side: u32) -> Result<(), &'static str> {
+        if !matches!(side, 1 | 2 | 4 | 8) {
+            return Err("decoration batch side must be 1, 2, 4 or 8 chunks");
+        }
+        if side as i32 != self.decoration_batch {
+            self.decoration_batch = side as i32;
+            // Retained entries belong to the previous replay policy.
+            self.decorated.clear();
+            self.decorated_bytes = 0;
+        }
+        Ok(())
+    }
+
+    /// Side, in chunks, of the square sharing one Features replay.
+    #[must_use]
+    pub const fn decoration_batch_chunks(&self) -> u32 {
+        self.decoration_batch as u32
     }
 
     /// Returns the dimension.
@@ -444,6 +521,12 @@ impl StandaloneWorldgen {
             decorated_generated: 0,
             decorated_hits: 0,
             feature_regions: 0,
+            starts_nanos: 0,
+            biomes_nanos: 0,
+            terrain_nanos: 0,
+            holders_nanos: 0,
+            features_nanos: 0,
+            changes_nanos: 0,
         };
     }
 
@@ -818,10 +901,39 @@ impl StandaloneWorldgen {
             self.stats.decorated_hits += 1;
             return Arc::clone(&entry.chunk);
         }
-        self.stats.decorated_generated += 1;
-        // Preserve the accepted fixed output-chunk replay exactly. A miss
-        // always starts with fresh Terrain and the same nine sources.
-        let holders = self.decorate(key, key);
+        // A side of one preserves the accepted fixed output-chunk replay
+        // exactly. A miss always starts with fresh Terrain and the same nine
+        // sources. A larger side replays its whole floor-aligned square once.
+        let side = self.decoration_batch;
+        let batch_min = (key.0.div_euclid(side) * side, key.1.div_euclid(side) * side);
+        let batch_max = (batch_min.0 + side - 1, batch_min.1 + side - 1);
+        let holders = self.decorate(batch_min, batch_max);
+        let clock = StageClock::start();
+        let mut requested = None;
+        for chunk_x in batch_min.0..=batch_max.0 {
+            for chunk_z in batch_min.1..=batch_max.1 {
+                let output = (chunk_x, chunk_z);
+                self.stats.decorated_generated += 1;
+                let region = Arc::new(self.changed_chunk(&holders, output));
+                if output == key {
+                    requested = Some(Arc::clone(&region));
+                }
+                self.retain_decorated(output, region, now);
+            }
+        }
+        self.stats.changes_nanos += clock.nanos();
+        let Some(region) = requested else {
+            unreachable!("requested output chunk lies inside its own batch");
+        };
+        region
+    }
+
+    /// Blocks one decorated output chunk changed against its carved Terrain.
+    fn changed_chunk(
+        &self,
+        holders: &FxHashMap<(i32, i32), Arc<ChunkHolder>>,
+        key: (i32, i32),
+    ) -> DecoratedChunk {
         let Some(decorated) = holders
             .get(&key)
             .and_then(|holder| holder.try_chunk(ChunkStatus::Terrain))
@@ -851,38 +963,44 @@ impl StandaloneWorldgen {
                 !column.exists || block.y >= i32::from(column.height)
             })
             .collect();
-        let region = DecoratedChunk { all, surface };
-        let region = Arc::new(region);
+        DecoratedChunk { all, surface }
+    }
+
+    /// Retains one output chunk within the decorated byte and entry bounds.
+    fn retain_decorated(&mut self, key: (i32, i32), region: Arc<DecoratedChunk>, now: u64) {
+        if let Some(previous) = self.decorated.remove(&key) {
+            self.decorated_bytes -= previous.chunk.bytes();
+        }
         let bytes = region.bytes();
         let budget = self
             .terrain_capacity
             .saturating_mul(DECORATED_BYTES_PER_TERRAIN_ENTRY);
         // Oversized chunks remain usable for this request without entering the cache.
-        if bytes <= budget {
-            let capacity = self.terrain_capacity;
-            while self.decorated_bytes > budget - bytes || self.decorated.len() >= capacity {
-                let Some(oldest) = self
-                    .decorated
-                    .iter()
-                    .min_by_key(|(_, entry)| entry.last_used)
-                    .map(|(key, _)| *key)
-                else {
-                    break;
-                };
-                if let Some(entry) = self.decorated.remove(&oldest) {
-                    self.decorated_bytes -= entry.chunk.bytes();
-                }
-            }
-            self.decorated_bytes += bytes;
-            self.decorated.insert(
-                key,
-                DecoratedEntry {
-                    chunk: Arc::clone(&region),
-                    last_used: now,
-                },
-            );
+        if bytes > budget {
+            return;
         }
-        region
+        let capacity = self.terrain_capacity;
+        while self.decorated_bytes > budget - bytes || self.decorated.len() >= capacity {
+            let Some(oldest) = self
+                .decorated
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            if let Some(entry) = self.decorated.remove(&oldest) {
+                self.decorated_bytes -= entry.chunk.bytes();
+            }
+        }
+        self.decorated_bytes += bytes;
+        self.decorated.insert(
+            key,
+            DecoratedEntry {
+                chunk: region,
+                last_used: now,
+            },
+        );
     }
 
     /// Decorates every chunk within `source_radius` of `center`, in X-then-Z
@@ -963,6 +1081,7 @@ impl StandaloneWorldgen {
             }
         }
 
+        let clock = StageClock::start();
         let mut holders = FxHashMap::with_capacity_and_hasher(
             ((source_max.0 - source_min.0 + 1 + 2 * STRUCTURE_RADIUS)
                 * (source_max.1 - source_min.1 + 1 + 2 * STRUCTURE_RADIUS)) as usize,
@@ -994,7 +1113,9 @@ impl StandaloneWorldgen {
             }
         }
         let holders = Arc::new(holders);
+        self.stats.holders_nanos += clock.nanos();
 
+        let clock = StageClock::start();
         let feature_step = GENERATION_PYRAMID.get_step_to(ChunkStatus::Features);
         let cache_radius = feature_step.direct_dependencies.get_radius() as i32;
         for chunk_x in source_min.0..=source_max.0 {
@@ -1026,6 +1147,7 @@ impl StandaloneWorldgen {
                 self.stats.feature_regions += 1;
             }
         }
+        self.stats.features_nanos += clock.nanos();
 
         holders
     }
@@ -1120,10 +1242,12 @@ impl StandaloneWorldgen {
             self.stats.starts_hits += 1;
             return;
         }
+        let clock = StageClock::start();
         let chunk = self.empty_chunk(ChunkPos::new(key.0, key.1));
         self.generator.create_structures(&chunk);
         let starts = std::mem::take(&mut *chunk.structure_starts_mut());
         self.stats.starts_generated += 1;
+        self.stats.starts_nanos += clock.nanos();
         self.starts.insert(
             key,
             StartsEntry {
@@ -1172,6 +1296,7 @@ impl StandaloneWorldgen {
             self.stats.biomes_hits += 1;
             return;
         }
+        let clock = StageClock::start();
         let chunk = self.empty_chunk(ChunkPos::new(key.0, key.1));
         self.generator.create_biomes(&chunk);
         let biomes = chunk
@@ -1182,6 +1307,7 @@ impl StandaloneWorldgen {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         self.stats.biomes_generated += 1;
+        self.stats.biomes_nanos += clock.nanos();
         if let Some(entry) = self.starts.get_mut(&key) {
             entry.biomes = Some(biomes);
         }
@@ -1207,8 +1333,10 @@ impl StandaloneWorldgen {
                 self.ensure_biomes((key.0 + dx, key.1 + dz));
             }
         }
+        let clock = StageClock::start();
         let (surface, carved) = self.build_terrain(key, carve);
         self.stats.terrain_generated += 1;
+        self.stats.terrain_nanos += clock.nanos();
         self.terrain.insert(
             key,
             TerrainEntry {
