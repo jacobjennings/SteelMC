@@ -43,6 +43,18 @@ use crate::world::{LevelAccessor, LevelReader, ScheduledTickAccess, World};
 use crate::worldgen::feature::instrumentation::OreFeatureStats;
 use crate::worldgen::generator::context::WorldGenContext;
 
+/// Borrowed generation holders for one Features step. The step still validates
+/// both the status and distance before consulting the source.
+pub(crate) trait FeatureHolders {
+    fn holder(&self, x: i32, z: i32) -> &ChunkHolder;
+}
+
+impl FeatureHolders for StaticCache2D<Arc<ChunkHolder>> {
+    fn holder(&self, x: i32, z: i32) -> &ChunkHolder {
+        self.get(x, z)
+    }
+}
+
 /// Chunk-cache backed worldgen view for the current generation step.
 ///
 /// This deliberately differs from vanilla's `WorldGenRegion` in one area: it only exposes
@@ -52,7 +64,7 @@ use crate::worldgen::generator::context::WorldGenContext;
 pub struct WorldGenRegion<'a> {
     context: &'a WorldGenContext,
     step: &'a ChunkStep,
-    cache: &'a StaticCache2D<Arc<ChunkHolder>>,
+    cache: &'a dyn FeatureHolders,
     center: ChunkPos,
     chunk_cache_radius: i32,
     chunks: RefCell<Box<[Option<CachedWorldGenChunk<'a>>]>>,
@@ -213,6 +225,16 @@ impl<'a> WorldGenRegion<'a> {
         center: ChunkPos,
         random: RandomSource,
     ) -> Self {
+        Self::with_holders(context, step, cache, center, random)
+    }
+
+    pub(crate) fn with_holders(
+        context: &'a WorldGenContext,
+        step: &'a ChunkStep,
+        cache: &'a dyn FeatureHolders,
+        center: ChunkPos,
+        random: RandomSource,
+    ) -> Self {
         let chunk_cache_radius =
             i32::try_from(step.direct_dependencies.get_radius()).unwrap_or(i32::MAX);
         let chunk_cache_size = chunk_cache_radius.saturating_mul(2).saturating_add(1);
@@ -344,7 +366,7 @@ impl<'a> WorldGenRegion<'a> {
             return None;
         }
 
-        let holder = self.cache.get(chunk_x, chunk_z);
+        let holder = self.cache.holder(chunk_x, chunk_z);
         let chunk = holder.try_chunk(available_status)?;
         let published_status = holder.published_status()?;
         Some(WorldGenChunkRef {

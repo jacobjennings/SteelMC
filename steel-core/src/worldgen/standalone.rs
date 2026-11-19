@@ -9,7 +9,7 @@ use std::cell::OnceCell;
 use std::sync::{Arc, Weak};
 
 use glam::IVec3;
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use rustc_hash::FxHashMap;
 use steel_registry::biome::BiomeRef;
 use steel_registry::blocks::block_state_ext::BlockStateExt;
 use steel_registry::dimension_type::DimensionTypeRef;
@@ -27,7 +27,6 @@ use steel_worldgen::structure::{StructureReferenceMap, StructureStart, Structure
 
 use crate::bootstrap::init_globals_once;
 use crate::chunk::Chunk;
-use crate::chunk::chunk_generation_task::StaticCache2D;
 use crate::chunk::chunk_holder::ChunkHolder;
 use crate::chunk::chunk_pyramid::GENERATION_PYRAMID;
 use crate::chunk::chunk_ticket_manager::ChunkTicketLevel;
@@ -36,6 +35,7 @@ use crate::chunk::section::{ChunkSection, Sections};
 use crate::chunk::status::ChunkStatus;
 use crate::poi::{PoiReplay, PoiTask, replay_poi_tasks};
 use crate::worldgen::generator::{ChunkGenerator, GenerationChunk, TerrainPhase};
+use crate::worldgen::region::FeatureHolders;
 use crate::worldgen::stages::structures::collect_source_references;
 use crate::worldgen::stages::terrain::beardifier_from_starts;
 use crate::worldgen::{
@@ -380,6 +380,55 @@ pub struct StandaloneWorldgen {
     stats: StandaloneStats,
     bounded_coarse_surface: bool,
     decoration_batch: i32,
+}
+
+/// A fresh private dependency window for this replay. Sources share mutations
+/// within the replay in their original order. No feature write reaches the
+/// retained carved terrain or a different output chunk's replay.
+struct ReplayHolders<'a> {
+    world: &'a StandaloneWorldgen,
+    min: (i32, i32),
+    width: usize,
+    cells: Vec<OnceCell<Arc<ChunkHolder>>>,
+    terrain_min: (i32, i32),
+    terrain_max: (i32, i32),
+}
+
+impl ReplayHolders<'_> {
+    fn owned_holder(&self, x: i32, z: i32) -> &Arc<ChunkHolder> {
+        let col = usize::try_from(x - self.min.0).expect("feature dependency west of window");
+        let row = usize::try_from(z - self.min.1).expect("feature dependency north of window");
+        assert!(col < self.width, "feature dependency east of window");
+        self.cells[row * self.width + col].get_or_init(|| {
+            let pos = ChunkPos::new(x, z);
+            let holder = Arc::new(ChunkHolder::new(
+                pos,
+                ChunkTicketLevel::STRONGEST,
+                None,
+                self.world.min_y,
+                self.world.height,
+            ));
+            if (self.terrain_min.0..=self.terrain_max.0).contains(&x)
+                && (self.terrain_min.1..=self.terrain_max.1).contains(&z)
+            {
+                let chunk = self.world.carved_chunk((x, z));
+                holder.insert_chunk(chunk.clone_generation_state(), ChunkStatus::Terrain);
+            } else {
+                let chunk = self.world.empty_chunk(pos);
+                if let Some(entry) = self.world.starts.get(&(x, z)) {
+                    chunk.structure_starts_mut().clone_from(&entry.starts);
+                }
+                holder.insert_chunk(chunk, ChunkStatus::StructureStarts);
+            }
+            holder
+        })
+    }
+}
+
+impl FeatureHolders for ReplayHolders<'_> {
+    fn holder(&self, x: i32, z: i32) -> &ChunkHolder {
+        self.owned_holder(x, z)
+    }
 }
 
 impl StandaloneWorldgen {
@@ -907,7 +956,7 @@ impl StandaloneWorldgen {
         let side = self.decoration_batch;
         let batch_min = (key.0.div_euclid(side) * side, key.1.div_euclid(side) * side);
         let batch_max = (batch_min.0 + side - 1, batch_min.1 + side - 1);
-        let holders = self.decorate(batch_min, batch_max);
+        let holders = self.decorate(batch_min, batch_max, 0);
         let clock = StageClock::start();
         let mut requested = None;
         for chunk_x in batch_min.0..=batch_max.0 {
@@ -1024,7 +1073,7 @@ impl StandaloneWorldgen {
         let ring = source_radius + 1;
         let pool = Arc::clone(&self.pool);
         let snapshots = pool.install(|| {
-            let holders = self.decorate(tile_min, tile_max);
+            let holders = self.decorate(tile_min, tile_max, FEATURE_WRITE_RADIUS + 1);
             let mut snapshots = Vec::new();
             for chunk_x in center.0 - ring..=center.0 + ring {
                 for chunk_z in center.1 - ring..=center.1 + ring {
@@ -1062,6 +1111,7 @@ impl StandaloneWorldgen {
         &mut self,
         tile_min: (i32, i32),
         tile_max: (i32, i32),
+        output_margin: i32,
     ) -> Arc<FxHashMap<(i32, i32), Arc<ChunkHolder>>> {
         // Features can write one chunk away, and each decorating chunk reads
         // Terrain one chunk further out.
@@ -1082,74 +1132,55 @@ impl StandaloneWorldgen {
         }
 
         let clock = StageClock::start();
-        let mut holders = FxHashMap::with_capacity_and_hasher(
-            ((source_max.0 - source_min.0 + 1 + 2 * STRUCTURE_RADIUS)
-                * (source_max.1 - source_min.1 + 1 + 2 * STRUCTURE_RADIUS)) as usize,
-            FxBuildHasher,
-        );
-        for chunk_x in source_min.0 - STRUCTURE_RADIUS..=source_max.0 + STRUCTURE_RADIUS {
-            for chunk_z in source_min.1 - STRUCTURE_RADIUS..=source_max.1 + STRUCTURE_RADIUS {
-                let pos = ChunkPos::new(chunk_x, chunk_z);
-                let holder = Arc::new(ChunkHolder::new(
-                    pos,
-                    ChunkTicketLevel::STRONGEST,
-                    None,
-                    self.min_y,
-                    self.height,
-                ));
-                let in_terrain = (terrain_min.0..=terrain_max.0).contains(&chunk_x)
-                    && (terrain_min.1..=terrain_max.1).contains(&chunk_z);
-                if in_terrain {
-                    let carved = self.carved_chunk((chunk_x, chunk_z));
-                    holder.insert_chunk(carved.clone_generation_state(), ChunkStatus::Terrain);
-                } else {
-                    let chunk = self.empty_chunk(pos);
-                    if let Some(entry) = self.starts.get(&(chunk_x, chunk_z)) {
-                        chunk.structure_starts_mut().clone_from(&entry.starts);
-                    }
-                    holder.insert_chunk(chunk, ChunkStatus::StructureStarts);
-                }
-                holders.insert((chunk_x, chunk_z), holder);
-            }
-        }
-        let holders = Arc::new(holders);
-        self.stats.holders_nanos += clock.nanos();
-
+        let width = (source_max.0 - source_min.0 + 1 + 2 * STRUCTURE_RADIUS) as usize;
+        let height = (source_max.1 - source_min.1 + 1 + 2 * STRUCTURE_RADIUS) as usize;
+        let holders = ReplayHolders {
+            world: self,
+            min: (
+                source_min.0 - STRUCTURE_RADIUS,
+                source_min.1 - STRUCTURE_RADIUS,
+            ),
+            width,
+            cells: (0..width * height).map(|_| OnceCell::new()).collect(),
+            terrain_min,
+            terrain_max,
+        };
+        let holder_setup = clock.nanos();
         let clock = StageClock::start();
         let feature_step = GENERATION_PYRAMID.get_step_to(ChunkStatus::Features);
-        let cache_radius = feature_step.direct_dependencies.get_radius() as i32;
+        let mut replays = 0;
         for chunk_x in source_min.0..=source_max.0 {
             for chunk_z in source_min.1..=source_max.1 {
-                let Some(center_holder) = holders.get(&(chunk_x, chunk_z)) else {
-                    unreachable!("feature source holder was just created");
-                };
+                let center_holder = holders.holder(chunk_x, chunk_z);
                 let Some(center_chunk) = center_holder.try_chunk(ChunkStatus::Terrain) else {
                     unreachable!("feature source holder was published at Terrain");
                 };
                 center_chunk.prime_final_heightmaps();
-                let cache_holders = Arc::clone(&holders);
-                let cache = Arc::new(StaticCache2D::create(
-                    chunk_x,
-                    chunk_z,
-                    cache_radius,
-                    move |x, z| match cache_holders.get(&(x, z)) {
-                        Some(holder) => Arc::clone(holder),
-                        None => panic!("missing feature dependency chunk ({x}, {z})"),
-                    },
-                ));
                 let center = ChunkPos::new(chunk_x, chunk_z);
                 let region_random = self
                     .generator
                     .create_worldgen_region_random(self.seed, center);
-                let mut region =
-                    WorldGenRegion::new(&self.context, feature_step, &cache, center, region_random);
+                let mut region = WorldGenRegion::with_holders(
+                    &self.context,
+                    feature_step,
+                    &holders,
+                    center,
+                    region_random,
+                );
                 self.generator.apply_biome_decorations(&mut region);
-                self.stats.feature_regions += 1;
+                replays += 1;
             }
         }
+        let mut output = FxHashMap::default();
+        for x in tile_min.0 - output_margin..=tile_max.0 + output_margin {
+            for z in tile_min.1 - output_margin..=tile_max.1 + output_margin {
+                output.insert((x, z), Arc::clone(holders.owned_holder(x, z)));
+            }
+        }
+        self.stats.holders_nanos += holder_setup;
         self.stats.features_nanos += clock.nanos();
-
-        holders
+        self.stats.feature_regions += replays;
+        Arc::new(output)
     }
 
     fn append_changed_blocks(
