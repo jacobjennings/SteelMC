@@ -1,8 +1,12 @@
 use super::super::instrumentation::OreFeatureProfile;
 use super::super::prelude::*;
 use super::super::runner::FeatureDecorationRunner;
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
+use std::cell::RefCell;
 use std::f32::consts::PI;
+use std::ptr;
+use std::rc::Rc;
 use std::time::Instant;
 use steel_math::trig;
 use steel_utils::PackedSectionBlockPos;
@@ -37,6 +41,12 @@ impl FeatureDecorationRunner {
         let size_xz = 2 * (spread_xz_ceil + max_radius);
         let size_y = 2 * (2 + max_radius);
 
+        if y_start <= region.height_at(HeightmapType::OceanFloorWg, origin.x(), origin.z()) {
+            return Self::do_place_ore(
+                region, registry, random, config, x0, x1, z0, z1, y0, y1, x_start, y_start,
+                z_start, size_xz, size_y,
+            );
+        }
         for x_probe in x_start..=x_start + size_xz {
             for z_probe in z_start..=z_start + size_xz {
                 if y_start <= region.height_at(HeightmapType::OceanFloorWg, x_probe, z_probe) {
@@ -76,6 +86,43 @@ impl FeatureDecorationRunner {
         let Ok(size) = usize::try_from(config.size) else {
             return false;
         };
+        let batch_no_air_exposure = config.discard_chance_on_air_exposure <= 0.0;
+        let fixed_rng_vein = batch_no_air_exposure || config.discard_chance_on_air_exposure >= 1.0;
+        let targets = ResolvedOreTargets::cached_from_config(registry, config);
+
+        let clip_xz = if batch_no_air_exposure {
+            let Some((min_x, max_x, min_z, max_z)) = region.writable_block_xz_bounds() else {
+                for _ in 0..size {
+                    let _ = random.next_f64();
+                }
+                return false;
+            };
+            if x_start + size_xz < min_x
+                || x_start > max_x
+                || z_start + size_xz < min_z
+                || z_start > max_z
+            {
+                for _ in 0..size {
+                    let _ = random.next_f64();
+                }
+                return false;
+            }
+            Some((min_x, max_x, min_z, max_z))
+        } else {
+            None
+        };
+
+        if fixed_rng_vein
+            && let Some(cutoff_y) = region.surface_cutoff_y()
+            && y_start + size_y < cutoff_y
+            && (targets.preserves_stone_tags || y_start + size_y < cutoff_y - 8)
+        {
+            for _ in 0..size {
+                let _ = random.next_f64();
+            }
+            return false;
+        }
+
         let mut vein_nodes = SmallVec::<[[f64; 4]; 32]>::from_elem([0.0; 4], size);
 
         for i in 0..size {
@@ -119,15 +166,19 @@ impl FeatureDecorationRunner {
             return false;
         };
         let profile = OreFeatureProfile::new(config.size);
-        let mut placed = 0_u64;
-        let mut tested = OreTestedPositions::with_capacity(search_volume.tested_position_count);
-        let targets = ResolvedOreTargets::from_config(registry, config);
-        let batch_no_air_exposure = config.discard_chance_on_air_exposure <= 0.0;
-        let mut pending_no_air_sections = SmallVec::<[PendingOreSection; 8]>::new();
         let min_y = region.min_y();
         let height = region.height();
 
-        {
+        let placed = ORE_SCRATCH.with(|scratch_cell| {
+            let mut scratch = scratch_cell.borrow_mut();
+            let OreScratch {
+                tested,
+                pending_no_air_sections,
+            } = &mut *scratch;
+            tested.reset(search_volume.tested_position_count);
+            pending_no_air_sections.clear();
+
+            let mut placed = 0_u64;
             let mut sections = region.bulk_section_access_for_ore(profile.stats());
             let candidate_started_at = profile.stats().map(|_| Instant::now());
 
@@ -145,9 +196,10 @@ impl FeatureDecorationRunner {
                     z_start,
                     min_y,
                     height,
+                    clip_xz,
                     batch_no_air_exposure,
-                    &mut tested,
-                    &mut pending_no_air_sections,
+                    tested,
+                    pending_no_air_sections,
                 )
             } else {
                 Self::collect_ore_candidates::<false>(
@@ -163,9 +215,10 @@ impl FeatureDecorationRunner {
                     z_start,
                     min_y,
                     height,
+                    clip_xz,
                     batch_no_air_exposure,
-                    &mut tested,
-                    &mut pending_no_air_sections,
+                    tested,
+                    pending_no_air_sections,
                 )
             };
             if let Some(started_at) = candidate_started_at
@@ -178,7 +231,7 @@ impl FeatureDecorationRunner {
 
             if batch_no_air_exposure {
                 let batch_apply_started_at = profile.stats().map(|_| Instant::now());
-                for pending_section in &pending_no_air_sections {
+                for pending_section in pending_no_air_sections.iter() {
                     placed += sections.replace_ore_target_block_states_in_section(
                         pending_section.key.chunk_x,
                         pending_section.key.chunk_z,
@@ -195,7 +248,9 @@ impl FeatureDecorationRunner {
                         .record_batch_apply_time(started_at.elapsed());
                 }
             }
-        }
+
+            placed
+        });
 
         profile.finish(placed);
         placed > 0
@@ -218,9 +273,10 @@ impl FeatureDecorationRunner {
         z_start: i32,
         min_y: i32,
         height: i32,
+        clip_xz: Option<(i32, i32, i32, i32)>,
         batch_no_air_exposure: bool,
         tested: &mut OreTestedPositions,
-        pending_no_air_sections: &mut SmallVec<[PendingOreSection; 8]>,
+        pending_no_air_sections: &mut Vec<PendingOreSection>,
     ) -> u64 {
         let mut placed = 0_u64;
 
@@ -230,10 +286,19 @@ impl FeatureDecorationRunner {
                 continue;
             }
 
-            let x_min = fast_floor(node[0] - radius).max(x_start);
-            let z_min = fast_floor(node[2] - radius).max(z_start);
-            let x_max = fast_floor(node[0] + radius).max(x_min);
-            let z_max = fast_floor(node[2] + radius).max(z_min);
+            let mut x_min = fast_floor(node[0] - radius).max(x_start);
+            let mut z_min = fast_floor(node[2] - radius).max(z_start);
+            let mut x_max = fast_floor(node[0] + radius).max(x_min);
+            let mut z_max = fast_floor(node[2] + radius).max(z_min);
+            if let Some((clip_min_x, clip_max_x, clip_min_z, clip_max_z)) = clip_xz {
+                x_min = x_min.max(clip_min_x);
+                x_max = x_max.min(clip_max_x);
+                z_min = z_min.max(clip_min_z);
+                z_max = z_max.min(clip_max_z);
+                if x_min > x_max || z_min > z_max {
+                    continue;
+                }
+            }
             let raw_y_min = fast_floor(node[1] - radius).max(y_start);
             let raw_y_max = fast_floor(node[1] + radius).max(raw_y_min);
             let y_min = raw_y_min.max(min_y);
@@ -327,7 +392,7 @@ impl FeatureDecorationRunner {
             config.size
         );
 
-        let targets = ResolvedOreTargets::from_config(registry, config);
+        let targets = ResolvedOreTargets::cached_from_config(registry, config);
         let tries = random.next_i32_bounded(config.size + 1);
         for i in 0..tries {
             let max_distance = i.min(7);
@@ -487,8 +552,21 @@ impl FeatureDecorationRunner {
     }
 }
 
+#[derive(Default)]
 struct OreTestedPositions {
-    words: SmallVec<[u64; 16]>,
+    words: Vec<u64>,
+}
+
+#[derive(Default)]
+struct OreScratch {
+    tested: OreTestedPositions,
+    pending_no_air_sections: Vec<PendingOreSection>,
+}
+
+thread_local! {
+    static ORE_TARGETS_CACHE: RefCell<FxHashMap<usize, Rc<ResolvedOreTargets>>> =
+        RefCell::new(FxHashMap::default());
+    static ORE_SCRATCH: RefCell<OreScratch> = RefCell::new(OreScratch::default());
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -500,11 +578,15 @@ struct PendingOreSectionKey {
 
 struct PendingOreSection {
     key: PendingOreSectionKey,
-    positions: SmallVec<[PackedSectionBlockPos; 256]>,
+    positions: Vec<PackedSectionBlockPos>,
 }
+
+const NO_ORE_REPLACEMENT: u16 = u16::MAX;
 
 struct ResolvedOreTargets {
     targets: SmallVec<[ResolvedOreTarget; 2]>,
+    flat_by_state: Option<Box<[u16]>>,
+    preserves_stone_tags: bool,
 }
 
 struct ResolvedOreTarget {
@@ -559,22 +641,69 @@ impl OreSearchVolume {
 }
 
 impl ResolvedOreTargets {
+    fn cached_from_config(registry: &Registry, config: &OreConfiguration) -> Rc<Self> {
+        let key = ptr::from_ref(config) as usize;
+        ORE_TARGETS_CACHE.with(|cache| {
+            if let Some(existing) = cache.borrow().get(&key) {
+                return Rc::clone(existing);
+            }
+            let built = Rc::new(Self::from_config(registry, config));
+            cache.borrow_mut().insert(key, Rc::clone(&built));
+            built
+        })
+    }
+
     fn from_config(registry: &Registry, config: &OreConfiguration) -> Self {
-        let mut targets = SmallVec::with_capacity(config.targets.len());
+        let mut targets: SmallVec<[ResolvedOreTarget; 2]> =
+            SmallVec::with_capacity(config.targets.len());
+        let mut has_height_rule = false;
+        let mut preserves_stone_tags = !config.targets.is_empty();
         for target in &config.targets {
-            let matcher = Self::resolve_rule_test(registry, &target.target);
+            let matcher = Self::resolve_rule_test(registry, &target.target, &mut has_height_rule);
             let state = WorldgenStateResolver::feature_block_state_from_data(
                 registry,
                 &target.state,
                 "ore feature",
             );
+            let block = state.get_block();
+            if block != &vanilla_blocks::GRANITE
+                && block != &vanilla_blocks::DIORITE
+                && block != &vanilla_blocks::ANDESITE
+                && block != &vanilla_blocks::TUFF
+            {
+                preserves_stone_tags = false;
+            }
             targets.push(ResolvedOreTarget { matcher, state });
         }
 
-        Self { targets }
+        let flat_by_state = if !has_height_rule {
+            let state_count = registry.blocks.state_to_block_id.len();
+            let mut table = vec![NO_ORE_REPLACEMENT; state_count];
+            for (state_idx, &block_id) in registry.blocks.state_to_block_id.iter().enumerate() {
+                if let Some(replacement) = targets
+                    .iter()
+                    .find_map(|target| target.matches(block_id, 0).then_some(target.state.0))
+                {
+                    table[state_idx] = replacement;
+                }
+            }
+            Some(table.into_boxed_slice())
+        } else {
+            None
+        };
+
+        Self {
+            targets,
+            flat_by_state,
+            preserves_stone_tags,
+        }
     }
 
-    fn resolve_rule_test(registry: &Registry, test: &StructureRuleTestData) -> ResolvedOreRuleTest {
+    fn resolve_rule_test(
+        registry: &Registry,
+        test: &StructureRuleTestData,
+        has_height_rule: &mut bool,
+    ) -> ResolvedOreRuleTest {
         match test {
             StructureRuleTestData::AlwaysTrue => ResolvedOreRuleTest::AlwaysTrue,
             StructureRuleTestData::BlockMatch { block } => {
@@ -595,20 +724,23 @@ impl ResolvedOreTargets {
             StructureRuleTestData::HeightMatch {
                 min_inclusive,
                 max_inclusive,
-            } => ResolvedOreRuleTest::HeightRange(*min_inclusive, *max_inclusive),
-            StructureRuleTestData::Not { rule } => {
-                ResolvedOreRuleTest::Not(Box::new(Self::resolve_rule_test(registry, rule)))
+            } => {
+                *has_height_rule = true;
+                ResolvedOreRuleTest::HeightRange(*min_inclusive, *max_inclusive)
             }
+            StructureRuleTestData::Not { rule } => ResolvedOreRuleTest::Not(Box::new(
+                Self::resolve_rule_test(registry, rule, has_height_rule),
+            )),
             StructureRuleTestData::AllOf { rules } => ResolvedOreRuleTest::AllOf(
                 rules
                     .iter()
-                    .map(|rule| Self::resolve_rule_test(registry, rule))
+                    .map(|rule| Self::resolve_rule_test(registry, rule, has_height_rule))
                     .collect(),
             ),
             StructureRuleTestData::AnyOf { rules } => ResolvedOreRuleTest::AnyOf(
                 rules
                     .iter()
-                    .map(|rule| Self::resolve_rule_test(registry, rule))
+                    .map(|rule| Self::resolve_rule_test(registry, rule, has_height_rule))
                     .collect(),
             ),
             other => unreachable!("ore rule test target does not support {other:?}"),
@@ -619,12 +751,17 @@ impl ResolvedOreTargets {
         self.targets.iter()
     }
 
+    #[inline]
     fn matching_replacement(
         &self,
         registry: &Registry,
         state: BlockStateId,
         y: i32,
     ) -> Option<BlockStateId> {
+        if let Some(table) = &self.flat_by_state {
+            let mapped = table[state.0 as usize];
+            return (mapped != NO_ORE_REPLACEMENT).then_some(BlockStateId(mapped));
+        }
         let block_id = Self::block_id_for_state(registry, state);
         self.targets
             .iter()
@@ -674,7 +811,7 @@ impl PendingOreSectionKey {
 }
 
 fn push_pending_ore_position(
-    sections: &mut SmallVec<[PendingOreSection; 8]>,
+    sections: &mut Vec<PendingOreSection>,
     key: PendingOreSectionKey,
     pos: PackedSectionBlockPos,
 ) {
@@ -690,17 +827,23 @@ fn push_pending_ore_position(
         return;
     }
 
-    sections.push(PendingOreSection {
-        key,
-        positions: smallvec::smallvec![pos],
-    });
+    let mut positions = Vec::with_capacity(64);
+    positions.push(pos);
+    sections.push(PendingOreSection { key, positions });
 }
 
 impl OreTestedPositions {
+    #[cfg(test)]
     fn with_capacity(bit_count: usize) -> Self {
         Self {
-            words: smallvec::smallvec![0; bit_count.div_ceil(u64::BITS as usize)],
+            words: vec![0; bit_count.div_ceil(u64::BITS as usize)],
         }
+    }
+
+    fn reset(&mut self, bit_count: usize) {
+        let word_count = bit_count.div_ceil(u64::BITS as usize);
+        self.words.clear();
+        self.words.resize(word_count, 0);
     }
 
     fn insert(&mut self, index: usize) -> bool {

@@ -5,6 +5,7 @@ use steel_registry::structure::StructureRef;
 use steel_utils::{BoundingBox, ChunkPos};
 
 use super::prelude::*;
+use steel_utils::value_providers::HeightProvider;
 use super::sorter::{FeatureSorter, FeatureStepData};
 use crate::worldgen::structure::piece_placer::StructurePiecePlacer;
 #[cfg(test)]
@@ -16,6 +17,7 @@ use steel_worldgen::structure::StructureStart;
 pub(crate) struct FeatureDecorationRunner {
     pub(super) sorter: FeatureSorter,
     source_biome_lookup: Box<[bool]>,
+    structures_by_step: Box<[Box<[StructureRef]>]>,
 }
 
 impl FeatureDecorationRunner {
@@ -143,9 +145,17 @@ impl FeatureDecorationRunner {
             source_biome_lookup[biome_id] = true;
         }
 
+        let sorter = FeatureSorter::build(&unique_biomes, registry);
+        let step_count = DECORATION_STEP_COUNT.max(sorter.step_count());
+        let structures_by_step = (0..step_count)
+            .map(|step| Self::structures_for_decoration_step(registry, step).into_boxed_slice())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
         Self {
-            sorter: FeatureSorter::build(&unique_biomes, registry),
+            sorter,
             source_biome_lookup,
+            structures_by_step,
         }
     }
 
@@ -158,26 +168,33 @@ impl FeatureDecorationRunner {
     ) {
         let center = region.center();
         let origin = BlockPos::new(center.0.x * 16, region.min_y(), center.0.y * 16);
-        let possible_biomes = self.collect_possible_biome_ids(region);
+        let (possible_biomes, all_warm_for_freeze) =
+            self.collect_possible_biomes_with_max_y(region, registry);
 
         let mut random = WorldgenRandom::from_seed(0);
         let decoration_seed = random.set_decoration_seed(seed, origin.x(), origin.z());
-        let step_count = DECORATION_STEP_COUNT.max(self.sorter.step_count());
+        let step_count = self.structures_by_step.len();
+        let has_structures = !region
+            .chunk(center.0.x, center.0.y, ChunkStatus::StructureStarts)
+            .structure_references()
+            .is_empty();
 
         for step in 0..step_count {
-            Self::place_structures_for_step(
-                region,
-                registry,
-                decoration_seed,
-                &mut random,
-                step,
-                biome_zoom_seed,
-            );
+            if has_structures {
+                self.place_structures_for_step_cached(
+                    region,
+                    registry,
+                    decoration_seed,
+                    &mut random,
+                    step,
+                    biome_zoom_seed,
+                );
+            }
 
             let Some(step_features) = self.sorter.step(step) else {
                 continue;
             };
-            Self::place_features_for_step(
+            Self::place_features_for_step_with_bounds(
                 region,
                 registry,
                 decoration_seed,
@@ -186,37 +203,91 @@ impl FeatureDecorationRunner {
                 step,
                 step_features,
                 &possible_biomes,
+                all_warm_for_freeze,
                 biome_zoom_seed,
             );
         }
     }
 
-    pub(super) fn collect_possible_biome_ids(&self, region: &WorldGenRegion<'_>) -> Vec<usize> {
+    fn collect_possible_biomes_with_max_y(
+        &self,
+        region: &WorldGenRegion<'_>,
+        registry: &Registry,
+    ) -> (SmallVec<[(usize, i32); 16]>, bool) {
         let center = region.center();
-        let mut seen = vec![false; self.source_biome_lookup.len()];
-        let mut biomes = Vec::new();
+        let lookup_len = self.source_biome_lookup.len();
+        let mut max_block_y = SmallVec::<[i32; 128]>::from_elem(i32::MIN, lookup_len);
+        let min_quart_y = region.min_y() >> 2;
 
         for chunk_z in center.0.y - 1..=center.0.y + 1 {
             for chunk_x in center.0.x - 1..=center.0.x + 1 {
-                let chunk = region.chunk(chunk_x, chunk_z, ChunkStatus::Biomes);
-                chunk.sections().for_each_biome_id(|biome_id| {
-                    let biome_id = usize::from(biome_id);
+                let chunk_ref = region.chunk(chunk_x, chunk_z, ChunkStatus::Biomes);
+                let summary = chunk_ref.raw_chunk().biome_max_quart_y.get_or_init(|| {
+                    let sections = chunk_ref.sections();
+                    let section_count = sections.sections.len();
+                    let mut per_chunk = SmallVec::<[i16; 128]>::from_elem(i16::MIN, lookup_len);
+                    sections.for_each_biome_id_with_quart_y(|section_index, qy, biome_id| {
+                        let idx = usize::from(biome_id);
+                        if idx < per_chunk.len() {
+                            let q_upper = if section_index + 1 >= section_count && qy >= 3 {
+                                i16::MAX
+                            } else {
+                                (min_quart_y + (section_index as i32) * 4 + (qy as i32)) as i16
+                            };
+                            if q_upper > per_chunk[idx] {
+                                per_chunk[idx] = q_upper;
+                            }
+                        }
+                    });
+                    let compact: Vec<(u16, i16)> = per_chunk
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(id, &qy)| (qy != i16::MIN).then_some((id as u16, qy)))
+                        .collect();
+                    std::sync::Arc::new(compact.into_boxed_slice())
+                });
+                for &(raw_id, max_qy) in summary.iter() {
+                    let biome_id = usize::from(raw_id);
                     if self
                         .source_biome_lookup
                         .get(biome_id)
                         .copied()
                         .unwrap_or(false)
-                        && !seen[biome_id]
                     {
-                        seen[biome_id] = true;
-                        biomes.push(biome_id);
+                        let upper_y = if max_qy == i16::MAX {
+                            i32::MAX / 4
+                        } else {
+                            (i32::from(max_qy) << 2) + 8
+                        };
+                        if upper_y > max_block_y[biome_id] {
+                            max_block_y[biome_id] = upper_y;
+                        }
                     }
-                });
+                }
             }
         }
 
-        biomes.sort_unstable();
-        biomes
+        let mut biomes = SmallVec::<[(usize, i32); 16]>::new();
+        let mut all_warm_for_freeze = true;
+        for (biome_id, &upper_y) in max_block_y.iter().enumerate() {
+            if upper_y != i32::MIN {
+                biomes.push((biome_id, upper_y));
+                if all_warm_for_freeze
+                    && let Some(biome) = registry.biomes.by_id(biome_id)
+                    && (biome.temperature < 0.62
+                        || !matches!(biome.temperature_modifier, TemperatureModifier::None))
+                {
+                    all_warm_for_freeze = false;
+                }
+            }
+        }
+        (biomes, all_warm_for_freeze)
+    }
+
+    #[cfg(test)]
+    pub(super) fn collect_possible_biome_ids(&self, region: &WorldGenRegion<'_>) -> Vec<usize> {
+        let (biomes, _) = self.collect_possible_biomes_with_max_y(region, &REGISTRY);
+        biomes.into_iter().map(|(id, _)| id).collect()
     }
 
     pub(super) fn structures_for_decoration_step(
@@ -285,6 +356,35 @@ impl FeatureDecorationRunner {
         source_positions
     }
 
+    fn place_structures_for_step_cached(
+        &self,
+        region: &mut WorldGenRegion<'_>,
+        registry: &Registry,
+        decoration_seed: i64,
+        random: &mut WorldgenRandom,
+        step: usize,
+        biome_zoom_seed: i64,
+    ) {
+        let center = region.center();
+        let center_chunk = region.chunk(center.0.x, center.0.y, ChunkStatus::StructureStarts);
+        if center_chunk.structure_references().is_empty() {
+            return;
+        }
+        let Some(structures) = self.structures_by_step.get(step) else {
+            return;
+        };
+        Self::place_structures_slice(
+            region,
+            registry,
+            decoration_seed,
+            random,
+            step,
+            structures,
+            biome_zoom_seed,
+        );
+    }
+
+    #[cfg(test)]
     pub(super) fn place_structures_for_step(
         region: &mut WorldGenRegion<'_>,
         registry: &Registry,
@@ -293,12 +393,30 @@ impl FeatureDecorationRunner {
         step: usize,
         biome_zoom_seed: i64,
     ) {
+        let structures = Self::structures_for_decoration_step(registry, step);
+        Self::place_structures_slice(
+            region,
+            registry,
+            decoration_seed,
+            random,
+            step,
+            &structures,
+            biome_zoom_seed,
+        );
+    }
+
+    fn place_structures_slice(
+        region: &mut WorldGenRegion<'_>,
+        registry: &Registry,
+        decoration_seed: i64,
+        random: &mut WorldgenRandom,
+        step: usize,
+        structures: &[StructureRef],
+        biome_zoom_seed: i64,
+    ) {
         let writable_box = Self::center_chunk_writable_box(region);
 
-        for (structure_index, structure) in Self::structures_for_decoration_step(registry, step)
-            .into_iter()
-            .enumerate()
-        {
+        for (structure_index, &structure) in structures.iter().enumerate() {
             Self::set_structure_seed(random, decoration_seed, structure_index, step);
 
             let source_positions =
@@ -359,6 +477,216 @@ impl FeatureDecorationRunner {
         random.set_feature_seed(decoration_seed, structure_index_i32, step_i32);
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "mirrors vanilla's decoration loop state without hiding generation inputs"
+    )]
+    fn place_features_for_step_with_bounds(
+        region: &mut WorldGenRegion<'_>,
+        registry: &Registry,
+        decoration_seed: i64,
+        random: &mut WorldgenRandom,
+        origin: BlockPos,
+        step: usize,
+        step_features: &FeatureStepData,
+        possible_biomes: &[(usize, i32)],
+        all_warm_for_freeze: bool,
+        biome_zoom_seed: i64,
+    ) {
+        let step_len = step_features.len();
+        if step_len == 0 {
+            return;
+        }
+        let mut max_biome_y = SmallVec::<[i32; 128]>::from_elem(i32::MIN, step_len);
+        for &(biome_id, biome_max_y) in possible_biomes {
+            if let Some(indices) = step_features.feature_indices_for_biome(biome_id) {
+                for &idx in indices {
+                    if biome_max_y > max_biome_y[idx] {
+                        max_biome_y[idx] = biome_max_y;
+                    }
+                }
+            }
+        }
+
+        let cutoff_y = region.surface_cutoff_y();
+        let last_root_system_idx = if cutoff_y.is_some() {
+            (0..step_len).rev().find(|&idx| {
+                max_biome_y[idx] != i32::MIN
+                    && step_features.feature(idx).is_some_and(|feat| {
+                        matches!(
+                            *Self::configured_feature_kind(&feat.data.feature),
+                            ConfiguredFeatureKind::RootSystem(_)
+                        )
+                    })
+            })
+        } else {
+            None
+        };
+
+        let gen_min_y = region.generation_min_y();
+        let gen_height = region.generation_height();
+        let sea_level = region.sea_level();
+        let Ok(step_i32) = i32::try_from(step) else {
+            panic!("decoration step {step} exceeds i32 range");
+        };
+        for (feature_index, &biome_upper_y) in max_biome_y.iter().enumerate() {
+            if biome_upper_y == i32::MIN {
+                continue;
+            }
+            let Some(feature) = step_features.feature(feature_index) else {
+                panic!("decoration step {step} references missing feature index {feature_index}");
+            };
+            let kind = Self::configured_feature_kind(&feature.data.feature);
+            if all_warm_for_freeze && matches!(*kind, ConfiguredFeatureKind::FreezeTopLayer) {
+                continue;
+            }
+            if let Some(cutoff_y) = cutoff_y
+                && last_root_system_idx.is_none_or(|last_rs| feature_index > last_rs)
+                && Self::placed_feature_provably_below_cutoff(
+                    &feature.data,
+                    biome_upper_y,
+                    gen_min_y,
+                    gen_height,
+                    sea_level,
+                    cutoff_y,
+                )
+            {
+                continue;
+            }
+            let Ok(feature_index_i32) = i32::try_from(feature_index) else {
+                panic!("decoration feature index {feature_index} exceeds i32 range");
+            };
+            random.set_feature_seed(decoration_seed, feature_index_i32, step_i32);
+            Self::place_placed_feature_entry(
+                region,
+                registry,
+                random,
+                origin,
+                feature,
+                biome_zoom_seed,
+            );
+        }
+    }
+
+    fn placed_feature_provably_below_cutoff(
+        feature: &PlacedFeatureData,
+        biome_upper_y: i32,
+        gen_min_y: i32,
+        gen_height: i32,
+        sea_level: i32,
+        cutoff_y: i32,
+    ) -> bool {
+        let Some(reach) = Self::configured_feature_max_upward_reach(Self::configured_feature_kind(&feature.feature)) else {
+            return false;
+        };
+        let mut max_y = gen_min_y;
+        for modifier in &feature.placement {
+            match modifier {
+                PlacementModifier::Count { .. }
+                | PlacementModifier::RarityFilter { .. }
+                | PlacementModifier::RandomChance { .. }
+                | PlacementModifier::InSquare
+                | PlacementModifier::NoiseBasedCount { .. }
+                | PlacementModifier::NoiseThresholdCount { .. }
+                | PlacementModifier::BlockPredicateFilter { .. }
+                | PlacementModifier::SurfaceWaterDepthFilter { .. }
+                | PlacementModifier::SurfaceRelativeThresholdFilter { .. } => {}
+                PlacementModifier::Biome => {
+                    max_y = max_y.min(biome_upper_y);
+                }
+                PlacementModifier::HeightRange { height } => {
+                    max_y = Self::max_height_provider_y(*height, gen_min_y, gen_height, sea_level);
+                }
+                PlacementModifier::Offset { y, .. }
+                | PlacementModifier::RandomOffset { y_spread: y, .. } => {
+                    max_y = max_y.saturating_add(y.max().max(0));
+                }
+                PlacementModifier::EnvironmentScan {
+                    direction_of_search,
+                    max_steps,
+                    ..
+                } => {
+                    if *direction_of_search != Direction::Down {
+                        max_y = max_y.saturating_add(*max_steps);
+                    }
+                }
+                PlacementModifier::Heightmap { .. }
+                | PlacementModifier::CountOnEveryLayer { .. }
+                | PlacementModifier::FixedPlacement { .. }
+                | PlacementModifier::Cuboid { .. }
+                | PlacementModifier::RandomlySelected { .. } => {
+                    return false;
+                }
+            }
+        }
+        max_y.saturating_add(reach) < cutoff_y
+    }
+
+    fn configured_feature_max_upward_reach(kind: &ConfiguredFeatureKind) -> Option<i32> {
+        match kind {
+            ConfiguredFeatureKind::Ore(c) | ConfiguredFeatureKind::ScatteredOre(c) => {
+                Some(4 + ((c.size as f32 / 8.0 + 1.0).ceil() as i32))
+            }
+            ConfiguredFeatureKind::Geode(c) => Some(c.max_gen_offset.saturating_add(34)),
+            ConfiguredFeatureKind::SculkPatch(_) => Some(46),
+            ConfiguredFeatureKind::MultifaceGrowth(c) => Some(c.search_range.saturating_add(34)),
+            ConfiguredFeatureKind::MonsterRoom => Some(38),
+            ConfiguredFeatureKind::SpringFeature(_) => Some(34),
+            ConfiguredFeatureKind::Disk(c) => Some(c.half_height.saturating_add(34)),
+            ConfiguredFeatureKind::VegetationPatch(c)
+            | ConfiguredFeatureKind::WaterloggedVegetationPatch(c) => {
+                Some(c.vertical_range.saturating_add(38))
+            }
+            ConfiguredFeatureKind::BlockColumn(c) => {
+                (c.direction == Direction::Down).then_some(36)
+            }
+            ConfiguredFeatureKind::Vines | ConfiguredFeatureKind::WeepingVines => Some(34),
+            ConfiguredFeatureKind::PointedDripstone(_) => Some(36),
+            ConfiguredFeatureKind::DripstoneCluster(c) => Some(
+                c.floor_to_ceiling_search_range
+                    .saturating_add(c.dripstone_block_layer_thickness.max())
+                    .saturating_add(c.height.max())
+                    .saturating_add(36),
+            ),
+            _ => None,
+        }
+    }
+
+    fn max_height_provider_y(
+        provider: HeightProvider,
+        min_y: i32,
+        height: i32,
+        sea_level: i32,
+    ) -> i32 {
+        match provider {
+            HeightProvider::Constant(anchor) => anchor.resolve_y(min_y, height, sea_level),
+            HeightProvider::Uniform {
+                min_inclusive,
+                max_inclusive,
+            }
+            | HeightProvider::Trapezoid {
+                min_inclusive,
+                max_inclusive,
+                ..
+            }
+            | HeightProvider::BiasedToBottom {
+                min_inclusive,
+                max_inclusive,
+                ..
+            }
+            | HeightProvider::VeryBiasedToBottom {
+                min_inclusive,
+                max_inclusive,
+                ..
+            } => {
+                let min = min_inclusive.resolve_y(min_y, height, sea_level);
+                let max = max_inclusive.resolve_y(min_y, height, sea_level);
+                min.max(max)
+            }
+        }
+    }
+
+    #[cfg(test)]
     #[expect(
         clippy::too_many_arguments,
         reason = "mirrors vanilla's decoration loop state without hiding generation inputs"

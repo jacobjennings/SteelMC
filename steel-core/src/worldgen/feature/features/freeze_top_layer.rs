@@ -8,6 +8,12 @@ impl FeatureDecorationRunner {
         origin: BlockPos,
         biome_zoom_seed: i64,
     ) -> bool {
+        if region
+            .final_output_chunk()
+            .is_some_and(|out_chunk| out_chunk != region.center())
+        {
+            return true;
+        }
         let ice = vanilla_blocks::ICE.default_state();
         let snow = vanilla_blocks::SNOW.default_state();
 

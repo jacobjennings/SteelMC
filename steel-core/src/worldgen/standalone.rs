@@ -6,6 +6,7 @@
 //! over fresh Terrain copies in x-then-z order, independent of request history.
 
 use std::cell::OnceCell;
+use std::mem::size_of;
 use std::sync::{Arc, Weak};
 
 use glam::IVec3;
@@ -30,7 +31,7 @@ use crate::chunk::Chunk;
 use crate::chunk::chunk_holder::ChunkHolder;
 use crate::chunk::chunk_pyramid::GENERATION_PYRAMID;
 use crate::chunk::chunk_ticket_manager::ChunkTicketLevel;
-use crate::chunk::paletted_container::BiomePalette;
+use crate::chunk::paletted_container::{BiomePalette, PalettedContainer};
 use crate::chunk::section::{ChunkSection, Sections};
 use crate::chunk::status::ChunkStatus;
 use crate::poi::{PoiReplay, PoiTask, replay_poi_tasks};
@@ -315,23 +316,54 @@ struct SurfaceColumn {
 struct StartsEntry {
     starts: StructureStartMap,
     biomes: Option<Box<[BiomePalette]>>,
+    has_root_system: bool,
     last_used: u64,
+}
+
+fn biome_has_root_system_lookup() -> &'static [bool] {
+    static LOOKUP: std::sync::OnceLock<Box<[bool]>> = std::sync::OnceLock::new();
+    LOOKUP.get_or_init(|| {
+        use steel_registry::{RegistryExt as _, feature::{ConfiguredFeatureKind, ConfiguredFeatureRef}};
+        fn ref_is_root_system(fref: &ConfiguredFeatureRef) -> bool {
+            let kind = match fref {
+                ConfiguredFeatureRef::Reference(entry) => &entry.kind,
+                ConfiguredFeatureRef::Inline(kind) => kind,
+            };
+            matches!(kind, ConfiguredFeatureKind::RootSystem(_))
+        }
+        let mut flags = Vec::new();
+        for (id, biome) in REGISTRY.biomes.iter() {
+            if flags.len() <= id {
+                flags.resize(id + 1, false);
+            }
+            let has_rs = biome.features.iter().flatten().any(|fkey| {
+                REGISTRY
+                    .placed_features
+                    .by_key(fkey)
+                    .is_some_and(|pf| ref_is_root_system(&pf.data.feature))
+            });
+            flags[id] = has_rs;
+        }
+        flags.into_boxed_slice()
+    })
 }
 
 struct TerrainEntry {
     surface: Box<[SurfaceColumn]>,
     carved: Option<Arc<Chunk>>,
+    has_root_system: bool,
     last_used: u64,
 }
 
 struct DecoratedChunk {
-    all: Vec<GeneratedBlock>,
+    all: Option<Vec<GeneratedBlock>>,
     surface: Vec<GeneratedBlock>,
 }
 
 impl DecoratedChunk {
     fn bytes(&self) -> usize {
-        (self.all.capacity() + self.surface.capacity()) * std::mem::size_of::<GeneratedBlock>()
+        let all_cap = self.all.as_ref().map_or(0, Vec::capacity);
+        (all_cap + self.surface.capacity()) * size_of::<GeneratedBlock>()
     }
 }
 
@@ -401,26 +433,34 @@ impl ReplayHolders<'_> {
         assert!(col < self.width, "feature dependency east of window");
         self.cells[row * self.width + col].get_or_init(|| {
             let pos = ChunkPos::new(x, z);
-            let holder = Arc::new(ChunkHolder::new(
-                pos,
-                ChunkTicketLevel::STRONGEST,
-                None,
-                self.world.min_y,
-                self.world.height,
-            ));
+            let make_holder = || {
+                Arc::new(ChunkHolder::new(
+                    pos,
+                    ChunkTicketLevel::STRONGEST,
+                    None,
+                    self.world.min_y,
+                    self.world.height,
+                ))
+            };
             if (self.terrain_min.0..=self.terrain_max.0).contains(&x)
                 && (self.terrain_min.1..=self.terrain_max.1).contains(&z)
             {
+                let holder = make_holder();
                 let chunk = self.world.carved_chunk((x, z));
                 holder.insert_chunk(chunk.clone_generation_state(), ChunkStatus::Terrain);
-            } else {
+                holder
+            } else if let Some(entry) = self.world.starts.get(&(x, z)) {
+                let holder = make_holder();
                 let chunk = self.world.empty_chunk(pos);
-                if let Some(entry) = self.world.starts.get(&(x, z)) {
-                    chunk.structure_starts_mut().clone_from(&entry.starts);
-                }
+                chunk.structure_starts_mut().clone_from(&entry.starts);
                 holder.insert_chunk(chunk, ChunkStatus::StructureStarts);
+                holder
+            } else {
+                let holder = make_holder();
+                let chunk = self.world.empty_chunk(pos);
+                holder.insert_chunk(chunk, ChunkStatus::StructureStarts);
+                holder
             }
-            holder
         })
     }
 }
@@ -695,8 +735,12 @@ impl StandaloneWorldgen {
         }
         let mut snapshot = self.terrain_chunk_snapshot(chunk_x, chunk_z);
         let pool = Arc::clone(&self.pool);
-        let changes = pool.install(|| self.decorated_chunk((chunk_x, chunk_z)));
-        for block in &changes.all {
+        let changes =
+            pool.install(|| self.decorated_chunk((chunk_x, chunk_z), GeneratedBlockFilter::All));
+        let Some(all_blocks) = changes.all.as_deref() else {
+            unreachable!("All filter populates DecoratedChunk::all");
+        };
+        for block in all_blocks {
             let x = block.x.rem_euclid(16) as usize;
             let z = block.z.rem_euclid(16) as usize;
             let y = (block.y - self.min_y) as usize;
@@ -927,9 +971,12 @@ impl StandaloneWorldgen {
         let mut blocks = Vec::new();
         for region_x in origin_x.div_euclid(region_blocks)..=max_x.div_euclid(region_blocks) {
             for region_z in origin_z.div_euclid(region_blocks)..=max_z.div_euclid(region_blocks) {
-                let region = self.decorated_chunk((region_x, region_z));
+                let region = self.decorated_chunk((region_x, region_z), filter);
                 let changed = match filter {
-                    GeneratedBlockFilter::All => &region.all,
+                    GeneratedBlockFilter::All => region
+                        .all
+                        .as_deref()
+                        .unwrap_or_else(|| unreachable!("All filter populates DecoratedChunk::all")),
                     GeneratedBlockFilter::AtOrAboveSurface => &region.surface,
                 };
                 blocks.extend(changed.iter().copied().filter(|block| {
@@ -943,9 +990,15 @@ impl StandaloneWorldgen {
         blocks
     }
 
-    fn decorated_chunk(&mut self, key: (i32, i32)) -> Arc<DecoratedChunk> {
+    fn decorated_chunk(
+        &mut self,
+        key: (i32, i32),
+        filter: GeneratedBlockFilter,
+    ) -> Arc<DecoratedChunk> {
         let now = self.tick();
-        if let Some(entry) = self.decorated.get_mut(&key) {
+        if let Some(entry) = self.decorated.get_mut(&key)
+            && (filter == GeneratedBlockFilter::AtOrAboveSurface || entry.chunk.all.is_some())
+        {
             entry.last_used = now;
             self.stats.decorated_hits += 1;
             return Arc::clone(&entry.chunk);
@@ -956,14 +1009,14 @@ impl StandaloneWorldgen {
         let side = self.decoration_batch;
         let batch_min = (key.0.div_euclid(side) * side, key.1.div_euclid(side) * side);
         let batch_max = (batch_min.0 + side - 1, batch_min.1 + side - 1);
-        let holders = self.decorate(batch_min, batch_max, 0);
+        let holders = self.decorate(batch_min, batch_max, 0, filter);
         let clock = StageClock::start();
         let mut requested = None;
         for chunk_x in batch_min.0..=batch_max.0 {
             for chunk_z in batch_min.1..=batch_max.1 {
                 let output = (chunk_x, chunk_z);
                 self.stats.decorated_generated += 1;
-                let region = Arc::new(self.changed_chunk(&holders, output));
+                let region = Arc::new(self.changed_chunk(&holders, output, filter));
                 if output == key {
                     requested = Some(Arc::clone(&region));
                 }
@@ -982,6 +1035,7 @@ impl StandaloneWorldgen {
         &self,
         holders: &FxHashMap<(i32, i32), Arc<ChunkHolder>>,
         key: (i32, i32),
+        filter: GeneratedBlockFilter,
     ) -> DecoratedChunk {
         let Some(decorated) = holders
             .get(&key)
@@ -995,13 +1049,29 @@ impl StandaloneWorldgen {
         let Some(carved) = entry.carved.as_deref() else {
             unreachable!("output terrain entry was just carved");
         };
+        let bounds = (key.0 * 16, key.1 * 16, key.0 * 16 + 15, key.1 * 16 + 15);
+        if filter == GeneratedBlockFilter::AtOrAboveSurface {
+            let mut surface = Vec::new();
+            self.append_changed_blocks(
+                &mut surface,
+                carved,
+                decorated,
+                &entry.surface,
+                bounds,
+                GeneratedBlockFilter::AtOrAboveSurface,
+            );
+            return DecoratedChunk {
+                all: None,
+                surface,
+            };
+        }
         let mut all = Vec::new();
         self.append_changed_blocks(
             &mut all,
             carved,
             decorated,
             &entry.surface,
-            (key.0 * 16, key.1 * 16, key.0 * 16 + 15, key.1 * 16 + 15),
+            bounds,
             GeneratedBlockFilter::All,
         );
         let surface = all
@@ -1012,7 +1082,10 @@ impl StandaloneWorldgen {
                 !column.exists || block.y >= i32::from(column.height)
             })
             .collect();
-        DecoratedChunk { all, surface }
+        DecoratedChunk {
+            all: Some(all),
+            surface,
+        }
     }
 
     /// Retains one output chunk within the decorated byte and entry bounds.
@@ -1073,7 +1146,12 @@ impl StandaloneWorldgen {
         let ring = source_radius + 1;
         let pool = Arc::clone(&self.pool);
         let snapshots = pool.install(|| {
-            let holders = self.decorate(tile_min, tile_max, FEATURE_WRITE_RADIUS + 1);
+            let holders = self.decorate(
+                tile_min,
+                tile_max,
+                FEATURE_WRITE_RADIUS + 1,
+                GeneratedBlockFilter::All,
+            );
             let mut snapshots = Vec::new();
             for chunk_x in center.0 - ring..=center.0 + ring {
                 for chunk_z in center.1 - ring..=center.1 + ring {
@@ -1112,6 +1190,7 @@ impl StandaloneWorldgen {
         tile_min: (i32, i32),
         tile_max: (i32, i32),
         output_margin: i32,
+        filter: GeneratedBlockFilter,
     ) -> Arc<FxHashMap<(i32, i32), Arc<ChunkHolder>>> {
         // Features can write one chunk away, and each decorating chunk reads
         // Terrain one chunk further out.
@@ -1130,6 +1209,34 @@ impl StandaloneWorldgen {
                 self.ensure_terrain((chunk_x, chunk_z), true);
             }
         }
+        let surface_cutoff_y = if filter == GeneratedBlockFilter::AtOrAboveSurface {
+            let mut all_exist = true;
+            let mut min_surface_y = i16::MAX;
+            'chunks: for chunk_x in terrain_min.0..=terrain_max.0 {
+                for chunk_z in terrain_min.1..=terrain_max.1 {
+                    let Some(entry) = self.terrain.get(&(chunk_x, chunk_z)) else {
+                        all_exist = false;
+                        break 'chunks;
+                    };
+                    if entry.has_root_system {
+                        all_exist = false;
+                        break 'chunks;
+                    }
+                    for col in &entry.surface {
+                        if !col.exists {
+                            all_exist = false;
+                            break 'chunks;
+                        }
+                        if col.height < min_surface_y {
+                            min_surface_y = col.height;
+                        }
+                    }
+                }
+            }
+            (all_exist && min_surface_y < i16::MAX).then_some(i32::from(min_surface_y) - 16)
+        } else {
+            None
+        };
 
         let clock = StageClock::start();
         let width = (source_max.0 - source_min.0 + 1 + 2 * STRUCTURE_RADIUS) as usize;
@@ -1148,24 +1255,26 @@ impl StandaloneWorldgen {
         let holder_setup = clock.nanos();
         let clock = StageClock::start();
         let feature_step = GENERATION_PYRAMID.get_step_to(ChunkStatus::Features);
+        let single_output_chunk =
+            (tile_min == tile_max && output_margin == 0).then_some(ChunkPos::new(tile_min.0, tile_min.1));
         let mut replays = 0;
         for chunk_x in source_min.0..=source_max.0 {
             for chunk_z in source_min.1..=source_max.1 {
-                let center_holder = holders.holder(chunk_x, chunk_z);
-                let Some(center_chunk) = center_holder.try_chunk(ChunkStatus::Terrain) else {
-                    unreachable!("feature source holder was published at Terrain");
-                };
-                center_chunk.prime_final_heightmaps();
+                let _ = holders.holder(chunk_x, chunk_z);
                 let center = ChunkPos::new(chunk_x, chunk_z);
                 let region_random = self
                     .generator
                     .create_worldgen_region_random(self.seed, center);
-                let mut region = WorldGenRegion::with_holders(
+                let final_output_chunk =
+                    single_output_chunk.filter(|_| chunk_x == source_max.0 && chunk_z == source_max.1);
+                let mut region = WorldGenRegion::with_holders_and_pruning(
                     &self.context,
                     feature_step,
                     &holders,
                     center,
                     region_random,
+                    surface_cutoff_y,
+                    final_output_chunk,
                 );
                 self.generator.apply_biome_decorations(&mut region);
                 replays += 1;
@@ -1194,6 +1303,22 @@ impl StandaloneWorldgen {
     ) {
         let chunk_min_x = carved.pos.0.x * 16;
         let chunk_min_z = carved.pos.0.y * 16;
+        let min_surface_y = if filter == GeneratedBlockFilter::AtOrAboveSurface {
+            let mut all_exist = true;
+            let mut min_h = i16::MAX;
+            for col in surface {
+                if !col.exists {
+                    all_exist = false;
+                    break;
+                }
+                if col.height < min_h {
+                    min_h = col.height;
+                }
+            }
+            (all_exist && min_h < i16::MAX).then_some(i32::from(min_h))
+        } else {
+            None
+        };
         let carved_sections = &carved.sections.sections;
         let decorated_sections = &decorated.sections.sections;
         for (section_index, (before, after)) in carved_sections
@@ -1201,9 +1326,17 @@ impl StandaloneWorldgen {
             .zip(decorated_sections.iter())
             .enumerate()
         {
+            let section_min_y = self.min_y + (section_index as i32) * 16;
+            if let Some(min_y_keep) = min_surface_y
+                && section_min_y + 15 < min_y_keep
+            {
+                continue;
+            }
             let before = before.read();
             let after = after.read();
-            let section_min_y = self.min_y + (section_index as i32) * 16;
+            if before.states.same_cube_or_value(&after.states) {
+                continue;
+            }
             for local_y in 0..16 {
                 let y = section_min_y + local_y as i32;
                 for local_z in 0..16 {
@@ -1284,6 +1417,7 @@ impl StandaloneWorldgen {
             StartsEntry {
                 starts,
                 biomes: None,
+                has_root_system: false,
                 last_used: now,
             },
         );
@@ -1310,6 +1444,7 @@ impl StandaloneWorldgen {
                 StartsEntry {
                     starts: starts.clone(),
                     biomes: None,
+                    has_root_system: false,
                     last_used: now,
                 },
             );
@@ -1330,16 +1465,32 @@ impl StandaloneWorldgen {
         let clock = StageClock::start();
         let chunk = self.empty_chunk(ChunkPos::new(key.0, key.1));
         self.generator.create_biomes(&chunk);
+        let rs_lookup = biome_has_root_system_lookup();
+        let mut has_root_system = false;
         let biomes = chunk
             .sections
             .sections
             .iter()
-            .map(|section| section.read().biomes.clone())
+            .map(|section| {
+                let pal = section.read().biomes.clone();
+                if !has_root_system
+                    && pal.maybe_has(|id| {
+                        rs_lookup
+                            .get(usize::from(id))
+                            .copied()
+                            .unwrap_or(false)
+                    })
+                {
+                    has_root_system = true;
+                }
+                pal
+            })
             .collect::<Vec<_>>()
             .into_boxed_slice();
         self.stats.biomes_generated += 1;
         self.stats.biomes_nanos += clock.nanos();
         if let Some(entry) = self.starts.get_mut(&key) {
+            entry.has_root_system = has_root_system;
             entry.biomes = Some(biomes);
         }
     }
@@ -1365,6 +1516,7 @@ impl StandaloneWorldgen {
             }
         }
         let clock = StageClock::start();
+        let has_root_system = self.starts.get(&key).is_some_and(|s| s.has_root_system);
         let (surface, carved) = self.build_terrain(key, carve);
         self.stats.terrain_generated += 1;
         self.stats.terrain_nanos += clock.nanos();
@@ -1373,6 +1525,7 @@ impl StandaloneWorldgen {
             TerrainEntry {
                 surface,
                 carved: carved.map(Arc::new),
+                has_root_system,
                 last_used: now,
             },
         );
@@ -1470,34 +1623,75 @@ impl StandaloneWorldgen {
     }
 
     fn surface_columns(&self, chunk: &Chunk) -> Box<[SurfaceColumn]> {
-        let mut column = Vec::new();
         let below_ceiling = self.dimension.surface_below_ceiling();
         let air = vanilla_blocks::AIR.default_state();
-        (0..256)
-            .map(|index| {
-                chunk
-                    .sections
-                    .read_column_into(index % 16, index / 16, &mut column);
-                let mut found_opening = !below_ceiling;
-                for (relative_y, state) in column.iter().enumerate().rev() {
-                    let solid = !state.is_air() && !state.get_block().config.liquid;
-                    if !solid {
-                        found_opening = true;
-                    } else if found_opening {
-                        return SurfaceColumn {
-                            height: (self.min_y + relative_y as i32) as i16,
+        let mut columns = [SurfaceColumn {
+            height: self.min_y as i16,
+            state: air,
+            exists: false,
+        }; 256];
+        let mut found_opening = [!below_ceiling; 256];
+        let mut resolved_count = 0usize;
+        for (section_index, section) in chunk.sections.sections.iter().enumerate().rev() {
+            let section = section.read();
+            let section_min_y = self.min_y + (section_index as i32) * 16;
+            if let PalettedContainer::Homogeneous(state) = &section.states {
+                let solid = !state.is_air() && !state.get_block().config.liquid;
+                if !solid {
+                    for (col, opening) in columns.iter().zip(found_opening.iter_mut()) {
+                        if !col.exists {
+                            *opening = true;
+                        }
+                    }
+                    continue;
+                }
+                let top_y = (section_min_y + 15) as i16;
+                for (col, &opening) in columns.iter_mut().zip(found_opening.iter()) {
+                    if !col.exists && opening {
+                        *col = SurfaceColumn {
+                            height: top_y,
                             state: *state,
                             exists: true,
                         };
+                        resolved_count += 1;
                     }
                 }
-                SurfaceColumn {
-                    height: self.min_y as i16,
-                    state: air,
-                    exists: false,
+                if resolved_count == 256 {
+                    break;
                 }
-            })
-            .collect()
+                continue;
+            }
+            for local_y in (0..16).rev() {
+                let y = (section_min_y + local_y as i32) as i16;
+                for local_z in 0..16 {
+                    for local_x in 0..16 {
+                        let idx = local_z * 16 + local_x;
+                        if columns[idx].exists {
+                            continue;
+                        }
+                        let state = section.states.get(local_x, local_y, local_z);
+                        let solid = !state.is_air() && !state.get_block().config.liquid;
+                        if !solid {
+                            found_opening[idx] = true;
+                        } else if found_opening[idx] {
+                            columns[idx] = SurfaceColumn {
+                                height: y,
+                                state,
+                                exists: true,
+                            };
+                            resolved_count += 1;
+                        }
+                    }
+                }
+                if resolved_count == 256 {
+                    break;
+                }
+            }
+            if resolved_count == 256 {
+                break;
+            }
+        }
+        Box::new(columns)
     }
 
     fn trim_caches(&mut self) {

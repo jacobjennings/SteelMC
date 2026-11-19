@@ -111,6 +111,8 @@ pub struct Chunk {
     full_runtime: OnceLock<Box<FullChunkRuntime>>,
     /// Generator-owned state retained only between generation stages.
     transient_generation_state: SyncMutex<TransientGenerationState>,
+    /// Cached per-chunk biome max quart Ys for feature decoration.
+    pub(crate) biome_max_quart_y: OnceLock<Arc<Box<[(u16, i16)]>>>,
 }
 
 enum PendingPromotionCommit {
@@ -152,6 +154,7 @@ impl Chunk {
             light: SyncRwLock::new(ChunkLightData::for_valid_world_height(min_y, height)),
             full_runtime: OnceLock::new(),
             transient_generation_state: SyncMutex::new(TransientGenerationState::default()),
+            biome_max_quart_y: OnceLock::new(),
         }
     }
 
@@ -213,6 +216,7 @@ impl Chunk {
             light: SyncRwLock::new(light),
             full_runtime: OnceLock::new(),
             transient_generation_state: SyncMutex::new(TransientGenerationState::default()),
+            biome_max_quart_y: OnceLock::new(),
         };
 
         if status >= ChunkStatus::InitializeLight {
@@ -256,25 +260,37 @@ impl Chunk {
             .map(|section| section.read().clone())
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let copy = Self::new(
-            Sections::from_owned(sections),
-            self.pos,
-            self.min_y,
-            self.height,
-            Weak::new(),
-        );
-        copy.heightmaps.write().clone_from(&self.heightmaps.read());
-        copy.structure_starts
-            .write()
-            .clone_from(&self.structure_starts.read());
-        copy.structure_references
-            .write()
-            .clone_from(&self.structure_references.read());
-        copy.postprocessing
-            .lock()
-            .clone_from(&self.postprocessing.lock());
-        copy.poi_tasks.lock().clone_from(&self.poi_tasks.lock());
-        copy
+        Self {
+            sections: Sections::from_owned(sections),
+            pos: self.pos,
+            dirty: AtomicBool::new(true),
+            heightmaps: SyncRwLock::new(self.heightmaps.read().clone()),
+            min_y: self.min_y,
+            height: self.height,
+            level: Weak::new(),
+            block_entities: BlockEntityStorage::new(),
+            entities: EntityStorage::new(),
+            structure_starts: SyncRwLock::new(self.structure_starts.read().clone()),
+            structure_references: SyncRwLock::new(self.structure_references.read().clone()),
+            postprocessing: SyncMutex::new(self.postprocessing.lock().clone()),
+            poi_tasks: SyncMutex::new(self.poi_tasks.lock().clone()),
+            scheduled_ticks: Arc::new(ChunkTickContainer::new_proto(ChunkTickLists::new(
+                BlockTickList::new_pending(),
+                FluidTickList::new_pending(),
+            ))),
+            sky_light_sources: SyncRwLock::new(ChunkSkyLightSources::for_valid_world_height(
+                0,
+                16,
+            )),
+            light: SyncRwLock::new(ChunkLightData::for_valid_world_height(0, 16)),
+            full_runtime: OnceLock::new(),
+            transient_generation_state: SyncMutex::new(TransientGenerationState::default()),
+            biome_max_quart_y: self
+                .biome_max_quart_y
+                .get()
+                .cloned()
+                .map_or_else(OnceLock::new, OnceLock::from),
+        }
     }
 
     /// Returns the stable section storage.

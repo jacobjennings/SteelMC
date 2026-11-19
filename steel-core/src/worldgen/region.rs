@@ -67,9 +67,12 @@ pub struct WorldGenRegion<'a> {
     cache: &'a dyn FeatureHolders,
     center: ChunkPos,
     chunk_cache_radius: i32,
-    chunks: RefCell<Box<[Option<CachedWorldGenChunk<'a>>]>>,
-    worldgen_heightmaps: RefCell<Box<[CachedWorldgenHeightmaps]>>,
+    near_chunks: RefCell<[Option<CachedWorldGenChunk<'a>>; 9]>,
+    far_chunks: RefCell<BulkSectionChunkMap<'a>>,
+    worldgen_heightmaps: RefCell<[CachedWorldgenHeightmaps; 9]>,
     random: RandomSource,
+    surface_cutoff_y: Option<i32>,
+    final_output_chunk: Option<ChunkPos>,
 }
 
 /// Size of 8 is fine here because analysis showed that 91.7% only ever reach <=2 and the largest one ever grew was 6.
@@ -95,6 +98,7 @@ pub(crate) struct WorldGenBulkSectionAccess<'region, 'world, 'profile> {
     ore_profile: Option<&'profile RefCell<OreFeatureStats>>,
 }
 
+#[derive(Clone, Copy)]
 struct CachedWorldGenChunk<'region> {
     holder: &'region ChunkHolder,
     chunk: &'region Chunk,
@@ -112,6 +116,13 @@ pub(crate) struct WorldGenChunkRef<'a> {
     holder: &'a ChunkHolder,
     chunk: &'a Chunk,
     access_mode: WorldGenAccessMode,
+}
+
+impl<'a> WorldGenChunkRef<'a> {
+    #[must_use]
+    pub(crate) const fn raw_chunk(self) -> &'a Chunk {
+        self.chunk
+    }
 }
 
 impl WorldGenChunkRef<'_> {
@@ -235,15 +246,24 @@ impl<'a> WorldGenRegion<'a> {
         center: ChunkPos,
         random: RandomSource,
     ) -> Self {
+        Self::with_holders_and_pruning(context, step, cache, center, random, None, None)
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "standalone replay passes optional pruning bounds alongside standard region inputs"
+    )]
+    pub(crate) fn with_holders_and_pruning(
+        context: &'a WorldGenContext,
+        step: &'a ChunkStep,
+        cache: &'a dyn FeatureHolders,
+        center: ChunkPos,
+        random: RandomSource,
+        surface_cutoff_y: Option<i32>,
+        final_output_chunk: Option<ChunkPos>,
+    ) -> Self {
         let chunk_cache_radius =
             i32::try_from(step.direct_dependencies.get_radius()).unwrap_or(i32::MAX);
-        let chunk_cache_size = chunk_cache_radius.saturating_mul(2).saturating_add(1);
-        let chunk_cache_len =
-            usize::try_from(chunk_cache_size.saturating_mul(chunk_cache_size)).unwrap_or(0);
-        let chunks = (0..chunk_cache_len).map(|_| None).collect();
-        let worldgen_heightmaps = (0..chunk_cache_len)
-            .map(|_| CachedWorldgenHeightmaps::default())
-            .collect();
 
         Self {
             context,
@@ -251,10 +271,38 @@ impl<'a> WorldGenRegion<'a> {
             cache,
             center,
             chunk_cache_radius,
-            chunks: RefCell::new(chunks),
-            worldgen_heightmaps: RefCell::new(worldgen_heightmaps),
+            near_chunks: RefCell::new([None; 9]),
+            far_chunks: RefCell::new(BulkSectionChunkMap::default()),
+            worldgen_heightmaps: RefCell::new(std::array::from_fn(|_| {
+                CachedWorldgenHeightmaps::default()
+            })),
             random,
+            surface_cutoff_y,
+            final_output_chunk,
         }
+    }
+
+    #[must_use]
+    pub(crate) const fn surface_cutoff_y(&self) -> Option<i32> {
+        self.surface_cutoff_y
+    }
+
+    #[must_use]
+    pub(crate) const fn final_output_chunk(&self) -> Option<ChunkPos> {
+        self.final_output_chunk
+    }
+
+    #[must_use]
+    pub(crate) const fn writable_block_xz_bounds(&self) -> Option<(i32, i32, i32, i32)> {
+        let radius = self.step.block_state_write_radius;
+        if radius < 0 {
+            return None;
+        }
+        let min_x = (self.center.0.x - radius) * 16;
+        let max_x = (self.center.0.x + radius) * 16 + 15;
+        let min_z = (self.center.0.y - radius) * 16;
+        let max_z = (self.center.0.y + radius) * 16 + 15;
+        Some((min_x, max_x, min_z, max_z))
     }
 
     /// Returns the center chunk being generated.
@@ -400,6 +448,23 @@ impl<'a> WorldGenRegion<'a> {
         chunk
     }
 
+    #[inline]
+    fn near_cache_index(&self, chunk_x: i32, chunk_z: i32) -> Option<usize> {
+        if self.chunk_cache_radius < 1 {
+            if self.chunk_cache_radius == 0 && chunk_x == self.center.0.x && chunk_z == self.center.0.y {
+                return Some(4);
+            }
+            return None;
+        }
+        let dx = chunk_x.wrapping_sub(self.center.0.x);
+        let dz = chunk_z.wrapping_sub(self.center.0.y);
+        if (-1..=1).contains(&dx) && (-1..=1).contains(&dz) {
+            Some(((dz + 1) * 3 + (dx + 1)) as usize)
+        } else {
+            None
+        }
+    }
+
     fn with_cached_chunk<R>(
         &self,
         chunk_x: i32,
@@ -407,56 +472,67 @@ impl<'a> WorldGenRegion<'a> {
         status: ChunkStatus,
         f: impl FnOnce(WorldGenChunkRef<'_>) -> R,
     ) -> R {
-        let Some(cache_index) = self.chunk_cache_index(chunk_x, chunk_z) else {
-            let chunk = self.chunk(chunk_x, chunk_z, status);
-            return f(chunk);
-        };
-
-        let cache_needs_update = self.chunks.borrow().get(cache_index).is_none_or(|cached| {
-            cached
-                .as_ref()
-                .is_none_or(|cached| status > cached.verified_status)
-        });
-
-        if cache_needs_update {
-            let chunk = self.chunk(chunk_x, chunk_z, status);
-            let mut chunks = self.chunks.borrow_mut();
-            let Some(slot) = chunks.get_mut(cache_index) else {
-                panic!("Worldgen region cache index {cache_index} escaped its storage");
+        if let Some(near_idx) = self.near_cache_index(chunk_x, chunk_z) {
+            let cached_val = {
+                let near = self.near_chunks.borrow();
+                near[near_idx].filter(|cached| status <= cached.verified_status)
             };
-            if let Some(cached) = slot {
-                cached.verified_status = status;
+            let entry = if let Some(cached) = cached_val {
+                cached
             } else {
-                *slot = Some(CachedWorldGenChunk {
+                let chunk = self.chunk(chunk_x, chunk_z, status);
+                let next = CachedWorldGenChunk {
                     access_mode: chunk.access_mode,
                     holder: chunk.holder,
                     chunk: chunk.chunk,
                     verified_status: status,
-                });
-            }
+                };
+                self.near_chunks.borrow_mut()[near_idx] = Some(next);
+                next
+            };
+            return f(WorldGenChunkRef {
+                holder: entry.holder,
+                chunk: entry.chunk,
+                access_mode: entry.access_mode,
+            });
         }
 
-        let chunks = self.chunks.borrow();
-        let Some(Some(cached)) = chunks.get(cache_index) else {
-            panic!("Worldgen region cache failed to store chunk ({chunk_x}, {chunk_z})");
+        let radius = self.chunk_cache_radius;
+        let dx = chunk_x.saturating_sub(self.center.0.x).saturating_abs();
+        let dz = chunk_z.saturating_sub(self.center.0.y).saturating_abs();
+        if dx > radius || dz > radius {
+            let chunk = self.chunk(chunk_x, chunk_z, status);
+            return f(chunk);
+        }
+
+        let key = ((i64::from(chunk_x)) << 32) | i64::from(chunk_z as u32);
+        let cached_val = {
+            let far = self.far_chunks.borrow();
+            far.get(&key).copied().filter(|cached| status <= cached.verified_status)
+        };
+        let entry = if let Some(cached) = cached_val {
+            cached
+        } else {
+            let chunk = self.chunk(chunk_x, chunk_z, status);
+            let next = CachedWorldGenChunk {
+                access_mode: chunk.access_mode,
+                holder: chunk.holder,
+                chunk: chunk.chunk,
+                verified_status: status,
+            };
+            self.far_chunks.borrow_mut().insert(key, next);
+            next
         };
         f(WorldGenChunkRef {
-            holder: cached.holder,
-            chunk: cached.chunk,
-            access_mode: cached.access_mode,
+            holder: entry.holder,
+            chunk: entry.chunk,
+            access_mode: entry.access_mode,
         })
     }
 
+    #[inline]
     fn chunk_cache_index(&self, chunk_x: i32, chunk_z: i32) -> Option<usize> {
-        let radius = self.chunk_cache_radius;
-        let size = radius.checked_mul(2)?.checked_add(1)?;
-        let rel_x = chunk_x.checked_sub(self.center.0.x)?.checked_add(radius)?;
-        let rel_z = chunk_z.checked_sub(self.center.0.y)?.checked_add(radius)?;
-        if rel_x < 0 || rel_x >= size || rel_z < 0 || rel_z >= size {
-            return None;
-        }
-
-        usize::try_from(rel_z.checked_mul(size)?.checked_add(rel_x)?).ok()
+        self.near_cache_index(chunk_x, chunk_z)
     }
 
     /// Gets a block state through the region dependency contract.
@@ -539,14 +615,15 @@ impl<'a> WorldGenRegion<'a> {
         else {
             return false;
         };
-        let changed_proto = self.with_cached_chunk(chunk_x, chunk_z, status, |chunk| {
+        let changed_worldgen_hm = self.with_cached_chunk(chunk_x, chunk_z, status, |chunk| {
             if !chunk.access_mode.allows_writes() {
                 // Vanilla exposes an already-Full dependency through
                 // `ImposterProtoChunk(false)`, whose block writes are no-ops.
                 return false;
             }
+            let published_status = chunk.published_status();
             let old_state = chunk.chunk.set_block_state_for_generation(
-                chunk.published_status(),
+                published_status,
                 pos,
                 state,
                 flags,
@@ -559,9 +636,9 @@ impl<'a> WorldGenRegion<'a> {
             } else if old_state.is_some_and(|old_state| old_state.has_block_entity()) {
                 chunk.chunk.remove_block_entity_if_state(pos, state);
             }
-            old_state.is_some()
+            old_state.is_some() && published_status < ChunkStatus::Terrain
         });
-        if changed_proto {
+        if changed_worldgen_hm {
             self.invalidate_cached_worldgen_heightmaps(chunk_x, chunk_z);
         }
         if !flags.contains(UpdateFlags::UPDATE_KNOWN_SHAPE)
@@ -1132,6 +1209,12 @@ impl<'region, 'world, 'profile> WorldGenBulkSectionAccess<'region, 'world, 'prof
                 }
             }
         } else {
+            if let crate::chunk::paletted_container::PalettedContainer::Homogeneous(single_state) =
+                &section_guard.states
+                && (0..16).all(|ly| replacement(*single_state, section_base_y + ly).is_none())
+            {
+                return 0;
+            }
             for &pos in positions {
                 let local_x = usize::from(pos.x());
                 let local_y = usize::from(pos.y());

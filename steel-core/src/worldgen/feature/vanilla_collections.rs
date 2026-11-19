@@ -4,7 +4,6 @@ use smallvec::SmallVec;
 
 use super::prelude::*;
 
-const INLINE_CAPACITY: usize = 32;
 const INITIAL_TABLE_CAPACITY: usize = 16;
 const LOAD_FACTOR_NUMERATOR: usize = 3;
 const LOAD_FACTOR_DENOMINATOR: usize = 4;
@@ -12,97 +11,147 @@ const TREEIFY_THRESHOLD: usize = 8;
 const UNTREEIFY_THRESHOLD: usize = 6;
 const MIN_TREEIFY_CAPACITY: usize = 64;
 
+#[derive(Default)]
+struct Bucket {
+    items: SmallVec<[BlockPos; 4]>,
+    tree: Option<Box<TreeBin>>,
+}
+
+impl Bucket {
+    fn treeify(&mut self, bucket: usize) {
+        let tree_bin = TreeBin::new(bucket, &self.items);
+        let root = tree_bin.root_position();
+        self.tree = Some(Box::new(tree_bin));
+        Self::move_root_to_front(&mut self.items, root);
+    }
+
+    fn move_root_to_front(items: &mut SmallVec<[BlockPos; 4]>, root: BlockPos) {
+        if let Some(root_index) = items.iter().position(|&entry| entry == root)
+            && root_index != 0
+        {
+            let pos = items.remove(root_index);
+            items.insert(0, pos);
+        }
+    }
+}
+
 /// Block-position set for feature code that vanilla models as `HashSet<BlockPos>`.
 ///
 /// This mirrors the target JDK 25 `HashMap` bucket, resize, and tree-bin behavior. Its iteration
 /// order affects feature RNG and leaf-distance propagation.
 #[derive(Default)]
 pub(super) struct JavaBlockPosSet {
-    entries: SmallVec<[BlockPos; INLINE_CAPACITY]>,
-    table_capacity: usize,
-    tree_bins: Vec<TreeBin>,
+    buckets: Vec<Bucket>,
+    len: usize,
+    first_non_empty: usize,
 }
 
 impl JavaBlockPosSet {
     pub(super) fn insert(&mut self, pos: BlockPos) -> bool {
-        if self.entries.contains(&pos) {
+        if self.buckets.is_empty() {
+            self.buckets.resize_with(INITIAL_TABLE_CAPACITY, Bucket::default);
+            self.first_non_empty = INITIAL_TABLE_CAPACITY;
+        }
+
+        let capacity = self.buckets.len();
+        let bucket = Self::bucket(pos, capacity);
+        if let Some(tree) = &self.buckets[bucket].tree {
+            if tree.find(pos).is_some() {
+                return false;
+            }
+        } else if self.buckets[bucket].items.contains(&pos) {
             return false;
         }
 
-        if self.table_capacity == 0 {
-            self.table_capacity = INITIAL_TABLE_CAPACITY;
+        self.len += 1;
+        if bucket < self.first_non_empty {
+            self.first_non_empty = bucket;
         }
 
-        let bucket = Self::bucket(pos, self.table_capacity);
-        if let Some(tree_bin_index) = self.tree_bins.iter().position(|bin| bin.bucket == bucket) {
-            let (parent, root) = self.tree_bins[tree_bin_index].insert(pos);
-            let Some(parent_index) = self.entries.iter().position(|&entry| entry == parent) else {
+        if let Some(tree) = &mut self.buckets[bucket].tree {
+            let (parent, root) = tree.insert(pos);
+            let items = &mut self.buckets[bucket].items;
+            let Some(parent_index) = items.iter().position(|&entry| entry == parent) else {
                 unreachable!("tree-bin parent must be present in the iteration order");
             };
-            self.entries.insert(parent_index + 1, pos);
-            self.move_position_to_bucket_front(root, bucket);
+            items.insert(parent_index + 1, pos);
+            Bucket::move_root_to_front(items, root);
         } else {
-            let insert_at = self
-                .entries
-                .iter()
-                .position(|&entry| Self::bucket(entry, self.table_capacity) > bucket)
-                .unwrap_or(self.entries.len());
-            self.entries.insert(insert_at, pos);
-
-            let bucket_len = self
-                .entries
-                .iter()
-                .filter(|&&entry| Self::bucket(entry, self.table_capacity) == bucket)
-                .count();
-            if bucket_len > TREEIFY_THRESHOLD {
-                if self.table_capacity < MIN_TREEIFY_CAPACITY {
+            self.buckets[bucket].items.push(pos);
+            if self.buckets[bucket].items.len() > TREEIFY_THRESHOLD {
+                if capacity < MIN_TREEIFY_CAPACITY {
                     self.resize();
                 } else {
-                    self.treeify_bin(bucket);
+                    self.buckets[bucket].treeify(bucket);
                 }
             }
         }
-        if self.entries.len()
-            > self.table_capacity * LOAD_FACTOR_NUMERATOR / LOAD_FACTOR_DENOMINATOR
-        {
+
+        if self.len > self.buckets.len() * LOAD_FACTOR_NUMERATOR / LOAD_FACTOR_DENOMINATOR {
             self.resize();
         }
         true
     }
 
     pub(super) fn contains(&self, pos: BlockPos) -> bool {
-        self.entries.contains(&pos)
+        if self.len == 0 {
+            return false;
+        }
+        let bucket = Self::bucket(pos, self.buckets.len());
+        let slot = &self.buckets[bucket];
+        if let Some(tree) = &slot.tree {
+            tree.find(pos).is_some()
+        } else {
+            slot.items.contains(&pos)
+        }
     }
 
-    pub(super) fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+    pub(super) const fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     pub(super) fn java_order(&self) -> impl Iterator<Item = &BlockPos> {
-        self.entries.iter()
+        self.buckets.iter().flat_map(|bucket| bucket.items.iter())
     }
 
     pub(super) fn java_ordered_positions(&self) -> Vec<BlockPos> {
-        self.entries.to_vec()
+        let mut out = Vec::with_capacity(self.len);
+        for bucket in &self.buckets {
+            out.extend_from_slice(&bucket.items);
+        }
+        out
+    }
+
+    pub(super) fn reset_to_initial_capacity(&mut self) {
+        if self.buckets.len() > INITIAL_TABLE_CAPACITY {
+            self.buckets.truncate(INITIAL_TABLE_CAPACITY);
+        }
+        for bucket in &mut self.buckets {
+            bucket.items.clear();
+            bucket.tree = None;
+        }
+        self.len = 0;
+        self.first_non_empty = self.buckets.len();
     }
 
     pub(super) fn pop_java_ordered_position(&mut self) -> Option<BlockPos> {
-        if self.entries.is_empty() {
+        if self.len == 0 {
             return None;
         }
-
-        let pos = self.entries.remove(0);
-        let bucket = Self::bucket(pos, self.table_capacity);
-        if let Some(tree_bin_index) = self.tree_bins.iter().position(|bin| bin.bucket == bucket) {
-            if self
-                .entries
-                .iter()
-                .any(|&entry| Self::bucket(entry, self.table_capacity) == bucket)
-            {
-                self.tree_bins[tree_bin_index].remove(pos);
-            } else {
-                self.tree_bins.remove(tree_bin_index);
-            }
+        while self.first_non_empty < self.buckets.len()
+            && self.buckets[self.first_non_empty].items.is_empty()
+        {
+            self.first_non_empty += 1;
+        }
+        let bucket = self.first_non_empty;
+        let slot = &mut self.buckets[bucket];
+        let pos = slot.items.remove(0);
+        self.len -= 1;
+        if slot.items.is_empty() {
+            slot.tree = None;
+            self.first_non_empty += 1;
+        } else if let Some(tree) = &mut slot.tree {
+            tree.remove(pos);
         }
         Some(pos)
     }
@@ -122,80 +171,69 @@ impl JavaBlockPosSet {
     }
 
     fn resize(&mut self) {
-        let old_capacity = self.table_capacity;
-        self.table_capacity *= 2;
-        let table_capacity = self.table_capacity;
-        self.entries
-            .sort_by_key(|&entry| Self::bucket(entry, table_capacity));
+        let old_capacity = self.buckets.len();
+        let new_capacity = old_capacity * 2;
+        let old_buckets = mem::take(&mut self.buckets);
+        self.buckets.resize_with(new_capacity, Bucket::default);
+        self.first_non_empty = new_capacity;
 
-        let old_tree_bins = mem::take(&mut self.tree_bins);
-        for mut tree_bin in old_tree_bins {
-            let low = self
-                .entries
-                .iter()
-                .copied()
-                .filter(|&entry| Self::bucket(entry, table_capacity) == tree_bin.bucket)
-                .collect::<SmallVec<[BlockPos; INLINE_CAPACITY]>>();
-            let high_bucket = tree_bin.bucket + old_capacity;
-            let high = self
-                .entries
-                .iter()
-                .copied()
-                .filter(|&entry| Self::bucket(entry, table_capacity) == high_bucket)
-                .collect::<SmallVec<[BlockPos; INLINE_CAPACITY]>>();
-
-            if low.is_empty() || high.is_empty() {
-                tree_bin.bucket = if low.is_empty() {
-                    high_bucket
-                } else {
-                    tree_bin.bucket
-                };
-                self.tree_bins.push(tree_bin);
+        for (low_bucket, old_bucket) in old_buckets.into_iter().enumerate() {
+            if old_bucket.items.is_empty() {
                 continue;
             }
+            let high_bucket = low_bucket + old_capacity;
+            let mut low_items = SmallVec::<[BlockPos; 4]>::new();
+            let mut high_items = SmallVec::<[BlockPos; 4]>::new();
+            for pos in old_bucket.items {
+                if Self::bucket(pos, new_capacity) == low_bucket {
+                    low_items.push(pos);
+                } else {
+                    high_items.push(pos);
+                }
+            }
+            if !low_items.is_empty() {
+                self.first_non_empty = self.first_non_empty.min(low_bucket);
+            }
+            if !high_items.is_empty() {
+                self.first_non_empty = self.first_non_empty.min(high_bucket);
+            }
 
-            self.retreeify_split_bin(tree_bin.bucket, &low);
-            self.retreeify_split_bin(high_bucket, &high);
-        }
-    }
+            if let Some(mut tree_bin) = old_bucket.tree {
+                if low_items.is_empty() {
+                    tree_bin.bucket = high_bucket;
+                    self.buckets[high_bucket] = Bucket {
+                        items: high_items,
+                        tree: Some(tree_bin),
+                    };
+                } else if high_items.is_empty() {
+                    tree_bin.bucket = low_bucket;
+                    self.buckets[low_bucket] = Bucket {
+                        items: low_items,
+                        tree: Some(tree_bin),
+                    };
+                } else {
+                    let mut low_slot = Bucket {
+                        items: low_items,
+                        tree: None,
+                    };
+                    if low_slot.items.len() > UNTREEIFY_THRESHOLD {
+                        low_slot.treeify(low_bucket);
+                    }
+                    self.buckets[low_bucket] = low_slot;
 
-    fn treeify_bin(&mut self, bucket: usize) {
-        let positions = self
-            .entries
-            .iter()
-            .copied()
-            .filter(|&entry| Self::bucket(entry, self.table_capacity) == bucket)
-            .collect::<SmallVec<[BlockPos; INLINE_CAPACITY]>>();
-        let tree_bin = TreeBin::new(bucket, &positions);
-        let root = tree_bin.root_position();
-        self.tree_bins.push(tree_bin);
-        self.move_position_to_bucket_front(root, bucket);
-    }
-
-    fn retreeify_split_bin(&mut self, bucket: usize, positions: &[BlockPos]) {
-        if positions.len() <= UNTREEIFY_THRESHOLD {
-            return;
-        }
-        let tree_bin = TreeBin::new(bucket, positions);
-        let root = tree_bin.root_position();
-        self.tree_bins.push(tree_bin);
-        self.move_position_to_bucket_front(root, bucket);
-    }
-
-    fn move_position_to_bucket_front(&mut self, pos: BlockPos, bucket: usize) {
-        let Some(root_index) = self.entries.iter().position(|&entry| entry == pos) else {
-            return;
-        };
-        let Some(bucket_start) = self
-            .entries
-            .iter()
-            .position(|&entry| Self::bucket(entry, self.table_capacity) == bucket)
-        else {
-            return;
-        };
-        if root_index != bucket_start {
-            let pos = self.entries.remove(root_index);
-            self.entries.insert(bucket_start, pos);
+                    let mut high_slot = Bucket {
+                        items: high_items,
+                        tree: None,
+                    };
+                    if high_slot.items.len() > UNTREEIFY_THRESHOLD {
+                        high_slot.treeify(high_bucket);
+                    }
+                    self.buckets[high_bucket] = high_slot;
+                }
+            } else {
+                self.buckets[low_bucket].items = low_items;
+                self.buckets[high_bucket].items = high_items;
+            }
         }
     }
 }

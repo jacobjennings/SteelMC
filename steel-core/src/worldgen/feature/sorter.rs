@@ -16,7 +16,7 @@ pub(super) struct FeatureSorter {
 pub(super) struct FeatureStepData {
     features: Box<[PlacedFeatureEntryRef]>,
     index_by_placed_feature_id: FxHashMap<usize, usize>,
-    feature_indices_by_biome_id: FxHashMap<usize, Box<[usize]>>,
+    feature_indices_by_biome_id: Vec<Option<Box<[usize]>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -187,7 +187,7 @@ impl FeatureSorter {
             steps.push(FeatureStepData {
                 features: features.into_boxed_slice(),
                 index_by_placed_feature_id,
-                feature_indices_by_biome_id: FxHashMap::default(),
+                feature_indices_by_biome_id: Vec::new(),
             });
         }
 
@@ -225,9 +225,12 @@ impl FeatureSorter {
 
                 indices.sort_unstable();
                 indices.dedup();
-                step_data
-                    .feature_indices_by_biome_id
-                    .insert(biome_id, indices.into_boxed_slice());
+                if step_data.feature_indices_by_biome_id.len() <= biome_id {
+                    step_data
+                        .feature_indices_by_biome_id
+                        .resize_with(biome_id + 1, || None);
+                }
+                step_data.feature_indices_by_biome_id[biome_id] = Some(indices.into_boxed_slice());
             }
         }
 
@@ -248,9 +251,13 @@ impl FeatureStepData {
         self.features.get(index).copied()
     }
 
+    pub(super) const fn len(&self) -> usize {
+        self.features.len()
+    }
+
     pub(super) fn feature_indices_for_biome(&self, biome_id: usize) -> Option<&[usize]> {
         self.feature_indices_by_biome_id
-            .get(&biome_id)
-            .map(Box::as_ref)
+            .get(biome_id)
+            .and_then(Option::as_deref)
     }
 }

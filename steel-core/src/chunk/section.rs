@@ -333,12 +333,40 @@ impl Sections {
     /// Visits every biome palette value in section order while holding each
     /// section's read lock once.
     pub fn for_each_biome_id(&self, mut visitor: impl FnMut(u16)) {
-        for holder in &self.sections {
+        self.for_each_biome_id_with_quart_y(|_, _, biome_id| visitor(biome_id));
+    }
+
+    /// Visits biome palette values along with their `(section_index, local_quart_y)`.
+    ///
+    /// For homogeneous sections `local_quart_y` is reported as `3` (the top of
+    /// the section), which bounds the highest quart where that biome occurs.
+    pub(crate) fn for_each_biome_id_with_quart_y(
+        &self,
+        mut visitor: impl FnMut(usize, usize, u16),
+    ) {
+        use crate::chunk::paletted_container::PalettedContainer;
+        for (section_index, holder) in self.sections.iter().enumerate() {
             let guard = holder.read();
-            for qy in 0..4 {
-                for qz in 0..4 {
-                    for qx in 0..4 {
-                        visitor(guard.biomes.get(qx, qy, qz));
+            match &guard.biomes {
+                PalettedContainer::Homogeneous(biome_id) => {
+                    visitor(section_index, 3, *biome_id);
+                }
+                PalettedContainer::Heterogeneous(hetero) => {
+                    for (qy, layer) in hetero.cube.iter().enumerate() {
+                        for row in layer {
+                            for &biome_id in row {
+                                visitor(section_index, qy, biome_id);
+                            }
+                        }
+                    }
+                }
+                PalettedContainer::Building(_) => {
+                    for qy in 0..4 {
+                        for qz in 0..4 {
+                            for qx in 0..4 {
+                                visitor(section_index, qy, guard.biomes.get(qx, qy, qz));
+                            }
+                        }
                     }
                 }
             }
@@ -762,6 +790,11 @@ impl ChunkSection {
         z: usize,
         new_state: BlockStateId,
     ) -> BlockStateId {
+        if let BlockPalette::Homogeneous(original) = self.states
+            && original == new_state
+        {
+            return original;
+        }
         self.states.enter_building_mode();
         self.states.set(x, y, z, new_state)
     }

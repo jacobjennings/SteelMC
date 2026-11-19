@@ -60,29 +60,42 @@ impl FeatureDecorationRunner {
             }
         }
 
-        let mut placement = TreePlacement::default();
-        let placed = Self::do_place_tree(region, registry, random, config, origin, &mut placement);
-        if !placed || (placement.trunks.is_empty() && placement.foliage.is_empty()) {
-            return false;
+        thread_local! {
+            static TREE_PLACEMENT_SCRATCH: RefCell<TreePlacement> = RefCell::new(TreePlacement::default());
         }
+        TREE_PLACEMENT_SCRATCH.with(|cell| {
+            let mut borrowed = cell.try_borrow_mut();
+            let mut fallback;
+            let placement = if let Ok(scratch) = borrowed.as_deref_mut() {
+                scratch.reset();
+                scratch
+            } else {
+                fallback = TreePlacement::default();
+                &mut fallback
+            };
+            let placed = Self::do_place_tree(region, registry, random, config, origin, placement);
+            if !placed || (placement.trunks.is_empty() && placement.foliage.is_empty()) {
+                return false;
+            }
 
-        if !config.decorators.is_empty() {
-            Self::place_tree_decorators(
-                region,
-                registry,
-                random,
-                &config.decorators,
-                &mut placement,
-                biome_zoom_seed,
-                place_nested,
-            );
-        }
+            if !config.decorators.is_empty() {
+                Self::place_tree_decorators(
+                    region,
+                    registry,
+                    random,
+                    &config.decorators,
+                    placement,
+                    biome_zoom_seed,
+                    place_nested,
+                );
+            }
 
-        let Some(bounds) = TreeBounds::from_placement(&placement) else {
-            return false;
-        };
-        Self::update_tree_leaves(region, bounds, &placement);
-        true
+            let Some(bounds) = TreeBounds::from_placement(placement) else {
+                return false;
+            };
+            Self::update_tree_leaves(region, bounds, placement);
+            true
+        })
     }
 
     fn do_place_tree(
@@ -420,6 +433,13 @@ impl TreePlacement {
     ) {
         self.decorations.insert(pos);
         FeatureDecorationRunner::set_tree_block(region, pos, state);
+    }
+
+    fn reset(&mut self) {
+        self.trunks.reset_to_initial_capacity();
+        self.foliage.reset_to_initial_capacity();
+        self.decorations.reset_to_initial_capacity();
+        self.roots.reset_to_initial_capacity();
     }
 }
 

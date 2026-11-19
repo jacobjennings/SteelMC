@@ -4,6 +4,7 @@ use std::{
     hash::Hash,
     io::{Result, Write},
     mem, slice,
+    sync::Arc,
 };
 
 use steel_registry::blocks::block_state_ext::BlockStateExt;
@@ -33,7 +34,7 @@ type Cube<T, const DIM: usize> = [[[T; DIM]; DIM]; DIM];
 /// A heterogeneous palette container.
 #[derive(Debug, Clone)]
 pub struct HeterogeneousPalette<V: Hash + Eq + Copy, const DIM: usize> {
-    pub(crate) cube: Box<Cube<V, DIM>>,
+    pub(crate) cube: Arc<Cube<V, DIM>>,
     // Keeps track of how many different times each value appears in the cube. (value, count)
     pub(crate) palette: Vec<(V, u16)>,
 }
@@ -86,7 +87,7 @@ impl<V: Hash + Eq + Copy, const DIM: usize> HeterogeneousPalette<V, DIM> {
             }
         }
 
-        self.cube[y][z][x] = value;
+        Arc::make_mut(&mut self.cube)[y][z][x] = value;
 
         old_value
     }
@@ -104,11 +105,11 @@ pub enum PalettedContainer<V: Hash + Eq + Copy + Default, const DIM: usize> {
     /// A homogeneous container, where all values are the same.
     Homogeneous(V),
     /// A heterogeneous container, where values can be different.
-    Heterogeneous(HeterogeneousPalette<V, DIM>),
+    Heterogeneous(Arc<HeterogeneousPalette<V, DIM>>),
     /// Write-only build mode: raw cube without palette tracking.
     /// `set` is a single store; `get` is a direct read.
     /// Convert back via [`Self::finalize_building`].
-    Building(Box<Cube<V, DIM>>),
+    Building(Arc<Cube<V, DIM>>),
 }
 
 enum PaletteMode {
@@ -133,13 +134,18 @@ impl<V: Hash + Eq + Copy + Default + Debug, const DIM: usize> PalettedContainer<
     /// to a single palette increment.
     #[must_use]
     pub fn from_cube(cube: Box<Cube<V, DIM>>) -> Self {
+        Self::from_arc_cube(Arc::from(cube))
+    }
+
+    #[must_use]
+    fn from_arc_cube(cube: Arc<Cube<V, DIM>>) -> Self {
         let mut palette: Vec<(V, u16)> = Vec::new();
         let total = DIM * DIM * DIM;
         // SAFETY: `[[[V; DIM]; DIM]; DIM]` is a fully-contiguous array of
         // `DIM*DIM*DIM` `V`s, so casting its base pointer to `*const V` and
-        // building a slice of that length is sound. `cube` is a live `Box`, so
+        // building a slice of that length is sound. `cube` is a live `Arc`, so
         // the pointer is valid for the lifetime of the slice.
-        let flat: &[V] = unsafe { slice::from_raw_parts(cube.as_ptr().cast::<V>(), total) };
+        let flat: &[V] = unsafe { slice::from_raw_parts((*cube).as_ptr().cast::<V>(), total) };
 
         let mut i = 0;
         while i < total {
@@ -160,8 +166,24 @@ impl<V: Hash + Eq + Copy + Default + Debug, const DIM: usize> PalettedContainer<
         if palette.len() == 1 {
             Self::Homogeneous(palette[0].0)
         } else {
-            Self::Heterogeneous(HeterogeneousPalette { cube, palette })
+            Self::Heterogeneous(Arc::new(HeterogeneousPalette { cube, palette }))
         }
+    }
+
+    /// Returns true if both containers are backed by the exact same shared cube or homogeneous value.
+    #[must_use]
+    pub fn same_cube_or_value(&self, other: &Self) -> bool {
+        let cube_a = match self {
+            Self::Homogeneous(a) => return matches!(other, Self::Homogeneous(b) if a == b),
+            Self::Heterogeneous(a) => &a.cube,
+            Self::Building(a) => a,
+        };
+        let cube_b = match other {
+            Self::Homogeneous(_) => return false,
+            Self::Heterogeneous(b) => &b.cube,
+            Self::Building(b) => b,
+        };
+        Arc::ptr_eq(cube_a, cube_b)
     }
 
     /// Gets the value at the given coordinates.
@@ -259,14 +281,18 @@ impl<V: Hash + Eq + Copy + Default + Debug, const DIM: usize> PalettedContainer<
             Self::Building(_) => {}
             Self::Homogeneous(value) => {
                 let cube: Box<Cube<V, DIM>> = Box::new([[[*value; DIM]; DIM]; DIM]);
-                *self = Self::Building(cube);
+                *self = Self::Building(Arc::from(cube));
             }
             Self::Heterogeneous(_) => {
                 let taken = mem::replace(self, Self::Homogeneous(V::default()));
                 let Self::Heterogeneous(data) = taken else {
                     unreachable!()
                 };
-                *self = Self::Building(data.cube);
+                let cube = match Arc::try_unwrap(data) {
+                    Ok(owned) => owned.cube,
+                    Err(shared) => Arc::clone(&shared.cube),
+                };
+                *self = Self::Building(cube);
             }
         }
     }
@@ -280,8 +306,9 @@ impl<V: Hash + Eq + Copy + Default + Debug, const DIM: usize> PalettedContainer<
     #[inline]
     pub fn as_building_slice_mut(&mut self) -> Option<&mut [V]> {
         if let Self::Building(cube) = self {
+            let cube = Arc::make_mut(cube);
             // SAFETY: `[[[V; DIM]; DIM]; DIM]` is a contiguous array of
-            // `DIM*DIM*DIM` `V`s; the cast preserves the live `&mut Box`'s
+            // `DIM*DIM*DIM` `V`s; the cast preserves the live `&mut Cube`'s
             // borrow because the returned slice cannot outlive `self`.
             Some(unsafe {
                 slice::from_raw_parts_mut(cube.as_mut_ptr().cast::<V>(), DIM * DIM * DIM)
@@ -302,7 +329,7 @@ impl<V: Hash + Eq + Copy + Default + Debug, const DIM: usize> PalettedContainer<
         let Self::Building(cube) = taken else {
             unreachable!()
         };
-        *self = Self::from_cube(cube);
+        *self = Self::from_arc_cube(cube);
     }
 
     /// Sets the value at the given coordinates.
@@ -322,15 +349,22 @@ impl<V: Hash + Eq + Copy + Default + Debug, const DIM: usize> PalettedContainer<
                 original
             }
             Self::Heterogeneous(data) => {
-                let original = data.set(x, y, z, value);
-                if data.palette.len() == 1 {
-                    *self = Self::Homogeneous(data.palette[0].0);
+                let current = data.get(x, y, z);
+                if current == value {
+                    return current;
+                }
+                let data_mut = Arc::make_mut(data);
+                let original = data_mut.set(x, y, z, value);
+                if data_mut.palette.len() == 1 {
+                    *self = Self::Homogeneous(data_mut.palette[0].0);
                 }
                 original
             }
             Self::Building(cube) => {
                 let old = cube[y][z][x];
-                cube[y][z][x] = value;
+                if old != value {
+                    Arc::make_mut(cube)[y][z][x] = value;
+                }
                 old
             }
         }
@@ -479,7 +513,7 @@ impl BlockPalette {
             }
             Self::Building(cube) => {
                 let mut count: u16 = 0;
-                for slab in cube {
+                for slab in &**cube {
                     for row in slab {
                         for v in row {
                             if v.0 != 0 {
