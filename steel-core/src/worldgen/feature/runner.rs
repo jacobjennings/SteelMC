@@ -211,14 +211,7 @@ impl FeatureDecorationRunner {
         let mut seen = vec![false; self.source_biome_lookup.len()];
         for z in center.0.y - 1..=center.0.y + 1 {
             for x in center.0.x - 1..=center.0.x + 1 {
-                let chunk = region.chunk(x, z, ChunkStatus::Biomes);
-                let ids = chunk.raw_chunk().decoration_biomes.get_or_init(|| {
-                    let mut ids = FxHashSet::default();
-                    chunk.sections().for_each_biome_id(|id| {
-                        ids.insert(id);
-                    });
-                    ids.into_iter().collect()
-                });
+                let ids = region.decoration_biomes(x, z);
                 for &id in ids.iter() {
                     let index = usize::from(id);
                     if self.source_biome_lookup.get(index) == Some(&true) {

@@ -5,8 +5,8 @@
 //! reads cached fixed output-chunk replays. Each miss decorates nine sources
 //! over fresh Terrain copies in x-then-z order, independent of request history.
 
-use std::cell::OnceCell;
-use std::mem::size_of;
+use std::cell::{OnceCell, RefCell};
+use std::mem::{size_of, size_of_val};
 use std::sync::{Arc, Weak};
 
 use glam::IVec3;
@@ -316,6 +316,7 @@ struct SurfaceColumn {
 struct StartsEntry {
     starts: StructureStartMap,
     biomes: Option<Box<[BiomePalette]>>,
+    decoration_biomes: Option<Arc<[u16]>>,
     last_used: u64,
 }
 
@@ -388,7 +389,7 @@ pub struct StandaloneWorldgen {
 /// within the replay in their original order. No feature write reaches the
 /// retained carved terrain or a different output chunk's replay.
 struct ReplayHolders<'a> {
-    world: &'a StandaloneWorldgen,
+    world: RefCell<&'a mut StandaloneWorldgen>,
     min: (i32, i32),
     width: usize,
     cells: Vec<OnceCell<Arc<ChunkHolder>>>,
@@ -402,35 +403,31 @@ impl ReplayHolders<'_> {
         let row = usize::try_from(z - self.min.1).expect("feature dependency north of window");
         assert!(col < self.width, "feature dependency east of window");
         self.cells[row * self.width + col].get_or_init(|| {
+            let mut world = self.world.borrow_mut();
             let pos = ChunkPos::new(x, z);
-            let make_holder = || {
-                Arc::new(ChunkHolder::new(
-                    pos,
-                    ChunkTicketLevel::STRONGEST,
-                    None,
-                    self.world.min_y,
-                    self.world.height,
-                ))
-            };
+            let holder = Arc::new(ChunkHolder::new(
+                pos,
+                ChunkTicketLevel::STRONGEST,
+                None,
+                world.min_y,
+                world.height,
+            ));
             if (self.terrain_min.0..=self.terrain_max.0).contains(&x)
                 && (self.terrain_min.1..=self.terrain_max.1).contains(&z)
             {
-                let holder = make_holder();
-                let chunk = self.world.carved_chunk((x, z));
+                world.ensure_terrain((x, z), true);
+                let chunk = world.carved_chunk((x, z));
                 holder.insert_chunk(chunk.clone_generation_state(), ChunkStatus::Terrain);
-                holder
-            } else if let Some(entry) = self.world.starts.get(&(x, z)) {
-                let holder = make_holder();
-                let chunk = self.world.empty_chunk(pos);
-                chunk.structure_starts_mut().clone_from(&entry.starts);
-                holder.insert_chunk(chunk, ChunkStatus::StructureStarts);
-                holder
             } else {
-                let holder = make_holder();
-                let chunk = self.world.empty_chunk(pos);
+                // A structure reference may reach beyond the lazily built terrain.
+                world.ensure_starts((x, z));
+                let chunk = world.empty_chunk(pos);
+                chunk
+                    .structure_starts_mut()
+                    .clone_from(&world.starts[&(x, z)].starts);
                 holder.insert_chunk(chunk, ChunkStatus::StructureStarts);
-                holder
             }
+            holder
         })
     }
 }
@@ -439,9 +436,57 @@ impl FeatureHolders for ReplayHolders<'_> {
     fn holder(&self, x: i32, z: i32) -> &ChunkHolder {
         self.owned_holder(x, z)
     }
+
+    fn decoration_biomes(&self, x: i32, z: i32) -> Option<Arc<[u16]>> {
+        let mut world = self.world.borrow_mut();
+        let key = (x, z);
+        if let Some(ids) = world
+            .starts
+            .get(&key)
+            .and_then(|e| e.decoration_biomes.as_ref())
+        {
+            return Some(Arc::clone(ids));
+        }
+        world.ensure_biomes(key);
+        let entry = world.starts.get_mut(&key)?;
+        let palettes = entry.biomes.as_ref()?;
+        let mut ids = rustc_hash::FxHashSet::default();
+        for palette in palettes {
+            match palette {
+                PalettedContainer::Homogeneous(id) => {
+                    ids.insert(*id);
+                }
+                PalettedContainer::Heterogeneous(data) => {
+                    ids.extend(data.palette.iter().map(|&(id, _)| id));
+                }
+                PalettedContainer::Building(cube) => {
+                    ids.extend(cube.iter().flatten().flatten().copied());
+                }
+            }
+        }
+        let ids: Arc<[u16]> = ids.into_iter().collect();
+        entry.decoration_biomes = Some(Arc::clone(&ids));
+        Some(ids)
+    }
 }
 
 impl StandaloneWorldgen {
+    /// Retained biome ID sets and their payload, measured at a tile boundary.
+    #[must_use]
+    pub fn replay_biome_cache_stats(&self) -> (usize, usize, usize) {
+        let mut sets = 0;
+        let mut bytes = 0;
+        for ids in self
+            .starts
+            .values()
+            .filter_map(|entry| entry.decoration_biomes.as_ref())
+        {
+            sets += 1;
+            bytes += size_of_val(ids.as_ref());
+        }
+        (self.starts.capacity(), sets, bytes)
+    }
+
     /// Selects the surface-only material scan for future Overworld Coarse misses.
     /// Full upgrades always regenerate complete material columns.
     pub fn set_bounded_coarse_surface(&mut self, enabled: bool) {
@@ -1168,16 +1213,18 @@ impl StandaloneWorldgen {
         );
         let terrain_min = (source_min.0 - 1, source_min.1 - 1);
         let terrain_max = (source_max.0 + 1, source_max.1 + 1);
-        for chunk_x in terrain_min.0..=terrain_max.0 {
-            for chunk_z in terrain_min.1..=terrain_max.1 {
-                self.ensure_terrain((chunk_x, chunk_z), true);
-            }
-        }
+        // The replay owns its mutable holders. A biome-set query can use the
+        // immutable Biomes stage without creating a carved chunk or a holder.
+        let terrain_clocks = |s: &StandaloneStats| s.starts_nanos + s.biomes_nanos + s.terrain_nanos;
+        let prior_terrain_time = terrain_clocks(&self.stats);
+        let generator = Arc::clone(&self.generator);
+        let context = Arc::clone(&self.context);
+        let seed = self.seed;
         let clock = StageClock::start();
         let width = (source_max.0 - source_min.0 + 1 + 2 * STRUCTURE_RADIUS) as usize;
         let height = (source_max.1 - source_min.1 + 1 + 2 * STRUCTURE_RADIUS) as usize;
         let holders = ReplayHolders {
-            world: self,
+            world: RefCell::new(self),
             min: (
                 source_min.0 - STRUCTURE_RADIUS,
                 source_min.1 - STRUCTURE_RADIUS,
@@ -1195,19 +1242,17 @@ impl StandaloneWorldgen {
             for chunk_z in source_min.1..=source_max.1 {
                 let _ = holders.holder(chunk_x, chunk_z);
                 let center = ChunkPos::new(chunk_x, chunk_z);
-                let region_random = self
-                    .generator
-                    .create_worldgen_region_random(self.seed, center);
+                let region_random = generator.create_worldgen_region_random(seed, center);
                 // Later features can read earlier underground and neighbour writes.
                 // Apply the output height filter only when collecting changed blocks.
                 let mut region = WorldGenRegion::with_holders(
-                    &self.context,
+                    &context,
                     feature_step,
                     &holders,
                     center,
                     region_random,
                 );
-                self.generator.apply_biome_decorations(&mut region);
+                generator.apply_biome_decorations(&mut region);
                 replays += 1;
             }
         }
@@ -1218,7 +1263,8 @@ impl StandaloneWorldgen {
             }
         }
         self.stats.holders_nanos += holder_setup;
-        self.stats.features_nanos += clock.nanos();
+        let nested = terrain_clocks(&self.stats) - prior_terrain_time;
+        self.stats.features_nanos += clock.nanos().saturating_sub(nested);
         self.stats.feature_regions += replays;
         Arc::new(output)
     }
@@ -1348,6 +1394,7 @@ impl StandaloneWorldgen {
             StartsEntry {
                 starts,
                 biomes: None,
+                decoration_biomes: None,
                 last_used: now,
             },
         );
@@ -1374,6 +1421,7 @@ impl StandaloneWorldgen {
                 StartsEntry {
                     starts: starts.clone(),
                     biomes: None,
+                    decoration_biomes: None,
                     last_used: now,
                 },
             );

@@ -311,6 +311,13 @@ impl SteelWorldgen {
         ]
     }
 
+    /// Retained starts table capacity, biome ID sets and ID payload bytes.
+    #[must_use]
+    pub fn replay_biome_cache_stats(&self) -> Vec<u32> {
+        let (capacity, sets, bytes) = self.inner.worldgen.replay_biome_cache_stats();
+        vec![capacity as u32, sets as u32, bytes as u32]
+    }
+
     /// Resets retained-work and cache-hit counters without clearing chunk caches.
     pub fn reset_cache_stats(&mut self) {
         self.inner.reset_stats();

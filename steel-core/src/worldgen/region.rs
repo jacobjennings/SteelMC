@@ -47,6 +47,11 @@ use crate::worldgen::generator::context::WorldGenContext;
 /// both the status and distance before consulting the source.
 pub(crate) trait FeatureHolders {
     fn holder(&self, x: i32, z: i32) -> &ChunkHolder;
+
+    /// Standalone Features keeps the original biome palettes through Terrain.
+    fn decoration_biomes(&self, _x: i32, _z: i32) -> Option<Arc<[u16]>> {
+        None
+    }
 }
 
 impl FeatureHolders for StaticCache2D<Arc<ChunkHolder>> {
@@ -260,6 +265,26 @@ impl<'a> WorldGenRegion<'a> {
             })),
             random,
         }
+    }
+
+    /// Visit the IDs used for feature selection. Only a Biomes dependency
+    /// may take the standalone shortcut. Other holders use their live chunk.
+    pub(crate) fn decoration_biomes(&self, x: i32, z: i32) -> Arc<[u16]> {
+        if self
+            .required_status_at(x, z)
+            .is_some_and(|status| status >= ChunkStatus::Biomes)
+            && let Some(ids) = self.cache.decoration_biomes(x, z)
+        {
+            return ids;
+        }
+        let chunk = self.chunk(x, z, ChunkStatus::Biomes);
+        Arc::clone(chunk.raw_chunk().decoration_biomes.get_or_init(|| {
+            let mut ids = rustc_hash::FxHashSet::default();
+            chunk.sections().for_each_biome_id(|id| {
+                ids.insert(id);
+            });
+            ids.into_iter().collect()
+        }))
     }
 
     /// Returns the center chunk being generated.
