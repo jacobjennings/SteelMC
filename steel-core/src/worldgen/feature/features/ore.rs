@@ -87,41 +87,7 @@ impl FeatureDecorationRunner {
             return false;
         };
         let batch_no_air_exposure = config.discard_chance_on_air_exposure <= 0.0;
-        let fixed_rng_vein = batch_no_air_exposure || config.discard_chance_on_air_exposure >= 1.0;
         let targets = ResolvedOreTargets::cached_from_config(registry, config);
-
-        let clip_xz = if batch_no_air_exposure {
-            let Some((min_x, max_x, min_z, max_z)) = region.writable_block_xz_bounds() else {
-                for _ in 0..size {
-                    let _ = random.next_f64();
-                }
-                return false;
-            };
-            if x_start + size_xz < min_x
-                || x_start > max_x
-                || z_start + size_xz < min_z
-                || z_start > max_z
-            {
-                for _ in 0..size {
-                    let _ = random.next_f64();
-                }
-                return false;
-            }
-            Some((min_x, max_x, min_z, max_z))
-        } else {
-            None
-        };
-
-        if fixed_rng_vein
-            && let Some(cutoff_y) = region.surface_cutoff_y()
-            && y_start + size_y < cutoff_y
-            && (targets.preserves_stone_tags || y_start + size_y < cutoff_y - 8)
-        {
-            for _ in 0..size {
-                let _ = random.next_f64();
-            }
-            return false;
-        }
 
         let mut vein_nodes = SmallVec::<[[f64; 4]; 32]>::from_elem([0.0; 4], size);
 
@@ -196,7 +162,6 @@ impl FeatureDecorationRunner {
                     z_start,
                     min_y,
                     height,
-                    clip_xz,
                     batch_no_air_exposure,
                     tested,
                     pending_no_air_sections,
@@ -215,7 +180,6 @@ impl FeatureDecorationRunner {
                     z_start,
                     min_y,
                     height,
-                    clip_xz,
                     batch_no_air_exposure,
                     tested,
                     pending_no_air_sections,
@@ -273,7 +237,6 @@ impl FeatureDecorationRunner {
         z_start: i32,
         min_y: i32,
         height: i32,
-        clip_xz: Option<(i32, i32, i32, i32)>,
         batch_no_air_exposure: bool,
         tested: &mut OreTestedPositions,
         pending_no_air_sections: &mut Vec<PendingOreSection>,
@@ -286,19 +249,10 @@ impl FeatureDecorationRunner {
                 continue;
             }
 
-            let mut x_min = fast_floor(node[0] - radius).max(x_start);
-            let mut z_min = fast_floor(node[2] - radius).max(z_start);
-            let mut x_max = fast_floor(node[0] + radius).max(x_min);
-            let mut z_max = fast_floor(node[2] + radius).max(z_min);
-            if let Some((clip_min_x, clip_max_x, clip_min_z, clip_max_z)) = clip_xz {
-                x_min = x_min.max(clip_min_x);
-                x_max = x_max.min(clip_max_x);
-                z_min = z_min.max(clip_min_z);
-                z_max = z_max.min(clip_max_z);
-                if x_min > x_max || z_min > z_max {
-                    continue;
-                }
-            }
+            let x_min = fast_floor(node[0] - radius).max(x_start);
+            let z_min = fast_floor(node[2] - radius).max(z_start);
+            let x_max = fast_floor(node[0] + radius).max(x_min);
+            let z_max = fast_floor(node[2] + radius).max(z_min);
             let raw_y_min = fast_floor(node[1] - radius).max(y_start);
             let raw_y_max = fast_floor(node[1] + radius).max(raw_y_min);
             let y_min = raw_y_min.max(min_y);
@@ -586,7 +540,6 @@ const NO_ORE_REPLACEMENT: u16 = u16::MAX;
 struct ResolvedOreTargets {
     targets: SmallVec<[ResolvedOreTarget; 2]>,
     flat_by_state: Option<Box<[u16]>>,
-    preserves_stone_tags: bool,
 }
 
 struct ResolvedOreTarget {
@@ -657,7 +610,6 @@ impl ResolvedOreTargets {
         let mut targets: SmallVec<[ResolvedOreTarget; 2]> =
             SmallVec::with_capacity(config.targets.len());
         let mut has_height_rule = false;
-        let mut preserves_stone_tags = !config.targets.is_empty();
         for target in &config.targets {
             let matcher = Self::resolve_rule_test(registry, &target.target, &mut has_height_rule);
             let state = WorldgenStateResolver::feature_block_state_from_data(
@@ -665,14 +617,6 @@ impl ResolvedOreTargets {
                 &target.state,
                 "ore feature",
             );
-            let block = state.get_block();
-            if block != &vanilla_blocks::GRANITE
-                && block != &vanilla_blocks::DIORITE
-                && block != &vanilla_blocks::ANDESITE
-                && block != &vanilla_blocks::TUFF
-            {
-                preserves_stone_tags = false;
-            }
             targets.push(ResolvedOreTarget { matcher, state });
         }
 
@@ -695,7 +639,6 @@ impl ResolvedOreTargets {
         Self {
             targets,
             flat_by_state,
-            preserves_stone_tags,
         }
     }
 

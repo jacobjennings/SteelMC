@@ -316,42 +316,12 @@ struct SurfaceColumn {
 struct StartsEntry {
     starts: StructureStartMap,
     biomes: Option<Box<[BiomePalette]>>,
-    has_root_system: bool,
     last_used: u64,
-}
-
-fn biome_has_root_system_lookup() -> &'static [bool] {
-    static LOOKUP: std::sync::OnceLock<Box<[bool]>> = std::sync::OnceLock::new();
-    LOOKUP.get_or_init(|| {
-        use steel_registry::{RegistryExt as _, feature::{ConfiguredFeatureKind, ConfiguredFeatureRef}};
-        fn ref_is_root_system(fref: &ConfiguredFeatureRef) -> bool {
-            let kind = match fref {
-                ConfiguredFeatureRef::Reference(entry) => &entry.kind,
-                ConfiguredFeatureRef::Inline(kind) => kind,
-            };
-            matches!(kind, ConfiguredFeatureKind::RootSystem(_))
-        }
-        let mut flags = Vec::new();
-        for (id, biome) in REGISTRY.biomes.iter() {
-            if flags.len() <= id {
-                flags.resize(id + 1, false);
-            }
-            let has_rs = biome.features.iter().flatten().any(|fkey| {
-                REGISTRY
-                    .placed_features
-                    .by_key(fkey)
-                    .is_some_and(|pf| ref_is_root_system(&pf.data.feature))
-            });
-            flags[id] = has_rs;
-        }
-        flags.into_boxed_slice()
-    })
 }
 
 struct TerrainEntry {
     surface: Box<[SurfaceColumn]>,
     carved: Option<Arc<Chunk>>,
-    has_root_system: bool,
     last_used: u64,
 }
 
@@ -1009,7 +979,7 @@ impl StandaloneWorldgen {
         let side = self.decoration_batch;
         let batch_min = (key.0.div_euclid(side) * side, key.1.div_euclid(side) * side);
         let batch_max = (batch_min.0 + side - 1, batch_min.1 + side - 1);
-        let holders = self.decorate(batch_min, batch_max, 0, filter);
+        let holders = self.decorate(batch_min, batch_max, 0);
         let clock = StageClock::start();
         let mut requested = None;
         for chunk_x in batch_min.0..=batch_max.0 {
@@ -1146,12 +1116,7 @@ impl StandaloneWorldgen {
         let ring = source_radius + 1;
         let pool = Arc::clone(&self.pool);
         let snapshots = pool.install(|| {
-            let holders = self.decorate(
-                tile_min,
-                tile_max,
-                FEATURE_WRITE_RADIUS + 1,
-                GeneratedBlockFilter::All,
-            );
+            let holders = self.decorate(tile_min, tile_max, FEATURE_WRITE_RADIUS + 1);
             let mut snapshots = Vec::new();
             for chunk_x in center.0 - ring..=center.0 + ring {
                 for chunk_z in center.1 - ring..=center.1 + ring {
@@ -1190,7 +1155,6 @@ impl StandaloneWorldgen {
         tile_min: (i32, i32),
         tile_max: (i32, i32),
         output_margin: i32,
-        filter: GeneratedBlockFilter,
     ) -> Arc<FxHashMap<(i32, i32), Arc<ChunkHolder>>> {
         // Features can write one chunk away, and each decorating chunk reads
         // Terrain one chunk further out.
@@ -1209,35 +1173,6 @@ impl StandaloneWorldgen {
                 self.ensure_terrain((chunk_x, chunk_z), true);
             }
         }
-        let surface_cutoff_y = if filter == GeneratedBlockFilter::AtOrAboveSurface {
-            let mut all_exist = true;
-            let mut min_surface_y = i16::MAX;
-            'chunks: for chunk_x in terrain_min.0..=terrain_max.0 {
-                for chunk_z in terrain_min.1..=terrain_max.1 {
-                    let Some(entry) = self.terrain.get(&(chunk_x, chunk_z)) else {
-                        all_exist = false;
-                        break 'chunks;
-                    };
-                    if entry.has_root_system {
-                        all_exist = false;
-                        break 'chunks;
-                    }
-                    for col in &entry.surface {
-                        if !col.exists {
-                            all_exist = false;
-                            break 'chunks;
-                        }
-                        if col.height < min_surface_y {
-                            min_surface_y = col.height;
-                        }
-                    }
-                }
-            }
-            (all_exist && min_surface_y < i16::MAX).then_some(i32::from(min_surface_y) - 16)
-        } else {
-            None
-        };
-
         let clock = StageClock::start();
         let width = (source_max.0 - source_min.0 + 1 + 2 * STRUCTURE_RADIUS) as usize;
         let height = (source_max.1 - source_min.1 + 1 + 2 * STRUCTURE_RADIUS) as usize;
@@ -1255,8 +1190,6 @@ impl StandaloneWorldgen {
         let holder_setup = clock.nanos();
         let clock = StageClock::start();
         let feature_step = GENERATION_PYRAMID.get_step_to(ChunkStatus::Features);
-        let single_output_chunk =
-            (tile_min == tile_max && output_margin == 0).then_some(ChunkPos::new(tile_min.0, tile_min.1));
         let mut replays = 0;
         for chunk_x in source_min.0..=source_max.0 {
             for chunk_z in source_min.1..=source_max.1 {
@@ -1265,16 +1198,14 @@ impl StandaloneWorldgen {
                 let region_random = self
                     .generator
                     .create_worldgen_region_random(self.seed, center);
-                let final_output_chunk =
-                    single_output_chunk.filter(|_| chunk_x == source_max.0 && chunk_z == source_max.1);
-                let mut region = WorldGenRegion::with_holders_and_pruning(
+                // Later features can read earlier underground and neighbour writes.
+                // Apply the output height filter only when collecting changed blocks.
+                let mut region = WorldGenRegion::with_holders(
                     &self.context,
                     feature_step,
                     &holders,
                     center,
                     region_random,
-                    surface_cutoff_y,
-                    final_output_chunk,
                 );
                 self.generator.apply_biome_decorations(&mut region);
                 replays += 1;
@@ -1417,7 +1348,6 @@ impl StandaloneWorldgen {
             StartsEntry {
                 starts,
                 biomes: None,
-                has_root_system: false,
                 last_used: now,
             },
         );
@@ -1444,7 +1374,6 @@ impl StandaloneWorldgen {
                 StartsEntry {
                     starts: starts.clone(),
                     biomes: None,
-                    has_root_system: false,
                     last_used: now,
                 },
             );
@@ -1465,32 +1394,16 @@ impl StandaloneWorldgen {
         let clock = StageClock::start();
         let chunk = self.empty_chunk(ChunkPos::new(key.0, key.1));
         self.generator.create_biomes(&chunk);
-        let rs_lookup = biome_has_root_system_lookup();
-        let mut has_root_system = false;
         let biomes = chunk
             .sections
             .sections
             .iter()
-            .map(|section| {
-                let pal = section.read().biomes.clone();
-                if !has_root_system
-                    && pal.maybe_has(|id| {
-                        rs_lookup
-                            .get(usize::from(id))
-                            .copied()
-                            .unwrap_or(false)
-                    })
-                {
-                    has_root_system = true;
-                }
-                pal
-            })
+            .map(|section| section.read().biomes.clone())
             .collect::<Vec<_>>()
             .into_boxed_slice();
         self.stats.biomes_generated += 1;
         self.stats.biomes_nanos += clock.nanos();
         if let Some(entry) = self.starts.get_mut(&key) {
-            entry.has_root_system = has_root_system;
             entry.biomes = Some(biomes);
         }
     }
@@ -1516,7 +1429,6 @@ impl StandaloneWorldgen {
             }
         }
         let clock = StageClock::start();
-        let has_root_system = self.starts.get(&key).is_some_and(|s| s.has_root_system);
         let (surface, carved) = self.build_terrain(key, carve);
         self.stats.terrain_generated += 1;
         self.stats.terrain_nanos += clock.nanos();
@@ -1525,7 +1437,6 @@ impl StandaloneWorldgen {
             TerrainEntry {
                 surface,
                 carved: carved.map(Arc::new),
-                has_root_system,
                 last_used: now,
             },
         );

@@ -251,10 +251,6 @@ impl FeatureStepData {
         self.features.get(index).copied()
     }
 
-    pub(super) const fn len(&self) -> usize {
-        self.features.len()
-    }
-
     pub(super) fn feature_indices_for_biome(&self, biome_id: usize) -> Option<&[usize]> {
         self.feature_indices_by_biome_id
             .get(biome_id)

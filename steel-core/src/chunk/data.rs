@@ -111,8 +111,8 @@ pub struct Chunk {
     full_runtime: OnceLock<Box<FullChunkRuntime>>,
     /// Generator-owned state retained only between generation stages.
     transient_generation_state: SyncMutex<TransientGenerationState>,
-    /// Cached per-chunk biome max quart Ys for feature decoration.
-    pub(crate) biome_max_quart_y: OnceLock<Arc<Box<[(u16, i16)]>>>,
+    /// Distinct biome IDs from this chunk for feature decoration.
+    pub(crate) decoration_biomes: OnceLock<Arc<[u16]>>,
 }
 
 enum PendingPromotionCommit {
@@ -154,7 +154,7 @@ impl Chunk {
             light: SyncRwLock::new(ChunkLightData::for_valid_world_height(min_y, height)),
             full_runtime: OnceLock::new(),
             transient_generation_state: SyncMutex::new(TransientGenerationState::default()),
-            biome_max_quart_y: OnceLock::new(),
+            decoration_biomes: OnceLock::new(),
         }
     }
 
@@ -216,7 +216,7 @@ impl Chunk {
             light: SyncRwLock::new(light),
             full_runtime: OnceLock::new(),
             transient_generation_state: SyncMutex::new(TransientGenerationState::default()),
-            biome_max_quart_y: OnceLock::new(),
+            decoration_biomes: OnceLock::new(),
         };
 
         if status >= ChunkStatus::InitializeLight {
@@ -285,8 +285,8 @@ impl Chunk {
             light: SyncRwLock::new(ChunkLightData::for_valid_world_height(0, 16)),
             full_runtime: OnceLock::new(),
             transient_generation_state: SyncMutex::new(TransientGenerationState::default()),
-            biome_max_quart_y: self
-                .biome_max_quart_y
+            decoration_biomes: self
+                .decoration_biomes
                 .get()
                 .cloned()
                 .map_or_else(OnceLock::new, OnceLock::from),

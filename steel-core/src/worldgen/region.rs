@@ -71,8 +71,6 @@ pub struct WorldGenRegion<'a> {
     far_chunks: RefCell<BulkSectionChunkMap<'a>>,
     worldgen_heightmaps: RefCell<[CachedWorldgenHeightmaps; 9]>,
     random: RandomSource,
-    surface_cutoff_y: Option<i32>,
-    final_output_chunk: Option<ChunkPos>,
 }
 
 /// Size of 8 is fine here because analysis showed that 91.7% only ever reach <=2 and the largest one ever grew was 6.
@@ -246,22 +244,6 @@ impl<'a> WorldGenRegion<'a> {
         center: ChunkPos,
         random: RandomSource,
     ) -> Self {
-        Self::with_holders_and_pruning(context, step, cache, center, random, None, None)
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "standalone replay passes optional pruning bounds alongside standard region inputs"
-    )]
-    pub(crate) fn with_holders_and_pruning(
-        context: &'a WorldGenContext,
-        step: &'a ChunkStep,
-        cache: &'a dyn FeatureHolders,
-        center: ChunkPos,
-        random: RandomSource,
-        surface_cutoff_y: Option<i32>,
-        final_output_chunk: Option<ChunkPos>,
-    ) -> Self {
         let chunk_cache_radius =
             i32::try_from(step.direct_dependencies.get_radius()).unwrap_or(i32::MAX);
 
@@ -277,32 +259,7 @@ impl<'a> WorldGenRegion<'a> {
                 CachedWorldgenHeightmaps::default()
             })),
             random,
-            surface_cutoff_y,
-            final_output_chunk,
         }
-    }
-
-    #[must_use]
-    pub(crate) const fn surface_cutoff_y(&self) -> Option<i32> {
-        self.surface_cutoff_y
-    }
-
-    #[must_use]
-    pub(crate) const fn final_output_chunk(&self) -> Option<ChunkPos> {
-        self.final_output_chunk
-    }
-
-    #[must_use]
-    pub(crate) const fn writable_block_xz_bounds(&self) -> Option<(i32, i32, i32, i32)> {
-        let radius = self.step.block_state_write_radius;
-        if radius < 0 {
-            return None;
-        }
-        let min_x = (self.center.0.x - radius) * 16;
-        let max_x = (self.center.0.x + radius) * 16 + 15;
-        let min_z = (self.center.0.y - radius) * 16;
-        let max_z = (self.center.0.y + radius) * 16 + 15;
-        Some((min_x, max_x, min_z, max_z))
     }
 
     /// Returns the center chunk being generated.
