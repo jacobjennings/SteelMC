@@ -379,6 +379,7 @@ pub struct StandaloneWorldgen {
     terrain_capacity: usize,
     decorated: FxHashMap<(i32, i32), DecoratedEntry>,
     decorated_bytes: usize,
+    ore_replay: crate::worldgen::feature::OreReplayCache,
     stats: StandaloneStats,
     bounded_coarse_surface: bool,
     decoration_batch: i32,
@@ -517,6 +518,7 @@ impl StandaloneWorldgen {
             terrain_capacity: terrain_cache_capacity,
             decorated: FxHashMap::default(),
             decorated_bytes: 0,
+            ore_replay: Default::default(),
             stats: StandaloneStats::default(),
             bounded_coarse_surface: false,
             decoration_batch: 1,
@@ -875,6 +877,9 @@ impl StandaloneWorldgen {
         let capacity = (samples_per_side * samples_per_side) as usize;
         let mut tile = StandaloneTile::with_capacity(samples_per_side, capacity, self.min_y);
         let carve = detail == TileDetail::Full;
+        // noise_biome creates a fresh sampler for each point. Its full quart
+        // coordinate therefore identifies the answer, including biome ties.
+        let mut point_biomes = FxHashMap::default();
         for sample_z in 0..samples_per_side {
             for sample_x in 0..samples_per_side {
                 let x = origin_x.saturating_add((sample_x * resolution) as i32);
@@ -885,13 +890,14 @@ impl StandaloneWorldgen {
                     unreachable!("terrain entry was just ensured");
                 };
                 let column = entry.surface[column_index(x, z)];
-                tile.push_sample(
-                    column.height,
-                    column.exists,
-                    self.generator
-                        .noise_biome(x >> 2, i32::from(column.height) >> 2, z >> 2),
-                    Some(column.state),
-                );
+                let quart = (x >> 2, i32::from(column.height) >> 2, z >> 2);
+                let sample = || self.generator.noise_biome(quart.0, quart.1, quart.2);
+                let biome = if carve && resolution == 1 {
+                    *point_biomes.entry(quart).or_insert_with(sample)
+                } else {
+                    sample()
+                };
+                tile.push_sample(column.height, column.exists, biome, Some(column.state));
             }
         }
         tile
@@ -1176,6 +1182,7 @@ impl StandaloneWorldgen {
         let clock = StageClock::start();
         let width = (source_max.0 - source_min.0 + 1 + 2 * STRUCTURE_RADIUS) as usize;
         let height = (source_max.1 - source_min.1 + 1 + 2 * STRUCTURE_RADIUS) as usize;
+        let mut ore_replay = std::mem::take(&mut self.ore_replay);
         let holders = ReplayHolders {
             world: self,
             min: (
@@ -1207,6 +1214,7 @@ impl StandaloneWorldgen {
                     center,
                     region_random,
                 );
+                region.ore_replay = Some(&mut ore_replay);
                 self.generator.apply_biome_decorations(&mut region);
                 replays += 1;
             }
@@ -1217,6 +1225,7 @@ impl StandaloneWorldgen {
                 output.insert((x, z), Arc::clone(holders.owned_holder(x, z)));
             }
         }
+        self.ore_replay = ore_replay;
         self.stats.holders_nanos += holder_setup;
         self.stats.features_nanos += clock.nanos();
         self.stats.feature_regions += replays;

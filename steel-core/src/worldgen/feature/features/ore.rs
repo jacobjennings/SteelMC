@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::f32::consts::PI;
 use std::ptr;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 use steel_math::trig;
 use steel_utils::PackedSectionBlockPos;
@@ -23,6 +24,14 @@ impl FeatureDecorationRunner {
         if config.size <= 0 {
             return false;
         }
+        let shape_key = (region.ore_replay.is_some()
+            && config.discard_chance_on_air_exposure <= 0.0
+            && !super::super::instrumentation::ore_profile_enabled())
+        .then(|| OreShapeKey {
+            state: random.uniform_state(),
+            origin,
+            size: config.size,
+        });
         let direction = random.next_f32() * PI;
         let spread_xz = config.size as f32 / 8.0;
         let spread_xz_ceil = spread_xz.ceil() as i32;
@@ -43,16 +52,16 @@ impl FeatureDecorationRunner {
 
         if y_start <= region.height_at(HeightmapType::OceanFloorWg, origin.x(), origin.z()) {
             return Self::do_place_ore(
-                region, registry, random, config, x0, x1, z0, z1, y0, y1, x_start, y_start,
-                z_start, size_xz, size_y,
+                region, registry, random, config, shape_key, x0, x1, z0, z1, y0, y1, x_start,
+                y_start, z_start, size_xz, size_y,
             );
         }
         for x_probe in x_start..=x_start + size_xz {
             for z_probe in z_start..=z_start + size_xz {
                 if y_start <= region.height_at(HeightmapType::OceanFloorWg, x_probe, z_probe) {
                     return Self::do_place_ore(
-                        region, registry, random, config, x0, x1, z0, z1, y0, y1, x_start, y_start,
-                        z_start, size_xz, size_y,
+                        region, registry, random, config, shape_key, x0, x1, z0, z1, y0, y1,
+                        x_start, y_start, z_start, size_xz, size_y,
                     );
                 }
             }
@@ -66,11 +75,12 @@ impl FeatureDecorationRunner {
         clippy::too_many_lines,
         reason = "mirrors vanilla ore vein placement inputs"
     )]
-    pub(in crate::worldgen::feature) fn do_place_ore(
+    fn do_place_ore(
         region: &mut WorldGenRegion<'_>,
         registry: &Registry,
         random: &mut WorldgenRandom,
         config: &OreConfiguration,
+        shape_key: Option<OreShapeKey>,
         x0: f64,
         x1: f64,
         z0: f64,
@@ -88,6 +98,21 @@ impl FeatureDecorationRunner {
         };
         let batch_no_air_exposure = config.discard_chance_on_air_exposure <= 0.0;
         let targets = ResolvedOreTargets::cached_from_config(registry, config);
+
+        if let Some(key) = shape_key
+            && let Some(geometry) = region
+                .ore_replay
+                .as_deref()
+                .and_then(|cache| cache.get(key))
+        {
+            // The height gate already passed in this replay. Each node uses
+            // exactly one double, and this ore path never draws for exposure.
+            for _ in 0..size {
+                random.next_f64();
+            }
+            let mut sections = region.bulk_section_access_for_ore(None);
+            return apply_ore_sections(&mut sections, registry, &targets, &geometry) > 0;
+        }
 
         let mut vein_nodes = SmallVec::<[[f64; 4]; 32]>::from_elem([0.0; 4], size);
 
@@ -195,14 +220,13 @@ impl FeatureDecorationRunner {
 
             if batch_no_air_exposure {
                 let batch_apply_started_at = profile.stats().map(|_| Instant::now());
-                for pending_section in pending_no_air_sections.iter() {
-                    placed += sections.replace_ore_target_block_states_in_section(
-                        pending_section.key.chunk_x,
-                        pending_section.key.chunk_z,
-                        pending_section.key.section_index,
-                        &pending_section.positions,
-                        |block_state, y| targets.matching_replacement(registry, block_state, y),
-                    );
+                placed +=
+                    apply_ore_sections(&mut sections, registry, &targets, pending_no_air_sections);
+                drop(sections);
+                if let Some(key) = shape_key
+                    && let Some(cache) = region.ore_replay.as_deref_mut()
+                {
+                    cache.insert(key, pending_no_air_sections);
                 }
                 if let Some(started_at) = batch_apply_started_at
                     && let Some(stats) = profile.stats()
@@ -504,6 +528,74 @@ impl FeatureDecorationRunner {
         };
         block.config.is_air
     }
+}
+
+/// Geometry depends on the origin, vein size and the complete incoming
+/// uniform RNG state. The owning world fixes the build height. Cached
+/// positions never carry block states or the result of a write.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct OreShapeKey {
+    state: [u64; 2],
+    origin: BlockPos,
+    size: i32,
+}
+
+impl OreShapeKey {
+    fn slot(self) -> usize {
+        // Full-key equality resolves collisions.
+        self.state[0] as usize % OreReplayCache::SLOTS
+    }
+}
+
+type OreShapeSlot = Option<(OreShapeKey, Arc<[PendingOreSection]>)>;
+
+#[derive(Default)]
+pub(crate) struct OreReplayCache {
+    slots: Vec<OreShapeSlot>,
+}
+
+impl OreReplayCache {
+    const SLOTS: usize = 2048;
+    const BYTES_PER_SHAPE: usize = 2048;
+
+    fn get(&self, key: OreShapeKey) -> Option<Arc<[PendingOreSection]>> {
+        let (stored, shape) = self.slots.get(key.slot())?.as_ref()?;
+        (*stored == key).then(|| Arc::clone(shape))
+    }
+
+    fn insert(&mut self, key: OreShapeKey, sections: &mut Vec<PendingOreSection>) {
+        let bytes = sections.len() * size_of::<PendingOreSection>()
+            + sections
+                .iter()
+                .map(|s| s.positions.capacity() * size_of::<PackedSectionBlockPos>())
+                .sum::<usize>();
+        if bytes > Self::BYTES_PER_SHAPE {
+            return;
+        }
+        if self.slots.is_empty() {
+            self.slots.resize_with(Self::SLOTS, || None);
+        }
+        self.slots[key.slot()] = Some((key, std::mem::take(sections).into()));
+    }
+}
+
+fn apply_ore_sections(
+    sections: &mut WorldGenBulkSectionAccess<'_, '_, '_>,
+    registry: &Registry,
+    targets: &ResolvedOreTargets,
+    pending: &[PendingOreSection],
+) -> u64 {
+    let mut placed = 0;
+    for pending_section in pending {
+        placed += sections.replace_ore_target_block_states_in_section(
+            pending_section.key.chunk_x,
+            pending_section.key.chunk_z,
+            pending_section.key.section_index,
+            &pending_section.positions,
+            |block_state, y| targets.matching_replacement(registry, block_state, y),
+        );
+    }
+    placed
 }
 
 #[derive(Default)]

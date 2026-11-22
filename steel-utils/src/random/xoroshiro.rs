@@ -64,6 +64,10 @@ impl Xoroshiro {
         self.next_random() >> (64 - bits)
     }
 
+    pub(super) const fn uniform_state(&self) -> [u64; 2] {
+        [self.seed_lo, self.seed_hi]
+    }
+
     const fn next_random(&mut self) -> u64 {
         let l = self.seed_lo;
         let m = self.seed_hi;

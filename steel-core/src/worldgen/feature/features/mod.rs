@@ -32,6 +32,7 @@ mod monster_room;
 mod multiface_growth;
 mod nether_forest_vegetation;
 mod ore;
+pub(crate) use ore::OreReplayCache;
 mod projected_random_patchy_square;
 mod random_neighbor_spread;
 mod replace_blobs;

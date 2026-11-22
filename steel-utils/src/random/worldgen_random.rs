@@ -54,6 +54,13 @@ impl WorldgenRandom {
         self.set_seed(feature_seed);
     }
 
+    /// Both words that determine the next uniform draws. Gaussian draws also
+    /// depend on a separate spare value.
+    #[must_use]
+    pub const fn uniform_state(&self) -> [u64; 2] {
+        self.source.uniform_state()
+    }
+
     fn next_bits(&mut self, bits: u64) -> u64 {
         self.source.next_i64() as u64 >> (64 - bits)
     }

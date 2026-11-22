@@ -65,6 +65,7 @@ pub struct WorldGenRegion<'a> {
     context: &'a WorldGenContext,
     step: &'a ChunkStep,
     cache: &'a dyn FeatureHolders,
+    pub(crate) ore_replay: Option<&'a mut crate::worldgen::feature::OreReplayCache>,
     center: ChunkPos,
     chunk_cache_radius: i32,
     near_chunks: RefCell<[Option<CachedWorldGenChunk<'a>>; 9]>,
@@ -253,6 +254,7 @@ impl<'a> WorldGenRegion<'a> {
             cache,
             center,
             chunk_cache_radius,
+            ore_replay: None,
             near_chunks: RefCell::new([None; 9]),
             far_chunks: RefCell::new(BulkSectionChunkMap::default()),
             worldgen_heightmaps: RefCell::new(std::array::from_fn(|_| {

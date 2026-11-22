@@ -20,7 +20,7 @@ mod state;
 mod vanilla_collections;
 mod weather;
 
-pub(crate) use features::no_nested_features;
+pub(crate) use features::{OreReplayCache, no_nested_features};
 pub(crate) use runner::FeatureDecorationRunner;
 
 #[cfg(test)]
